@@ -55,8 +55,7 @@ NNEvaluator::NNEvaluator(
   int yLen,
   bool rExactNNLen,
   bool iUseNHWC,
-  int nnCacheSizePowerOfTwo,
-  int nnMutexPoolSizePowerofTwo,
+  const NNCacheConfig& nnCacheConfig,
   bool skipNeuralNet,
   const string& homeDataDirOverride,
   enabled_t useFP16Mode,
@@ -83,7 +82,7 @@ NNEvaluator::NNEvaluator(
    disableWarmup(disableWarmup_),
    computeContext(NULL),
    loadedModel(NULL),
-   nnCacheTable(NULL),
+   nnCacheTable(nullptr),
    logger(lg),
    internalModelName(),
    modelVersion(-1),
@@ -126,8 +125,8 @@ NNEvaluator::NNEvaluator(
     );
   }
 
-  if(nnCacheSizePowerOfTwo >= 0)
-    nnCacheTable = new NNCacheTable(nnCacheSizePowerOfTwo, nnMutexPoolSizePowerofTwo);
+  if(nnCacheConfig.sizePowerOfTwo >= 0)
+    nnCacheTable = NNCacheTable::create(nnCacheConfig);
 
   if(!debugSkipNeuralNet) {
     vector<int> gpuIdxs = gpuIdxByServerThread;
@@ -173,7 +172,7 @@ NNEvaluator::~NNEvaluator() {
     NeuralNet::freeLoadedModel(loadedModel);
   loadedModel = NULL;
 
-  delete nnCacheTable;
+  nnCacheTable.reset();
 }
 
 string NNEvaluator::getModelName() const {
@@ -368,7 +367,7 @@ void NNEvaluator::clearStats() {
 }
 
 void NNEvaluator::clearCache() {
-  if(nnCacheTable != NULL)
+  if(nnCacheTable != nullptr)
     nnCacheTable->clear();
 }
 
@@ -922,7 +921,7 @@ void NNEvaluator::evaluate(
 
   bool hadResultWithoutOwnerMap = false;
   shared_ptr<NNOutput> resultWithoutOwnerMap;
-  if(nnCacheTable != NULL && !skipCache && nnCacheTable->get(nnHash,buf.result)) {
+  if(nnCacheTable != nullptr && !skipCache && nnCacheTable->get(nnHash,buf.result)) {
     if(!(includeOwnerMap && buf.result->whiteOwnerMap == NULL))
     {
       m_numCacheHits.fetch_add(1, std::memory_order_relaxed);
@@ -1280,98 +1279,7 @@ void NNEvaluator::evaluate(
 
   // And record the nnHash in the result and put it into the table
   buf.result->nnHash = nnHash;
-  if(nnCacheTable != NULL)
+  if(nnCacheTable != nullptr)
     nnCacheTable->set(buf.result);
 
-}
-
-// Uncomment this to lower the effective hash size down to one where we get true collisions
-// #define SIMULATE_TRUE_HASH_COLLISIONS
-
-NNCacheTable::Entry::Entry()
-  :ptr(nullptr)
-{}
-NNCacheTable::Entry::~Entry()
-{}
-
-NNCacheTable::NNCacheTable(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo) {
-  if(sizePowerOfTwo < 0 || sizePowerOfTwo > 63)
-    throw StringError("NNCacheTable: Invalid sizePowerOfTwo: " + Global::intToString(sizePowerOfTwo));
-  if(mutexPoolSizePowerOfTwo < 0 || mutexPoolSizePowerOfTwo > 31)
-    throw StringError("NNCacheTable: Invalid mutexPoolSizePowerOfTwo: " + Global::intToString(mutexPoolSizePowerOfTwo));
-#if defined(SIMULATE_TRUE_HASH_COLLISIONS)
-  sizePowerOfTwo = sizePowerOfTwo > 12 ? 12 : sizePowerOfTwo;
-#endif
-  if(mutexPoolSizePowerOfTwo > sizePowerOfTwo)
-    mutexPoolSizePowerOfTwo = sizePowerOfTwo;
-
-  tableSize = ((uint64_t)1) << sizePowerOfTwo;
-  tableMask = tableSize-1;
-  entries = new Entry[tableSize];
-  uint32_t mutexPoolSize = ((uint32_t)1) << mutexPoolSizePowerOfTwo;
-  mutexPoolMask = mutexPoolSize-1;
-  mutexPool = new MutexPool(mutexPoolSize);
-}
-NNCacheTable::~NNCacheTable() {
-  delete[] entries;
-  delete mutexPool;
-}
-
-bool NNCacheTable::get(Hash128 nnHash, shared_ptr<NNOutput>& ret) {
-  // Free ret BEFORE locking, to avoid any expensive operations while locked.
-  if(ret != nullptr)
-    ret.reset();
-
-  uint64_t idx = nnHash.hash0 & tableMask;
-  uint32_t mutexIdx = (uint32_t)idx & mutexPoolMask;
-  Entry& entry = entries[idx];
-  std::mutex& mutex = mutexPool->getMutex(mutexIdx);
-
-  std::lock_guard<std::mutex> lock(mutex);
-
-  bool found = false;
-#if defined(SIMULATE_TRUE_HASH_COLLISIONS)
-  if(entry.ptr != nullptr && ((entry.ptr->nnHash.hash0 ^ nnHash.hash0) & 0xFFF) == 0) {
-    ret = entry.ptr;
-    found = true;
-  }
-#else
-  if(entry.ptr != nullptr && entry.ptr->nnHash == nnHash) {
-    ret = entry.ptr;
-    found = true;
-  }
-#endif
-  return found;
-}
-
-void NNCacheTable::set(const shared_ptr<NNOutput>& p) {
-  // Immediately copy p right now, before locking, to avoid any expensive operations while locked.
-  shared_ptr<NNOutput> buf(p);
-
-  uint64_t idx = p->nnHash.hash0 & tableMask;
-  uint32_t mutexIdx = (uint32_t)idx & mutexPoolMask;
-  Entry& entry = entries[idx];
-  std::mutex& mutex = mutexPool->getMutex(mutexIdx);
-
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    // Perform a swap, to avoid any expensive free under the mutex.
-    entry.ptr.swap(buf);
-  }
-
-  // No longer locked, allow buf to fall out of scope now, will free whatever used to be present in the table.
-}
-
-void NNCacheTable::clear() {
-  shared_ptr<NNOutput> buf;
-  for(size_t idx = 0; idx<tableSize; idx++) {
-    Entry& entry = entries[idx];
-    uint32_t mutexIdx = (uint32_t)idx & mutexPoolMask;
-    std::mutex& mutex = mutexPool->getMutex(mutexIdx);
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      entry.ptr.swap(buf);
-    }
-    buf.reset();
-  }
 }

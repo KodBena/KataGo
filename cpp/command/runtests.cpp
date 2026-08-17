@@ -60,6 +60,7 @@ int MainCmds::runtests(const vector<string>& args) {
   ScoreValue::freeTables();
 
   Tests::runInlineConfigTests();
+  Tests::runNNCacheConfigTests();
 
   // Pick an arbitrary file that the test uses
   if(FileUtils::exists("tests/data/configs/folded/test-parent.cfg"))

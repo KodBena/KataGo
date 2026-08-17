@@ -10,38 +10,12 @@
 #include "../core/threadsafequeue.h"
 #include "../game/board.h"
 #include "../game/boardhistory.h"
+#include "../neuralnet/nncache.h"
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/sgfmetadata.h"
 #include "../neuralnet/nninterface.h"
-#include "../search/mutexpool.h"
 
 class NNEvaluator;
-
-class NNCacheTable {
-  struct Entry {
-    std::shared_ptr<NNOutput> ptr;
-    Entry();
-    ~Entry();
-  };
-
-  Entry* entries;
-  MutexPool* mutexPool;
-  uint64_t tableSize;
-  uint64_t tableMask;
-  uint32_t mutexPoolMask;
-
- public:
-  NNCacheTable(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo);
-  ~NNCacheTable();
-
-  NNCacheTable(const NNCacheTable& other) = delete;
-  NNCacheTable& operator=(const NNCacheTable& other) = delete;
-
-  // These are thread-safe. For get, ret will be set to nullptr upon a failure to find.
-  bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret);
-  void set(const std::shared_ptr<NNOutput>& p);
-  void clear();
-};
 
 // Each thread should allocate and re-use one of these
 struct NNResultBuf {
@@ -88,8 +62,7 @@ class NNEvaluator {
     int nnYLen,
     bool requireExactNNLen,
     bool inputsUseNHWC,
-    int nnCacheSizePowerOfTwo,
-    int nnMutexPoolSizePowerofTwo,
+    const NNCacheConfig& nnCacheConfig,
     bool debugSkipNeuralNet,
     const std::string& homeDataDirOverride,
     enabled_t useFP16Mode,
@@ -238,7 +211,7 @@ class NNEvaluator {
 
   ComputeContext* computeContext;
   LoadedModel* loadedModel;
-  NNCacheTable* nnCacheTable;
+  std::unique_ptr<NNCacheTable> nnCacheTable;
   Logger* logger;
 
   std::string internalModelName;

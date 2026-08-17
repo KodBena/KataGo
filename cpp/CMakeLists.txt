@@ -974,6 +974,7 @@ add_executable(katago
   neuralnet/sgfmetadata.cpp
   neuralnet/modelversion.cpp
   neuralnet/nneval.cpp
+  neuralnet/nncache.cpp
   neuralnet/desc.cpp
   neuralnet/debugprint.cpp
   ${NEURALNET_BACKEND_SOURCES}
@@ -1014,6 +1015,7 @@ add_executable(katago
   tests/testcommon.cpp
   tests/testconfig.cpp
   tests/testmisc.cpp
+  tests/testnncache.cpp
   tests/testnnevalcanary.cpp
   tests/testbackendreference.cpp
   tests/backendreferencedata.cpp

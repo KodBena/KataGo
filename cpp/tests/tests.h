@@ -142,6 +142,9 @@ namespace Tests {
 
   //testbook.cpp
   void runBookTests();
+
+  //testnncache.cpp
+  void runNNCacheConfigTests();
 }
 
 namespace TestCommon {
