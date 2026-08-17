@@ -231,10 +231,12 @@ class NNCacheTableChained final : public NNCacheTable {
       return best;
     }
     case NNCacheEvictionPolicy::None:
+    default:
       break;
     }
     // NNCacheShape::chained already refuses None, so reaching here means the shape type
-    // was bypassed. Refuse rather than silently pick an order nobody asked for.
+    // was bypassed -- or a policy was added to the enum and not to this switch. Refuse
+    // rather than silently pick an order nobody asked for.
     throw StringError(
       "NNCacheTableChained: eviction policy 'none' has no capacity-sweep implementation; a "
       "chained table's byte budget is always enforced, so a victim must be chosen."
@@ -252,6 +254,15 @@ class NNCacheTableChained final : public NNCacheTable {
     case NNCacheEvictionPolicy::Lfu: if(n->count != 0xFFFFFFFFu) n->count += 1; break;
     case NNCacheEvictionPolicy::Random: break;
     case NNCacheEvictionPolicy::None: break;
+    // A policy added to the enum and not here would silently record no sighting at all,
+    // which is the quiet half of the failure chooseVictim's throw catches loudly. Refuse
+    // in both halves rather than in one (ADR-0002).
+    default:
+      throw StringError(
+        "NNCacheTableChained::onSighting: no sighting behaviour for this eviction policy; "
+        "a policy was added to NNCacheEvictionPolicy without teaching the chained table what "
+        "a hit means under it."
+      );
     }
   }
 };
