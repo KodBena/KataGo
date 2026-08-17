@@ -92,3 +92,6 @@ cpp/build.ninja
 cpp/KataGoSwift.*
 cpp/include/KataGoSwift/KataGoSwift-swift.h
 cpp/external/katagocoreml/proto/
+
+# Session-local harness logs; never part of the source tree.
+.claude/logs/
