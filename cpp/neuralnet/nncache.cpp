@@ -1,6 +1,7 @@
 #include "../neuralnet/nncache.h"
 
 #include "../core/config_parser.h"
+#include "../neuralnet/nncacheimpl.h"
 #include "../search/mutexpool.h"
 
 using namespace std;
@@ -377,18 +378,43 @@ void NNCacheTableDirect::clear() {
 NNCacheTable::NNCacheTable() {}
 NNCacheTable::~NNCacheTable() {}
 
+// Builds the collision-resolution layer the shape asks for, then wraps it in the
+// admission layer if one is asked for. Admission is orthogonal to collision
+// resolution, so it composes over all four shapes rather than being repeated in each.
+//
+// Each implementation refuses what it specifically cannot honor at its own
+// constructor, where the real constraint is known -- ways against the size of a lock
+// region, a byte budget against the smallest entry that could ever fit. This seam
+// therefore no longer carries a not-implemented-yet refusal for any shape.
 unique_ptr<NNCacheTable> NNCacheTable::create(const NNCacheConfig& config) {
-  if(config.admission != NNCacheAdmissionPolicy::Always)
-    throw StringError(
-      "Key '" + string(NNCacheConfig::KEY_ADMISSION) + "' = " + ADMISSION_SECOND_SIGHTING +
-      " is not implemented yet; the only implemented value is " + ADMISSION_ALWAYS + "."
+  unique_ptr<NNCacheTable> table;
+  switch(config.shape.scheme()) {
+  case NNCacheCollisionScheme::Direct:
+    table = unique_ptr<NNCacheTable>(
+      new NNCacheTableDirect(config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo)
     );
-  if(config.shape.scheme() != NNCacheCollisionScheme::Direct)
+    break;
+  case NNCacheCollisionScheme::LinearProbe:
+  case NNCacheCollisionScheme::QuadraticProbe:
+    table = makeProbedNNCacheTable(config);
+    break;
+  case NNCacheCollisionScheme::Chain:
+    table = makeChainedNNCacheTable(config);
+    break;
+  }
+  if(table == nullptr)
     throw StringError(
       "Key '" + string(NNCacheConfig::KEY_COLLISION) + "' = " + config.shape.toString() +
-      " is not implemented yet; the only implemented value is " + COLLISION_DIRECT + "."
+      " has no implementation; the valid values are (" + COLLISION_DIRECT + "|" + COLLISION_LINEAR +
+      "|" + COLLISION_QUADRATIC + "|" + COLLISION_CHAIN + ")."
     );
-  return unique_ptr<NNCacheTable>(
-    new NNCacheTableDirect(config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo)
-  );
+
+  switch(config.admission) {
+  case NNCacheAdmissionPolicy::Always:
+    break;
+  case NNCacheAdmissionPolicy::SecondSighting:
+    table = makeSecondSightingNNCacheTable(std::move(table), config.sizePowerOfTwo);
+    break;
+  }
+  return table;
 }

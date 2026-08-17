@@ -145,6 +145,10 @@ namespace Tests {
 
   //testnncache.cpp
   void runNNCacheConfigTests();
+  void runNNCachePolicyTests();
+  // Not part of runtests: it is a measurement, not an assertion. Reached by the
+  // runnncachebench subcommand.
+  void runNNCacheBench();
 }
 
 namespace TestCommon {

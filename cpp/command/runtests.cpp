@@ -61,6 +61,7 @@ int MainCmds::runtests(const vector<string>& args) {
 
   Tests::runInlineConfigTests();
   Tests::runNNCacheConfigTests();
+  Tests::runNNCachePolicyTests();
 
   // Pick an arbitrary file that the test uses
   if(FileUtils::exists("tests/data/configs/folded/test-parent.cfg"))
@@ -70,6 +71,18 @@ int MainCmds::runtests(const vector<string>& args) {
   }
 
   cout << "All tests passed" << endl;
+  return 0;
+}
+
+// A measurement, not an assertion, so it is deliberately not part of runtests: it
+// takes seconds, allocates hundreds of megabytes, and its numbers mean nothing unless
+// the box is idle.
+int MainCmds::runnncachebench(const vector<string>& args) {
+  (void)args;
+  Board::initHash();
+  ScoreValue::initTables();
+  Tests::runNNCacheBench();
+  ScoreValue::freeTables();
   return 0;
 }
 

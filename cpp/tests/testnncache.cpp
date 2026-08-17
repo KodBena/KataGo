@@ -184,24 +184,28 @@ void Tests::runNNCacheConfigTests() {
     testAssert(threw);
   }
 
-  //---- Unimplemented shapes are refused loudly at construction, not substituted ----
+  //---- Every shape the config accepts now builds ----
+  // These two used to assert a not-implemented-yet refusal. They now assert the
+  // opposite, which is what the policy work delivered; what each shape then DOES is
+  // asserted in testnncachepolicy.cpp, not here. The refusals above are untouched,
+  // and that is the point: the config Port's contract did not move.
   {
-    bool threw = false;
-    try {
-      NNCacheConfig config = parseCacheCfg({{"nnCacheCollision","linearprobe"},{"nnCacheEviction","lru"}});
-      (void)NNCacheTable::create(config);
-    }
-    catch(const StringError&) { threw = true; }
-    testAssert(threw);
+    NNCacheConfig config = parseCacheCfg({{"nnCacheCollision","linearprobe"},{"nnCacheEviction","lru"}});
+    testAssert(NNCacheTable::create(config) != nullptr);
   }
   {
-    bool threw = false;
-    try {
-      NNCacheConfig config = parseCacheCfg({{"nnCacheAdmission","secondsighting"}});
-      (void)NNCacheTable::create(config);
-    }
-    catch(const StringError&) { threw = true; }
-    testAssert(threw);
+    NNCacheConfig config = parseCacheCfg({{"nnCacheAdmission","secondsighting"}});
+    testAssert(NNCacheTable::create(config) != nullptr);
+  }
+  {
+    NNCacheConfig config = parseCacheCfg(
+      {{"nnCacheCollision","quadraticprobe"},{"nnCacheEviction","lfu"},{"nnCacheWays","4"}}
+    );
+    testAssert(NNCacheTable::create(config) != nullptr);
+  }
+  {
+    NNCacheConfig config = parseCacheCfg({{"nnCacheCollision","chain"},{"nnCacheMaxBytes","100000000"}});
+    testAssert(NNCacheTable::create(config) != nullptr);
   }
 
   //---- Byte accounting: per-entry footprint is not a constant ----
