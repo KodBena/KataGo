@@ -978,6 +978,7 @@ add_executable(katago
   neuralnet/nncacheprobed.cpp
   neuralnet/nncachechained.cpp
   neuralnet/nncacheadmission.cpp
+  neuralnet/nncachetrace.cpp
   neuralnet/desc.cpp
   neuralnet/debugprint.cpp
   ${NEURALNET_BACKEND_SOURCES}
@@ -1049,6 +1050,7 @@ add_executable(katago
   command/commandline.cpp
   command/analysis.cpp
   command/benchmark.cpp
+  command/benchnncachepolicy.cpp
   command/contribute.cpp
   command/dumponnx.cpp
   command/evalsgf.cpp

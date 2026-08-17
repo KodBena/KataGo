@@ -333,6 +333,33 @@ class NNCacheTableProbed final : public NNCacheTable {
     // No longer locked; buf falls out of scope and frees whatever it swapped out.
   }
 
+  // A snapshot taken one region at a time; see NNCacheTableDirect::stats for why there
+  // is no global lock and what that costs under live traffic.
+  //
+  // fixedStructureBytes is where the associativity's real memory price shows up: the
+  // eviction policy's per-slot metadata is inside sizeof(Slot), so an LRU stamp or an
+  // LFU count is counted here at its true, alignment-inflated cost rather than at the
+  // width of its field.
+  NNCacheStats stats() const override {
+    const uint32_t numRegions = mutexPool->getNumMutexes();
+    NNCacheStats s = {0,0,0,(int64_t)(tableMask+1)};
+    for(uint32_t r = 0; r < numRegions; r++) {
+      const uint64_t base = ((uint64_t)r) << regionShift;
+      std::lock_guard<std::mutex> lock(mutexPool->getMutex(r));
+      for(uint64_t k = 0; k <= regionMask; k++) {
+        const Slot& slot = slots[base + k];
+        if(slot.ptr != nullptr) {
+          s.residentEntries += 1;
+          s.residentPayloadBytes += (int64_t)nnOutputFootprintBytes(*slot.ptr);
+        }
+      }
+    }
+    s.fixedStructureBytes =
+      (int64_t)((tableMask+1) * sizeof(Slot)) +
+      (int64_t)numRegions * (int64_t)(sizeof(std::mutex) + sizeof(typename Evict::RegionState));
+    return s;
+  }
+
   void clear() override {
     const uint32_t numRegions = mutexPool->getNumMutexes();
     std::vector<std::shared_ptr<NNOutput>> freeAfterUnlock;

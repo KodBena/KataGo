@@ -85,6 +85,15 @@ class NNCacheTableSecondSighting final : public NNCacheTable {
     ghost[idx].store(tag, std::memory_order_relaxed);
   }
 
+  // The inner table's own snapshot, with the ghost array added to the fixed cost. The
+  // ghost is real resident memory the operator pays for and it belongs to no other
+  // layer, so leaving it out would make the admission filter look free.
+  NNCacheStats stats() const override {
+    NNCacheStats s = inner->stats();
+    s.fixedStructureBytes += (int64_t)(sizeof(std::atomic<uint32_t>) * (ghostMask + 1));
+    return s;
+  }
+
   void clear() override {
     inner->clear();
     for(uint64_t i = 0; i <= ghostMask; i++)

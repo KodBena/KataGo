@@ -62,6 +62,7 @@ dumponnx : (TensorRT/ONNX only) Write out the ONNX graph KataGo builds for a mod
 
 runtests : Test important board algorithms and datastructures
 runnncachebench : Measure what the nn cache's inline hash tag costs and buys
+benchnncachepolicy : Sweep the nn cache policy matrix over a recorded operation trace
 runnnlayertests : Test a few subcomponents of the current neural net backend
 runonnxmodelfiletests : (TensorRT/ONNX only) Test the .onnx model file reader
 
@@ -112,6 +113,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::runtests(subArgs);
   else if(subcommand == "runnncachebench")
     return MainCmds::runnncachebench(subArgs);
+  else if(subcommand == "benchnncachepolicy")
+    return MainCmds::benchnncachepolicy(subArgs);
   else if(subcommand == "runnnlayertests")
     return MainCmds::runnnlayertests(subArgs);
   else if(subcommand == "runnnontinyboardtest")

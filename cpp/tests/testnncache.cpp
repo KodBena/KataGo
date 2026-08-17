@@ -136,21 +136,49 @@ void Tests::runNNCacheConfigTests() {
   );
 
   //---- Chaining ----
+  // The chained table's CAPACITY eviction order used to be recency, in force but
+  // unnameable: this key was required to say `none` here, which asserted that no policy
+  // was chosen while one was. It now names the capacity victim, and defaults to the
+  // order that was already running, so a config that says nothing behaves identically.
   {
     NNCacheConfig config = parseCacheCfg({{"nnCacheCollision","chain"},{"nnCacheMaxBytes","4000000000"}});
     testAssert(!config.isStatusQuo());
     testAssert(config.shape.scheme() == NNCacheCollisionScheme::Chain);
-    testAssert(config.shape.eviction() == NNCacheEvictionPolicy::None);
+    testAssert(config.shape.eviction() == NNCacheEvictionPolicy::Lru);
     testAssert(config.shape.maxBytes() == (int64_t)4000000000LL);
   }
-  expectAccepted({{"nnCacheCollision","chain"},{"nnCacheEviction","none"},{"nnCacheMaxBytes","1000"}});
+  // All three orders are now sayable, which is the whole point of the change.
+  {
+    NNCacheConfig config = parseCacheCfg(
+      {{"nnCacheCollision","chain"},{"nnCacheMaxBytes","4000000000"},{"nnCacheEviction","lru"}}
+    );
+    testAssert(config.shape.eviction() == NNCacheEvictionPolicy::Lru);
+  }
+  {
+    NNCacheConfig config = parseCacheCfg(
+      {{"nnCacheCollision","chain"},{"nnCacheMaxBytes","4000000000"},{"nnCacheEviction","random"}}
+    );
+    testAssert(config.shape.eviction() == NNCacheEvictionPolicy::Random);
+  }
+  {
+    NNCacheConfig config = parseCacheCfg(
+      {{"nnCacheCollision","chain"},{"nnCacheMaxBytes","4000000000"},{"nnCacheEviction","lfu"}}
+    );
+    testAssert(config.shape.eviction() == NNCacheEvictionPolicy::Lfu);
+  }
+  // The one acceptance this change REMOVES, and it is removed rather than quietly
+  // reinterpreted: `none` used to be the required word here and is now refused, because
+  // a chained table's byte budget is always enforced, so a victim is always chosen and
+  // "no eviction" is not a shape this table can be. The message must say what the word
+  // used to mean and which value reproduces the old behaviour, or the operator has to
+  // read the source to migrate a config that used to be correct.
+  expectRefused(
+    {{"nnCacheCollision","chain"},{"nnCacheEviction","none"},{"nnCacheMaxBytes","1000"}},
+    {"nnCacheEviction","none","chain","nnCacheMaxBytes","lru","random","lfu"}
+  );
   expectRefused(
     {{"nnCacheCollision","chain"}},
     {"nnCacheMaxBytes","required","chain","byte budget"}
-  );
-  expectRefused(
-    {{"nnCacheCollision","chain"},{"nnCacheMaxBytes","1000"},{"nnCacheEviction","lru"}},
-    {"nnCacheEviction","chain","none","nnCacheMaxBytes"}
   );
   expectRefused(
     {{"nnCacheCollision","chain"},{"nnCacheMaxBytes","1000"},{"nnCacheWays","4"}},
@@ -180,6 +208,15 @@ void Tests::runNNCacheConfigTests() {
     NNCacheShape shape = NNCacheShape::directMapped();
     bool threw = false;
     try { (void)shape.eviction(); }
+    catch(const StringError&) { threw = true; }
+    testAssert(threw);
+  }
+  // And the same for the chained coherence rule, at the factory rather than at the cfg
+  // Port: the type refuses `none` too, so a caller that bypasses the .cfg text cannot
+  // construct a chained shape with no capacity policy either.
+  {
+    bool threw = false;
+    try { (void)NNCacheShape::chained(4000000000LL, NNCacheEvictionPolicy::None); }
     catch(const StringError&) { threw = true; }
     testAssert(threw);
   }

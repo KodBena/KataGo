@@ -1,7 +1,10 @@
 #include "../neuralnet/nncache.h"
 
+#include <cstdlib>
+
 #include "../core/config_parser.h"
 #include "../neuralnet/nncacheimpl.h"
+#include "../neuralnet/nncachetrace.h"
 #include "../search/mutexpool.h"
 
 using namespace std;
@@ -52,6 +55,18 @@ static string collisionSchemeToString(NNCacheCollisionScheme scheme) {
   throw StringError("NNCacheShape: unhandled collision scheme");
 }
 
+// The one decode of an eviction word, shared by the probed and chained arms of the Port
+// so the two cannot drift (ADR-0012 P1). Its input is always a word getString() has
+// already checked against evictionVocabulary(), so the fallthrough is unreachable text
+// rather than a policy default.
+static NNCacheEvictionPolicy evictionPolicyFromString(const string& s) {
+  if(s == EVICTION_RANDOM) return NNCacheEvictionPolicy::Random;
+  if(s == EVICTION_LRU) return NNCacheEvictionPolicy::Lru;
+  if(s == EVICTION_LFU) return NNCacheEvictionPolicy::Lfu;
+  if(s == EVICTION_NONE) return NNCacheEvictionPolicy::None;
+  throw StringError("NNCacheConfig: unrecognized eviction policy '" + s + "'");
+}
+
 static string evictionPolicyToString(NNCacheEvictionPolicy eviction) {
   switch(eviction) {
   case NNCacheEvictionPolicy::Random: return EVICTION_RANDOM;
@@ -100,14 +115,24 @@ NNCacheShape NNCacheShape::probed(NNCacheCollisionScheme scheme, int ways, NNCac
   return NNCacheShape(scheme, ways, eviction, 0);
 }
 
-NNCacheShape NNCacheShape::chained(int64_t maxBytes) {
+NNCacheShape NNCacheShape::chained(int64_t maxBytes, NNCacheEvictionPolicy eviction) {
   if(maxBytes <= 0)
     throw StringError(
       "NNCacheShape::chained: " + string(NNCacheConfig::KEY_COLLISION) + " = " + COLLISION_CHAIN +
       " requires a positive " + string(NNCacheConfig::KEY_MAX_BYTES) +
       ", since a chained table has no fixed capacity and is bounded only by its byte budget."
     );
-  return NNCacheShape(NNCacheCollisionScheme::Chain, 0, NNCacheEvictionPolicy::None, maxBytes);
+  if(eviction == NNCacheEvictionPolicy::None)
+    throw StringError(
+      "NNCacheShape::chained: " + string(NNCacheConfig::KEY_EVICTION) + " = " + EVICTION_NONE +
+      " cannot be honored under " + string(NNCacheConfig::KEY_COLLISION) + " = " + COLLISION_CHAIN +
+      ". Chaining never evicts on COLLISION, which is what this value used to mean here, but its "
+      "byte budget is always enforced, so a resident entry is always given up when the budget is "
+      "exceeded and something must choose which. Valid here are (" + EVICTION_RANDOM + "|" +
+      EVICTION_LRU + "|" + EVICTION_LFU + "); " + EVICTION_LRU + " is the order that was in force "
+      "before this axis was expressible."
+    );
+  return NNCacheShape(NNCacheCollisionScheme::Chain, 0, eviction, maxBytes);
 }
 
 NNCacheEvictionPolicy NNCacheShape::eviction() const {
@@ -123,7 +148,8 @@ string NNCacheShape::toString() const {
   if(scheme_ == NNCacheCollisionScheme::Direct)
     return COLLISION_DIRECT;
   if(scheme_ == NNCacheCollisionScheme::Chain)
-    return COLLISION_CHAIN + ", maxBytes " + Global::int64ToString(maxBytes_);
+    return COLLISION_CHAIN + ", maxBytes " + Global::int64ToString(maxBytes_) + ", " +
+      evictionPolicyToString(eviction_);
   return collisionSchemeToString(scheme_) + ", " + Global::intToString(ways_) + "-way, " +
     evictionPolicyToString(eviction_);
 }
@@ -194,18 +220,32 @@ NNCacheConfig NNCacheConfig::fromCfg(ConfigParser& cfg, int sizePowerOfTwo, int 
         "Key '" + string(KEY_WAYS) + "' is meaningless under " + string(KEY_COLLISION) + " = " +
         COLLISION_CHAIN + ": a chain has no fixed associativity."
       );
-    if(cfg.contains(KEY_EVICTION) && cfg.getString(KEY_EVICTION, evictionVocabulary()) != EVICTION_NONE)
-      throw StringError(
-        "Key '" + string(KEY_EVICTION) + "' under " + string(KEY_COLLISION) + " = " + COLLISION_CHAIN +
-        " must be " + EVICTION_NONE + " or absent: chaining never evicts on collision, so eviction is "
-        "driven by '" + string(KEY_MAX_BYTES) + "' instead."
-      );
     if(!cfg.contains(KEY_MAX_BYTES))
       throw StringError(
         "Key '" + string(KEY_MAX_BYTES) + "' is required under " + string(KEY_COLLISION) + " = " +
         COLLISION_CHAIN + ": a chained table has no fixed capacity and is bounded only by its byte budget."
       );
-    config.shape = NNCacheShape::chained(cfg.getInt64(KEY_MAX_BYTES, 1, (int64_t)1 << 62));
+    // Chaining never evicts on COLLISION, but its byte budget is always enforced, so a
+    // resident entry IS given up when a region goes over and something chooses which.
+    // That order used to be unnameable -- the key was required to say `none`, which
+    // denied a policy was in force while one was. It is now this key's meaning here,
+    // defaulting to the recency order that was in force before it was expressible.
+    const string evictionStr =
+      cfg.contains(KEY_EVICTION) ? cfg.getString(KEY_EVICTION, evictionVocabulary()) : EVICTION_LRU;
+    if(evictionStr == EVICTION_NONE)
+      throw StringError(
+        "Key '" + string(KEY_EVICTION) + "' = " + EVICTION_NONE + " cannot be honored under " +
+        string(KEY_COLLISION) + " = " + COLLISION_CHAIN + ". It used to be required here, and it "
+        "meant 'no COLLISION eviction' -- but a chained table's '" + string(KEY_MAX_BYTES) +
+        "' budget is always enforced, so a resident entry is always given up when a region exceeds "
+        "it, and this key now names WHICH one. Valid here are (" + EVICTION_RANDOM + "|" +
+        EVICTION_LRU + "|" + EVICTION_LFU + "). " + EVICTION_LRU + " is the order that was already "
+        "in force, so that is the value that changes nothing."
+      );
+    config.shape = NNCacheShape::chained(
+      cfg.getInt64(KEY_MAX_BYTES, 1, (int64_t)1 << 62),
+      evictionPolicyFromString(evictionStr)
+    );
     return config;
   }
 
@@ -224,12 +264,8 @@ NNCacheConfig NNCacheConfig::fromCfg(ConfigParser& cfg, int sizePowerOfTwo, int 
       ": a probed table has more than one candidate victim per bucket, so the choice must be stated. "
       "Valid values are (" + EVICTION_RANDOM + "|" + EVICTION_LRU + "|" + EVICTION_LFU + ")."
     );
-  const string evictionStr = cfg.getString(KEY_EVICTION, evictionVocabulary());
   const NNCacheEvictionPolicy eviction =
-    evictionStr == EVICTION_RANDOM ? NNCacheEvictionPolicy::Random :
-    evictionStr == EVICTION_LRU ? NNCacheEvictionPolicy::Lru :
-    evictionStr == EVICTION_LFU ? NNCacheEvictionPolicy::Lfu :
-    NNCacheEvictionPolicy::None;
+    evictionPolicyFromString(cfg.getString(KEY_EVICTION, evictionVocabulary()));
   const int ways = cfg.contains(KEY_WAYS) ? cfg.getInt(KEY_WAYS, 2, 1024) : 2;
   config.shape = NNCacheShape::probed(scheme, ways, eviction);
   return config;
@@ -279,6 +315,7 @@ class NNCacheTableDirect final : public NNCacheTable {
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override;
   void set(const std::shared_ptr<NNOutput>& p) override;
   void clear() override;
+  NNCacheStats stats() const override;
 };
 
 NNCacheTableDirect::Entry::Entry()
@@ -369,6 +406,31 @@ void NNCacheTableDirect::clear() {
   }
 }
 
+// A snapshot, taken one lock region at a time rather than under a single global lock:
+// the table has no global lock and inventing one for a reporting call would be a new
+// serialisation point on a path that never had one. The consequence is stated rather
+// than hidden -- concurrent writers can move entries between regions the walk has
+// already passed and regions it has not, so under live traffic this is an approximation
+// whose error is bounded by the number of writes that land during the walk. The harness
+// that uses it takes it between measured windows, with no other thread running, where
+// it is exact.
+NNCacheStats NNCacheTableDirect::stats() const {
+  NNCacheStats s = {0,0,0,(int64_t)tableSize};
+  for(uint64_t idx = 0; idx<tableSize; idx++) {
+    std::mutex& mutex = mutexPool->getMutex((uint32_t)idx & mutexPoolMask);
+    std::lock_guard<std::mutex> lock(mutex);
+    const Entry& entry = entries[idx];
+    if(entry.ptr != nullptr) {
+      s.residentEntries += 1;
+      s.residentPayloadBytes += (int64_t)nnOutputFootprintBytes(*entry.ptr);
+    }
+  }
+  s.fixedStructureBytes =
+    (int64_t)(tableSize * sizeof(Entry)) +
+    (int64_t)((uint64_t)mutexPoolMask + 1) * (int64_t)sizeof(std::mutex);
+  return s;
+}
+
 }  // namespace
 
 //-------------------------------------------------------------------------------------
@@ -415,6 +477,24 @@ unique_ptr<NNCacheTable> NNCacheTable::create(const NNCacheConfig& config) {
   case NNCacheAdmissionPolicy::SecondSighting:
     table = makeSecondSightingNNCacheTable(std::move(table), config.sizePowerOfTwo);
     break;
+  }
+
+  // Trace recording, outermost so that what it records is what the ENGINE asked of the
+  // cache -- every get and every set as offered, before admission decides whether a set
+  // is stored. That is the stream a replay of another policy needs; recording inside the
+  // admission filter would bake this run's admission policy into the trace and make the
+  // admission axis unsweepable.
+  //
+  // Reached only through the environment, and only once, at construction: the shipped
+  // get/set path contains no test for this at all, because when it is not asked for the
+  // decorator is not there (ADR-0009 -- the instrument stays outside the instrument).
+  const char* tracePath = getenv(NNCacheTrace::TRACE_ENV);
+  if(tracePath != NULL && tracePath[0] != '\0') {
+    cerr << "NNCache: " << NNCacheTrace::TRACE_ENV << " is set, recording every cache operation to "
+         << tracePath << endl;
+    cerr << "NNCache: this serialises every cache operation through one lock. It is a CAPTURE run. "
+         << "Do NOT read timings from it." << endl;
+    table = NNCacheTrace::wrapWithTrace(std::move(table), string(tracePath));
   }
   return table;
 }

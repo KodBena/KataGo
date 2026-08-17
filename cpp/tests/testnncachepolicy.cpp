@@ -323,10 +323,16 @@ static void testRandomChoosesUniformlyAmongWays() {
 // Chaining and the byte budget
 //-------------------------------------------------------------------------------------
 
-static NNCacheConfig chainedConfig(int64_t maxBytes, int sizePowerOfTwo, int mutexPoolSizePowerOfTwo) {
+// The capacity eviction order is now an argument rather than an unnameable recency
+// policy, so every chained scenario states which order it is asserting against. The
+// scenarios that predate the change pass Lru, which is the order that was already in
+// force, so they assert exactly what they asserted before.
+static NNCacheConfig chainedConfig(
+  int64_t maxBytes, int sizePowerOfTwo, int mutexPoolSizePowerOfTwo, NNCacheEvictionPolicy eviction
+) {
   NNCacheConfig config = {
     sizePowerOfTwo, mutexPoolSizePowerOfTwo,
-    NNCacheShape::chained(maxBytes),
+    NNCacheShape::chained(maxBytes,eviction),
     NNCacheAdmissionPolicy::Always
   };
   return config;
@@ -361,7 +367,7 @@ static void testChainedByteBudgetCountsTheRealFootprint() {
   // Bare entries: insert one more than fits. The least recently used, which is the one
   // inserted first and never sighted, is the one that goes.
   {
-    unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow));
+    unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lru));
     vector<Hash128> keys;
     for(int64_t i = 0; i < bareFit+1; i++) {
       keys.push_back(keyAt((uint64_t)(i % 4), (int)i));   // buckets 0..3, all in region 0
@@ -374,7 +380,7 @@ static void testChainedByteBudgetCountsTheRealFootprint() {
 
   // Ownermap entries under the identical budget: fewer survive, by measurement.
   {
-    unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow));
+    unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lru));
     vector<Hash128> keys;
     for(int64_t i = 0; i < bareFit+1; i++) {
       keys.push_back(keyAt((uint64_t)(i % 4), (int)i));
@@ -397,7 +403,7 @@ static void testChainedSweepEvictsByRecency() {
   shared_ptr<NNOutput> bareProto = entryFor(keyAt(0,0),false);
   const int64_t maxBytes = (int64_t)chainedEntryBytes(*bareProto) * 3 * 4;
 
-  unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow));
+  unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lru));
   const Hash128 a = keyAt(0,0), b = keyAt(1,1), c = keyAt(2,2), d = keyAt(3,3);
   table->set(entryFor(a,false));
   table->set(entryFor(b,false));
@@ -420,7 +426,7 @@ static void testChainedRechargesAnUpgradedEntry() {
   // A budget of exactly two bare entries per region.
   const int64_t maxBytes = (int64_t)chainedEntryBytes(*bareProto) * 2 * 4;
 
-  unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow));
+  unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lru));
   const Hash128 a = keyAt(0,0), b = keyAt(1,1);
   table->set(entryFor(a,false));
   table->set(entryFor(b,false));
@@ -436,6 +442,176 @@ static void testChainedRechargesAnUpgradedEntry() {
   table->set(entryFor(a,true));
   testAssert(present(*table,a));
   testAssert(!present(*table,b));
+}
+
+// The chained capacity sweep under `random`. Two things are asserted, and the second is
+// the one that distinguishes random from lru rather than merely exercising it.
+static void testChainedRandomEvictsExactlyOneResident() {
+  const int sizePow = 4, poolPow = 2;
+  shared_ptr<NNOutput> bareProto = entryFor(keyAt(0,0),false);
+  const int64_t maxBytes = (int64_t)chainedEntryBytes(*bareProto) * 3 * 4;
+  const Hash128 keys[4] = { keyAt(0,0), keyAt(1,1), keyAt(2,2), keyAt(3,3) };
+
+  // Exactly one victim per over-budget insert: not zero (which would break the bound)
+  // and not two (which would evict more than the newcomer cost).
+  {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Random));
+    for(int i = 0; i<3; i++)
+      table->set(entryFor(keys[i],false));
+    table->set(entryFor(keys[3],false));
+    int survivors = 0;
+    for(int i = 0; i<4; i++)
+      survivors += present(*table,keys[i]) ? 1 : 0;
+    testAssert(survivors == 3);
+  }
+
+  // And the order is not the recency one. Ten distinct keys are inserted into one
+  // region whose budget holds three. Under `lru` the survivors are then EXACTLY the
+  // three most recent, every time and by construction -- that is what
+  // testChainedSweepEvictsByRecency pins. So asserting that this survivor set is not
+  // {the last three} distinguishes `random` from a recency order quietly wearing its
+  // name, rather than merely exercising the code path. The region rng is seeded from
+  // the region index and nothing else, so this is exact and deterministic run to run,
+  // not a sample given a tolerance.
+  {
+    const int numKeys = 10;
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Random));
+    vector<Hash128> many;
+    for(int i = 0; i<numKeys; i++) {
+      many.push_back(keyAt((uint64_t)(i % 4), 200+i));   // buckets 0..3, all region 0
+      table->set(entryFor(many.back(),false));
+    }
+    int survivors = 0;
+    bool matchesRecencyOutcome = true;
+    for(int i = 0; i<numKeys; i++) {
+      const bool here = present(*table,many[(size_t)i]);
+      survivors += here ? 1 : 0;
+      if(here != (i >= numKeys-3))
+        matchesRecencyOutcome = false;
+    }
+    testAssert(survivors == 3);            // the budget is still hard, whatever the order
+    testAssert(!matchesRecencyOutcome);    // and it is not the recency order
+    cout << "  chained random: 10 keys into a 3-entry region left 3 residents, and they are"
+         << " NOT the last 3 inserted (which is exactly what lru would leave)" << endl;
+  }
+}
+
+// The chained capacity sweep under `lfu`. Both scenarios keep the region at or below
+// LFU_SAMPLE_SIZE entries, where the sample IS the region and the choice is therefore
+// exact -- so these are logic invariants asserted with no tolerance, not samples.
+static void testChainedLfuEvictsTheLeastFrequentlyUsed() {
+  const int sizePow = 4, poolPow = 2;
+  shared_ptr<NNOutput> bareProto = entryFor(keyAt(0,0),false);
+  const int64_t maxBytes = (int64_t)chainedEntryBytes(*bareProto) * 3 * 4;
+
+  unique_ptr<NNCacheTable> table =
+    NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lfu));
+  const Hash128 a = keyAt(0,0), b = keyAt(1,1), c = keyAt(2,2), d = keyAt(3,3);
+  table->set(entryFor(a,false));
+  table->set(entryFor(b,false));
+  table->set(entryFor(c,false));
+  // All three were admitted at floor+1 = 1. Sight A three times and B once, leaving C
+  // the least frequent by construction; every get here is a sighting, which is the trap
+  // named at the top of this file, and it is being used deliberately.
+  testAssert(present(*table,a));
+  testAssert(present(*table,a));
+  testAssert(present(*table,a));
+  testAssert(present(*table,b));
+
+  table->set(entryFor(d,false));
+  testAssert(present(*table,a));
+  testAssert(present(*table,b));
+  testAssert(!present(*table,c));   // C, and only C: fewest sightings
+  testAssert(present(*table,d));
+}
+
+// The aging property, which is what makes this LFUDA rather than naive LFU: an entry
+// with a high frozen count is eventually overtaken instead of becoming immortal.
+static void testChainedLfuAgesAStaleEntry() {
+  const int sizePow = 4, poolPow = 2;
+  shared_ptr<NNOutput> bareProto = entryFor(keyAt(0,0),false);
+  const int64_t maxBytes = (int64_t)chainedEntryBytes(*bareProto) * 2 * 4;
+
+  const Hash128 a = keyAt(0,0);
+
+  // A is probed only ONCE per table, at the very end, and the whole scenario is rebuilt
+  // from scratch for each newcomer count. That is not fastidiousness: a get() is a
+  // SIGHTING under LFU, so probing A inside the loop would bump the very count the test
+  // is asserting has gone stale, and the entry would stay ahead of the aging floor
+  // forever. This is the trap named at the top of this file, and it is the one that
+  // would silently turn this test into a test of nothing.
+  const int maxNewcomers = 40;
+  int diedAfter = -1;
+  for(int n = 0; n <= maxNewcomers && diedAfter < 0; n++) {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lfu));
+    table->set(entryFor(a,false));
+    for(int i = 0; i<4; i++)          // A reaches count 5, then is never referenced again
+      testAssert(present(*table,a));
+    for(int i = 0; i<n; i++)          // newcomers, none of them ever re-referenced
+      table->set(entryFor(keyAt((uint64_t)(1 + (i % 3)), 100+i),false));
+    if(!present(*table,a))
+      diedAfter = n;
+  }
+
+  // The assertion is the aging property itself, and it is a logic invariant with no
+  // tolerance: under NAIVE LFU there is no finite n at all, because every newcomer would
+  // enter at count 1 against A's frozen 5 and A would be immortal. Under LFUDA the floor
+  // climbs past 5 and A dies. That a finite n exists is the whole difference between the
+  // algorithm that shipped and the one it replaced.
+  testAssert(diedAfter > 0);
+  testAssert(diedAfter <= maxNewcomers);
+  cout << "  chained lfu aging: the stale high-count entry survived " << (diedAfter-1)
+       << " unreferenced newcomers and died on the " << diedAfter
+       << "th (naive LFU: never dies)" << endl;
+}
+
+// stats() is what every byte and occupancy figure the sweep reports comes from, so it is
+// asserted against a scenario whose resident set is known by construction, not merely
+// printed.
+static void testChainedStatsReportWhatIsResident() {
+  const int sizePow = 4, poolPow = 2;
+  shared_ptr<NNOutput> bareProto = entryFor(keyAt(0,0),false);
+  shared_ptr<NNOutput> ownerProto = entryFor(keyAt(0,0),true);
+  const int64_t maxBytes = (int64_t)chainedEntryBytes(*bareProto) * 3 * 4;
+
+  unique_ptr<NNCacheTable> table =
+    NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lru));
+  table->set(entryFor(keyAt(0,0),false));
+  table->set(entryFor(keyAt(1,1),true));
+
+  const NNCacheStats s = table->stats();
+  testAssert(s.residentEntries == 2);
+  // The payload figure counts the ownership map, which is a separate heap block: the
+  // whole reason the sweep reports bytes rather than a count.
+  testAssert(
+    s.residentPayloadBytes ==
+    (int64_t)(nnOutputFootprintBytes(*bareProto) + nnOutputFootprintBytes(*ownerProto))
+  );
+  // A chained table is bounded by bytes and has no slot capacity, so it reports none
+  // rather than a denominator someone downstream would divide by.
+  testAssert(s.capacitySlots == 0);
+  testAssert(s.fixedStructureBytes > 0);
+}
+
+// The same for a probed table, where capacitySlots IS meaningful and occupancy is the
+// quantity the whole sweep is organised around.
+static void testProbedStatsReportOccupancy() {
+  unique_ptr<NNCacheTable> table = NNCacheTable::create(
+    probedConfig(NNCacheCollisionScheme::LinearProbe,WAYS,NNCacheEvictionPolicy::Lru,SIZE_POW,POOL_POW)
+  );
+  for(int i = 0; i<3; i++)
+    table->set(entryFor(keyAt(0,i),false));
+
+  const NNCacheStats s = table->stats();
+  testAssert(s.residentEntries == 3);
+  testAssert(s.capacitySlots == (((int64_t)1) << SIZE_POW));
+  testAssert(s.residentPayloadBytes == 3 * (int64_t)sizeof(NNOutput));
+  // Occupancy is exactly 3/16 here, which is the arithmetic the sweep does; asserting it
+  // means the sweep's denominator is the table's own, not a second copy of it.
+  testAssert(s.residentEntries * 16 == 3 * s.capacitySlots);
 }
 
 //-------------------------------------------------------------------------------------
@@ -487,7 +663,7 @@ static void testSecondSightingComposesWithEveryShape() {
   configs.push_back(probedConfig(NNCacheCollisionScheme::LinearProbe,4,NNCacheEvictionPolicy::Lru,8,4));
   configs.push_back(probedConfig(NNCacheCollisionScheme::QuadraticProbe,4,NNCacheEvictionPolicy::Lfu,8,4));
   shared_ptr<NNOutput> proto = entryFor(keyAt(0,0),false);
-  configs.push_back(chainedConfig((int64_t)chainedEntryBytes(*proto) * 8 * 16, 8, 4));
+  configs.push_back(chainedConfig((int64_t)chainedEntryBytes(*proto) * 8 * 16, 8, 4, NNCacheEvictionPolicy::Lru));
 
   for(size_t i = 0; i<configs.size(); i++) {
     unique_ptr<NNCacheTable> table = NNCacheTable::create(
@@ -516,7 +692,7 @@ static void testEveryShapeConstructsAndCaches() {
     for(int e = 0; e<3; e++)
       configs.push_back(probedConfig(schemes[s],4,evictions[e],8,4));
   shared_ptr<NNOutput> proto = entryFor(keyAt(0,0),false);
-  configs.push_back(chainedConfig((int64_t)chainedEntryBytes(*proto) * 8 * 16, 8, 4));
+  configs.push_back(chainedConfig((int64_t)chainedEntryBytes(*proto) * 8 * 16, 8, 4, NNCacheEvictionPolicy::Lru));
 
   for(size_t i = 0; i<configs.size(); i++) {
     unique_ptr<NNCacheTable> table = NNCacheTable::create(configs[i]);
@@ -563,7 +739,7 @@ static void testChainedBudgetTooSmallForARegionIsRefused() {
   string what;
   try {
     // 2^4 buckets in 2^2 regions, with a budget that cannot hold one entry per region.
-    (void)NNCacheTable::create(chainedConfig(1000,4,2));
+    (void)NNCacheTable::create(chainedConfig(1000,4,2,NNCacheEvictionPolicy::Lru));
   }
   catch(const StringError& e) { threw = true; what = e.what(); }
   testAssert(threw);
@@ -593,6 +769,11 @@ void Tests::runNNCachePolicyTests() {
   testChainedByteBudgetCountsTheRealFootprint();
   testChainedSweepEvictsByRecency();
   testChainedRechargesAnUpgradedEntry();
+  testChainedRandomEvictsExactlyOneResident();
+  testChainedLfuEvictsTheLeastFrequentlyUsed();
+  testChainedLfuAgesAStaleEntry();
+  testChainedStatsReportWhatIsResident();
+  testProbedStatsReportOccupancy();
 
   testSecondSightingAdmission();
   testSecondSightingComposesWithEveryShape();

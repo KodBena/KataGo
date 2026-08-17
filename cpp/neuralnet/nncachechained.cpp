@@ -48,19 +48,67 @@ using namespace std;
 // The capacity sweep
 // ---------------------------------------------------------------------------
 // It is not a periodic sweep and there is no background thread. Every insert into a
-// region ends by popping that region's LRU tail until the region is back under budget,
+// region ends by giving up victims until the region is back under budget,
 // so the work is amortised O(1) per insert -- an insert adds one entry's bytes and
 // therefore removes at most one entry's bytes worth of others -- and it is bounded by
 // the region, not the table. Evicted payload pointers are moved to a local buffer and
 // released after the lock is dropped, so no free ever happens under the lock.
 //
-// The order the sweep evicts in is recency: a get() moves its node to the region's LRU
-// head. That order is not currently expressible in the config -- nnCacheEviction under
-// chain is required to be `none`, which means "a collision never evicts", not "nothing
-// is ever evicted". Making the capacity order configurable would need a new
-// NNCacheShape factory; it is deliberately not invented here.
+// ---------------------------------------------------------------------------
+// Which resident entry the sweep gives up
+// ---------------------------------------------------------------------------
+// This is nnCacheEviction under nnCacheCollision = chain, and it is a real choice with
+// three answers, not a formality. It is a DIFFERENT TRIGGER from the probed table's
+// eviction -- there it fires because a bucket's ways are all taken, here because a
+// region is over its byte budget -- but it is the same question, "which resident entry
+// is given up", so it is the same config axis.
+//
+// Each of the three is exact where exactness is cheap, and the one place it is not is
+// named rather than hidden:
+//
+//   lru     EXACT. The region's node list is kept in recency order -- a get() moves its
+//           node to the head -- so the victim is the tail, in O(1). This is the order
+//           that was already in force before the axis was expressible, so `lru` is the
+//           value that changes nothing.
+//   random  EXACT and uniform. The region's roster is a flat vector of its nodes, so a
+//           uniform victim is one modulo away, in O(1).
+//   lfu     SAMPLED, not exact. LFU with Dynamic Aging as on the probed table -- a
+//           region floor equal to the last victim's count, newcomers admitted at
+//           floor+1 -- but the victim is the least-frequent of LFU_SAMPLE_SIZE nodes
+//           drawn uniformly from the roster, not of the whole region. The probed table
+//           can be exact because a bucket offers `ways` candidates and `ways` is small;
+//           a chained region holds however many entries its budget buys, which at a 4GB
+//           budget over 2^13 regions is on the order of 165, and an exact minimum would
+//           be a linear scan per eviction. A bucket-list min structure would restore
+//           exactness in O(1); it was rejected as a large structure to build before the
+//           sweep has said whether lfu is worth having at all. When a region holds
+//           LFU_SAMPLE_SIZE nodes or fewer the sample IS the region and the choice is
+//           exact, which is the case every test below constructs.
+//
+// What the two structures cost, stated rather than buried: the roster adds 8 bytes per
+// resident entry plus one vector header per region, and the roster index adds 8 bytes
+// to every Node after alignment -- paid by all three policies, including lru, which
+// does not use the roster. Keeping one Node layout rather than templating the table
+// over its policy is the deliberate trade: against ~1592 bytes for a bare entry and
+// ~3036 with an ownership map, 8 bytes is under 0.6%, and one table is one thing to get
+// right instead of three.
 
 namespace {
+
+// Redis's sampled-eviction constant, and the same reasoning: a sample of a handful
+// picks a near-minimum with high probability, and the quality gain from a larger sample
+// falls off fast. It is a constant here rather than a config key because a knob nobody
+// can calibrate is worse than a documented number (ADR-0002 rung 1 is about refusing,
+// not about offering every dial).
+static const int LFU_SAMPLE_SIZE = 8;
+
+inline uint64_t chainedSplitMix64(uint64_t& state) {
+  state += 0x9E3779B97F4A7C15ULL;
+  uint64_t z = state;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
 
 class NNCacheTableChained final : public NNCacheTable {
   struct Node {
@@ -70,12 +118,17 @@ class NNCacheTableChained final : public NNCacheTable {
     Node* chainNext;
     Node* lruPrev;     // toward the most recently used end
     Node* lruNext;     // toward the least recently used end
+    uint32_t rosterIdx;  // its own position in the region's roster, so removal is O(1)
+    uint32_t count;      // LFUDA reference count; unused under lru and random
   };
 
   struct Region {
     Node* lruHead;
     Node* lruTail;
     int64_t bytesUsed;
+    std::vector<Node*> roster;  // every node in the region, in no order; for O(1) sampling
+    uint64_t rng;               // splitmix64 state, seeded from the region index
+    uint32_t floor;             // LFUDA aging floor: the last victim's count
   };
 
   Node** buckets;
@@ -84,14 +137,18 @@ class NNCacheTableChained final : public NNCacheTable {
   uint64_t bucketMask;
   int regionShift;
   int64_t regionBudgetBytes;
+  NNCacheEvictionPolicy eviction;
 
  public:
-  NNCacheTableChained(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo, int64_t maxBytes);
+  NNCacheTableChained(
+    int sizePowerOfTwo, int mutexPoolSizePowerOfTwo, int64_t maxBytes, NNCacheEvictionPolicy evictionArg
+  );
   ~NNCacheTableChained() override;
 
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override;
   void set(const std::shared_ptr<NNOutput>& p) override;
   void clear() override;
+  NNCacheStats stats() const override;
 
   // The one definition of what an entry costs the budget. chainedEntryBytes() below
   // re-exports it so a test asserts against this and never against its own arithmetic
@@ -130,11 +187,86 @@ class NNCacheTableChained final : public NNCacheTable {
       link = &((*link)->chainNext);
     }
   }
+  // Roster membership: push_back to join, swap-with-last to leave, so both are O(1) and
+  // the vector never has a hole. The moved node's stored index is fixed up, which is the
+  // whole reason the index lives in the node.
+  void rosterPush(Region& rs, Node* n) {
+    n->rosterIdx = (uint32_t)rs.roster.size();
+    rs.roster.push_back(n);
+  }
+  void rosterRemove(Region& rs, Node* n) {
+    const size_t idx = (size_t)n->rosterIdx;
+    Node* moved = rs.roster.back();
+    rs.roster[idx] = moved;
+    moved->rosterIdx = (uint32_t)idx;
+    rs.roster.pop_back();
+  }
+
+  // The one place the eviction axis is read. Returns the node this region gives up, or
+  // NULL when it holds nothing.
+  Node* chooseVictim(Region& rs) {
+    if(rs.roster.empty())
+      return NULL;
+    switch(eviction) {
+    case NNCacheEvictionPolicy::Lru:
+      return rs.lruTail;
+    case NNCacheEvictionPolicy::Random:
+      return rs.roster[(size_t)(chainedSplitMix64(rs.rng) % (uint64_t)rs.roster.size())];
+    case NNCacheEvictionPolicy::Lfu: {
+      const size_t n = rs.roster.size();
+      if(n <= (size_t)LFU_SAMPLE_SIZE) {
+        // The sample is the whole region, so this arm is exact.
+        Node* best = rs.roster[0];
+        for(size_t i = 1; i<n; i++)
+          if(rs.roster[i]->count < best->count)
+            best = rs.roster[i];
+        return best;
+      }
+      Node* best = NULL;
+      for(int i = 0; i<LFU_SAMPLE_SIZE; i++) {
+        Node* cand = rs.roster[(size_t)(chainedSplitMix64(rs.rng) % (uint64_t)n)];
+        if(best == NULL || cand->count < best->count)
+          best = cand;
+      }
+      return best;
+    }
+    case NNCacheEvictionPolicy::None:
+      break;
+    }
+    // NNCacheShape::chained already refuses None, so reaching here means the shape type
+    // was bypassed. Refuse rather than silently pick an order nobody asked for.
+    throw StringError(
+      "NNCacheTableChained: eviction policy 'none' has no capacity-sweep implementation; a "
+      "chained table's byte budget is always enforced, so a victim must be chosen."
+    );
+  }
+
+  // Recording a sighting: what a get() on a hit, or a set() of a key already resident,
+  // does to the policy's state. LRU reorders; LFUDA counts, saturating; Random has
+  // nothing to remember, and skipping the list reorder there is not an optimization but
+  // the honest thing -- a recency order Random never reads would be a lie in the data
+  // structure.
+  void onSighting(Region& rs, Node* n) {
+    switch(eviction) {
+    case NNCacheEvictionPolicy::Lru: lruTouch(rs,n); break;
+    case NNCacheEvictionPolicy::Lfu: if(n->count != 0xFFFFFFFFu) n->count += 1; break;
+    case NNCacheEvictionPolicy::Random: break;
+    case NNCacheEvictionPolicy::None: break;
+    }
+  }
 };
 
-NNCacheTableChained::NNCacheTableChained(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo, int64_t maxBytes)
-  :buckets(NULL),regions(NULL),mutexPool(NULL),bucketMask(0),regionShift(0),regionBudgetBytes(0)
+NNCacheTableChained::NNCacheTableChained(
+  int sizePowerOfTwo, int mutexPoolSizePowerOfTwo, int64_t maxBytes, NNCacheEvictionPolicy evictionArg
+)
+  :buckets(NULL),regions(NULL),mutexPool(NULL),bucketMask(0),regionShift(0),regionBudgetBytes(0),
+   eviction(evictionArg)
 {
+  if(evictionArg == NNCacheEvictionPolicy::None)
+    throw StringError(
+      "NNCacheTableChained: eviction policy 'none' has no capacity-sweep implementation; a "
+      "chained table's byte budget is always enforced, so a victim must be chosen."
+    );
   if(sizePowerOfTwo < 0 || sizePowerOfTwo > 63)
     throw StringError("NNCacheTable: Invalid sizePowerOfTwo: " + Global::intToString(sizePowerOfTwo));
   if(mutexPoolSizePowerOfTwo < 0 || mutexPoolSizePowerOfTwo > 31)
@@ -166,6 +298,14 @@ NNCacheTableChained::NNCacheTableChained(int sizePowerOfTwo, int mutexPoolSizePo
 
   buckets = new Node*[numBuckets]();
   regions = new Region[numRegions]();
+  for(uint32_t r = 0; r < numRegions; r++) {
+    // Seeded from the region index and nothing else: run-deterministic on purpose, for
+    // the same reason the probed table's Random is -- a victim distribution that changed
+    // run to run could not be asserted against at all.
+    uint64_t seed = (uint64_t)r * 0x2545F4914F6CDD1DULL + 0x9E3779B97F4A7C15ULL;
+    regions[r].rng = chainedSplitMix64(seed);
+    regions[r].floor = 0;
+  }
   mutexPool = new MutexPool(numRegions);
 }
 
@@ -196,7 +336,7 @@ bool NNCacheTableChained::get(Hash128 nnHash, shared_ptr<NNOutput>& ret) {
     // no dereference of the payload at all -- the inline-tag question, answered by
     // construction on this shape rather than by a 32-bit approximation.
     if(n->hash == nnHash) {
-      lruTouch(regions[regionIdx], n);
+      onSighting(regions[regionIdx], n);
       ret = n->ptr;
       return true;
     }
@@ -234,7 +374,7 @@ void NNCacheTableChained::set(const shared_ptr<NNOutput>& p) {
       found->ptr.swap(buf);
       rs.bytesUsed += (int64_t)entryBytes - (int64_t)found->bytes;
       found->bytes = entryBytes;
-      lruTouch(rs,found);
+      onSighting(rs,found);
     }
     else {
       Node* n = spare;
@@ -245,12 +385,23 @@ void NNCacheTableChained::set(const shared_ptr<NNOutput>& p) {
       n->chainNext = buckets[bucket];
       buckets[bucket] = n;
       lruPushFront(rs,n);
+      rosterPush(rs,n);
+      // LFUDA admits a newcomer at the aging floor plus one, so an entry whose count
+      // froze long ago is eventually overtaken instead of becoming immortal. Under lru
+      // and random this field is never read.
+      n->count = rs.floor == 0xFFFFFFFFu ? 0xFFFFFFFFu : rs.floor + 1;
       rs.bytesUsed += (int64_t)entryBytes;
     }
 
-    while(rs.bytesUsed > regionBudgetBytes && rs.lruTail != NULL) {
-      Node* victim = rs.lruTail;
+    while(rs.bytesUsed > regionBudgetBytes) {
+      Node* victim = chooseVictim(rs);
+      if(victim == NULL)
+        break;
+      // The floor only ever rises, which is what makes the aging monotone.
+      if(victim->count > rs.floor)
+        rs.floor = victim->count;
       lruUnlink(rs,victim);
+      rosterRemove(rs,victim);
       chainUnlink(bucketOf(victim->hash), victim);
       rs.bytesUsed -= (int64_t)victim->bytes;
       freeAfterUnlock.emplace_back();
@@ -284,9 +435,45 @@ void NNCacheTableChained::clear() {
       rs.lruHead = NULL;
       rs.lruTail = NULL;
       rs.bytesUsed = 0;
+      // Back to exactly what a fresh table has, including the policy state: a surviving
+      // aging floor would let a cleared table go on evicting newcomers as if they were
+      // stale, and a surviving rng stream would make clear() a hidden input to the
+      // victim sequence.
+      rs.roster.clear();
+      rs.floor = 0;
+      uint64_t seed = (uint64_t)r * 0x2545F4914F6CDD1DULL + 0x9E3779B97F4A7C15ULL;
+      rs.rng = chainedSplitMix64(seed);
     }
     freeAfterUnlock.clear();
   }
+}
+
+// A snapshot taken one region at a time; see NNCacheTableDirect::stats for why there is
+// no global lock and what that costs under live traffic.
+//
+// capacitySlots is 0 and deliberately so: a chained table has no slot capacity to be a
+// fraction of. Its occupancy question is bytesUsed against the budget, which is
+// residentPayloadBytes plus the node bytes inside fixedStructureBytes -- so a reader who
+// wants "how full is it" reads bytes here, never a count over a made-up denominator.
+NNCacheStats NNCacheTableChained::stats() const {
+  const uint32_t numRegions = mutexPool->getNumMutexes();
+  NNCacheStats s = {0,0,0,0};
+  int64_t nodeBytes = 0;
+  for(uint32_t r = 0; r < numRegions; r++) {
+    std::lock_guard<std::mutex> lock(mutexPool->getMutex(r));
+    const Region& rs = regions[r];
+    for(const Node* n = rs.lruHead; n != NULL; n = n->lruNext) {
+      s.residentEntries += 1;
+      s.residentPayloadBytes += (int64_t)nnOutputFootprintBytes(*n->ptr);
+      nodeBytes += (int64_t)sizeof(Node);
+    }
+    nodeBytes += (int64_t)(rs.roster.capacity() * sizeof(Node*));
+  }
+  s.fixedStructureBytes =
+    (int64_t)((bucketMask+1) * sizeof(Node*)) +
+    (int64_t)numRegions * (int64_t)(sizeof(std::mutex) + sizeof(Region)) +
+    nodeBytes;
+  return s;
 }
 
 }  // namespace
@@ -305,6 +492,9 @@ unique_ptr<NNCacheTable> makeChainedNNCacheTable(const NNCacheConfig& config) {
   if(config.shape.scheme() != NNCacheCollisionScheme::Chain)
     throw StringError("makeChainedNNCacheTable: '" + config.shape.toString() + "' is not a chained shape.");
   return unique_ptr<NNCacheTable>(
-    new NNCacheTableChained(config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo, config.shape.maxBytes())
+    new NNCacheTableChained(
+      config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo,
+      config.shape.maxBytes(), config.shape.eviction()
+    )
   );
 }
