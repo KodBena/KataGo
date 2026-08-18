@@ -9,6 +9,7 @@
 
 #include "../core/fileutils.h"
 #include "../core/rand.h"
+#include "../neuralnet/nncachefileformat.h"
 #include "../neuralnet/nnevalcontainer.h"
 
 using namespace std;
@@ -240,6 +241,11 @@ uint64_t readU64(const uint8_t* p) {
   return v;
 }
 
+void writeU64(uint8_t* p, uint64_t v) {
+  for(int i = 0; i < 8; i++)
+    p[i] = (uint8_t)(v >> (8 * i));
+}
+
 NNEvalContainer containerIn(const ScopedTempDir& dir, const char* context) {
   return NNEvalContainer::forContextAndModel(dir.path(), context, MODEL, MODEL_VERSION);
 }
@@ -352,6 +358,61 @@ void testEvalContainerMergeIsLastWinsExceptAnOwnershipMapIsNeverLost() {
     testAssert(contents.entries().size() == 3);
     assertSameEvaluation(*a3, entryFor(contents, 1));
   }
+}
+
+// The same never-lose-an-ownership-map rule, for a map that was NOT established in the first
+// block.
+//
+// Why this is a leg of its own rather than another key in the test above. That test always
+// establishes the protected map in block 1, so every assertion it makes is consistent with an
+// implementation that only protects an entry the file OPENED with -- one that treats "carries
+// a map" as a property of the original insertion rather than of the entry currently standing.
+// Nothing in applyEntry is written that way, but the test could not tell, and a rule that
+// holds only for the first block is exactly the shape a later refactor could introduce
+// unnoticed. Here the map arrives in block 2, having itself superseded a map-less entry, and
+// must still stand against block 3.
+void testEvalContainerAnOwnershipMapEarnedInALaterBlockIsAlsoNeverLost() {
+  ScopedTempDir dir;
+  const NNEvalContainer container = containerIn(dir, "latemap");
+
+  // Block 1: key 1 WITHOUT a map. Key 2 is a control that never has a map at all.
+  const shared_ptr<NNOutput> a1 = makeOutput(1, 1, 19, 19, false);
+  const shared_ptr<NNOutput> b1 = makeOutput(2, 1, 19, 19, false);
+  container.appendBlock({asStored(a1), asStored(b1)});
+
+  // Block 2: key 1 WITH a map, superseding normally. The map is now established, mid-file.
+  const shared_ptr<NNOutput> a2 = makeOutput(1, 2, 19, 19, true);
+  container.appendBlock({asStored(a2)});
+  {
+    const NNEvalContainerContents contents = container.load();
+    assertSameEvaluation(*a2, entryFor(contents, 1));
+    testAssert(entryFor(contents, 1).whiteOwnerMap != NULL);
+  }
+
+  // Block 3: key 1 WITHOUT a map again. It must not win.
+  const shared_ptr<NNOutput> a3 = makeOutput(1, 3, 19, 19, false);
+  // Key 2 rides along in the same block, map-less both times, and MUST supersede. Without it
+  // this test would also pass against an implementation that ignored block 3 wholesale, and
+  // key 1's survival would be an observation of nothing (ADR-0021 Rule 4: the red, and the
+  // green, must be for the right reason).
+  const shared_ptr<NNOutput> b3 = makeOutput(2, 3, 19, 19, false);
+  container.appendBlock({asStored(a3), asStored(b3)});
+
+  const NNEvalContainerContents contents = container.load();
+  testAssert(contents.blocksApplied() == 3);
+  testAssert(contents.entriesApplied() == 5);
+  testAssert(contents.entries().size() == 2);
+
+  // THE HEADLINE CLAIM: key 1 is still block 2's evaluation, map intact.
+  assertSameEvaluation(*a2, entryFor(contents, 1));
+  testAssert(entryFor(contents, 1).whiteOwnerMap != NULL);
+  // AND block 3 was applied: its map-less entry for key 2 won, because key 2 had no map to
+  // lose.
+  assertSameEvaluation(*b3, entryFor(contents, 2));
+  testAssert(entryFor(contents, 2).whiteOwnerMap == NULL);
+  cout << "nnevals container: an ownership map earned in block 2 stood against block 3's "
+          "map-less entry for the same key, while block 3's other entry superseded normally"
+       << endl;
 }
 
 // THE LOAD-BEARING TEST. A crash mid-dump leaves a partial block. Exactly the dumps that
@@ -533,6 +594,96 @@ void testEvalContainerTheBlocksKeyIndexIsGatheredAfterItsHeader() {
   // And the file is exactly the header, the block header, the index, and the payloads -- no
   // interleaving, nothing else.
   testAssert(sizeOf(container.path()) == indexStart + 3 * (int64_t)NNEvalContainer::entryHeaderBytes() + runningOffset);
+}
+
+// A file from a LATER VERSION of this format -- one that sets a flag bit or a reserved header
+// byte v1 does not define -- is refused by name, not read as if the bits it does not
+// understand were absent.
+//
+// HOW THIS FILE IS FORGED, because the method is the whole reason this test exists. The
+// container is written by the REAL writer; then one bit is flipped on disk; then the two
+// checksums that bit invalidated are recomputed BY CALLING THE PRODUCTION FUNCTIONS --
+// NNCacheFileChecksum::of and NNCacheFileName::hashOf, the same functions the reader itself
+// calls to verify, public in nncachefileformat.h precisely so a caller can reuse them. No
+// checksum algorithm and no framing rule is restated here; the test knows only the strides
+// the format publishes through NNEvalContainer's own accessors, exactly as the key-index test
+// above does.
+//
+// This matters because the alternative -- flipping the bit and leaving the checksums stale --
+// would witness nothing: the block would be discarded as corrupt, the refusal under test
+// would never be reached, and the test would pass just as well with that refusal deleted. A
+// forged file whose checksums are VALID is the only input that can reach it.
+void testEvalContainerAFileFromALaterVersionIsRefusedNotSilentlyRead() {
+  ScopedTempDir dir;
+
+  // The one seed both checksums in this file are computed under. Read from the production
+  // function, for the context this container is bound to.
+  const uint64_t contextHash = NNCacheFileName::hashOf("laterversion");
+
+  // Leg 1: an undefined FLAG BIT on an entry. The entry header sits inside the block, so the
+  // block's own two checksums have to be repaired for the file to reach the flag check at
+  // all.
+  {
+    const NNEvalContainer container = containerIn(dir, "laterversion");
+    const shared_ptr<NNOutput> a = makeOutput(1, 1, 19, 19, true);
+    container.appendBlock({asStored(a)});
+
+    // It reads cleanly first, so what changes below is the one bit and nothing else.
+    {
+      const NNEvalContainerContents before = container.load();
+      testAssert(before.tail() == NNEvalContainerTail::Intact);
+      testAssert(before.entries().size() == 1);
+    }
+
+    const int64_t blockStart = NNEvalContainer::fileHeaderBytesFor(MODEL);
+    const int64_t indexStart = blockStart + (int64_t)NNEvalContainer::blockHeaderBytes();
+    // Everything the block's entry checksum covers: the gathered index, then the payloads.
+    const int64_t regionBytes = NNEvalContainer::bytesForEntry(19, 19, true);
+
+    // Set flags bit 1 -- reserved in v1, and NOT bit 0, so the entry's shape, its declared
+    // payload size and its offset all stay exactly right. The only thing wrong with this file
+    // is that it claims a feature this build does not have.
+    vector<uint8_t> flagsByte = readBytesAt(container.path(), indexStart + 16, 1);
+    testAssert((flagsByte[0] & 0x2) == 0);
+    flagsByte[0] = (uint8_t)(flagsByte[0] | 0x2);
+    overwriteBytesAt(container.path(), indexStart + 16, flagsByte);
+
+    // Repair the entry checksum over the whole region, through the production function.
+    const vector<uint8_t> region = readBytesAt(container.path(), indexStart, (size_t)regionBytes);
+    vector<uint8_t> entryChecksum(8);
+    writeU64(entryChecksum.data(), NNCacheFileChecksum::of(region.data(), region.size(), contextHash));
+    overwriteBytesAt(container.path(), blockStart + 16, entryChecksum);
+
+    // And the block header's checksum of itself, over its own first 24 bytes, same function,
+    // same seed.
+    const vector<uint8_t> blockHeader = readBytesAt(container.path(), blockStart, 24);
+    vector<uint8_t> headerChecksum(8);
+    writeU64(headerChecksum.data(), NNCacheFileChecksum::of(blockHeader.data(), blockHeader.size(), contextHash));
+    overwriteBytesAt(container.path(), blockStart + 24, headerChecksum);
+
+    // THE CLAIM: this is a well-formed, correctly-checksummed container that v1 must refuse.
+    // Asserted on the DIAGNOSIS, because a refusal that merely said "corrupt" would mean the
+    // forgery had failed and the checksums, not the flag, had caught it.
+    const string message = loadRefusalMessage(container);
+    testAssert(message.find("flag bits this build does not define") != string::npos);
+    testAssert(message.find("later version") != string::npos);
+    // Printed, because this refusal is the one the format's forward-compatibility story rests
+    // on and the message is what an operator meeting a future file will actually see.
+    cout << "nnevals container: a forged v1 file setting an undefined flag bit, with both "
+            "block checksums valid, was refused: " << message << endl;
+  }
+
+  // Leg 2: a reserved FILE-HEADER byte. The file header carries no checksum of its own -- it
+  // is verified field by field instead -- so this one needs no repair, which is worth stating
+  // rather than leaving the reader to wonder why the two legs look so different.
+  {
+    const NNEvalContainer container = containerIn(dir, "laterheader");
+    container.appendBlock({asStored(makeOutput(1, 1, 19, 19, false))});
+    testAssert(!loadIsRefused(container));
+    overwriteBytesAt(container.path(), 40, vector<uint8_t>{0, 0, 0, 1, 0, 0, 0, 0});
+    const string message = loadRefusalMessage(container);
+    testAssert(message.find("reserved file-header byte") != string::npos);
+  }
 }
 
 // A block that is the RIGHT LENGTH but wrong in its bytes -- the shape a lost page leaves,
@@ -877,9 +1028,11 @@ void Tests::runNNEvalContainerTests() {
 
   testEvalContainerRoundTripsWithAndWithoutOwnershipMaps();
   testEvalContainerMergeIsLastWinsExceptAnOwnershipMapIsNeverLost();
+  testEvalContainerAnOwnershipMapEarnedInALaterBlockIsAlsoNeverLost();
   testEvalContainerTornTailIsDiscardedAndThePrefixSurvives();
   testEvalContainerTruncationRefusesRatherThanShortReading();
   testEvalContainerTheBlocksKeyIndexIsGatheredAfterItsHeader();
+  testEvalContainerAFileFromALaterVersionIsRefusedNotSilentlyRead();
   testEvalContainerAWholeButCorruptBlockIsRejectedByItsChecksum();
   testEvalContainerACorruptBlockHeaderDoesNotProduceAPartialApplication();
   testEvalContainerTornTailIsRepairedBeforeTheNextAppend();
