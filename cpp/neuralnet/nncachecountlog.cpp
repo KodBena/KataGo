@@ -14,6 +14,7 @@
 
 #include "../core/fileutils.h"
 #include "../core/global.h"
+#include "../neuralnet/nncachefileformat.h"
 
 // The append-only per-(key, context) count log. See nncachecountlog.h for the format and
 // for why it is the shape it is; this file is the mechanism.
@@ -42,124 +43,42 @@ const size_t RECORD_BYTES = 24;
 const size_t BLOCK_HEADER_CHECKED_BYTES = 24;
 const uint32_t BLOCK_MAGIC = 0x4247434Bu;  // 'K','G','C','B' little-endian
 const int DEFAULT_COMPACTION_MULTIPLE = 4;
-const size_t MAX_CONTEXT_NAME_LEN = 128;
 
 //-------------------------------------------------------------------------------------
-// Little-endian packing, so the format is a fact about bytes and not about struct layout
+// The byte layer
 //-------------------------------------------------------------------------------------
 
-void put32(uint8_t* p, uint32_t v) {
-  p[0] = (uint8_t)(v      ); p[1] = (uint8_t)(v >>  8);
-  p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
-void put64(uint8_t* p, uint64_t v) {
-  for(int i = 0; i < 8; i++)
-    p[i] = (uint8_t)(v >> (8 * i));
-}
-uint32_t get32(const uint8_t* p) {
-  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-uint64_t get64(const uint8_t* p) {
-  uint64_t v = 0;
-  for(int i = 0; i < 8; i++)
-    v |= ((uint64_t)p[i]) << (8 * i);
-  return v;
-}
+// The little-endian packing, the checksum and the context-name boundary live in
+// nncachefileformat.h and are shared with the evaluation container, because they are one
+// fact each and not two (ADR-0012 P1/P7). In particular the CONTEXT HASH must be the same
+// function of the same validated name in both formats: an attach joins a context's
+// <context>.nncounts and <context>.<model>.nnevals by exactly that identity, and two
+// hand-copied hashes would make the join a coincidence rather than a contract.
 
-//-------------------------------------------------------------------------------------
-// The checksum
-//-------------------------------------------------------------------------------------
+using NNCacheFileBytes::put32;
+using NNCacheFileBytes::put64;
+using NNCacheFileBytes::get32;
+using NNCacheFileBytes::get64;
 
-// FNV-1a over the bytes, then an avalanche finalizer.
-//
-// It is a CORRUPTION DETECTOR, not a MAC: it defends against a crash, never against an
-// adversary. Two properties are what the torn-tail contract needs, and both are why it is
-// FNV rather than a sum or an XOR. A run of zero bytes -- the shape a page that never
-// reached the device leaves behind -- still advances the state, because the multiply runs
-// whatever the byte was. And the finalizer means a single changed bit anywhere in the input
-// changes about half the output bits, so a block that lost its last few bytes to a partial
-// flush does not checksum to the same value as the whole one.
 uint64_t checksumOf(const uint8_t* data, size_t len, uint64_t seed) {
-  uint64_t h = 0xcbf29ce484222325ULL ^ seed;
-  for(size_t i = 0; i < len; i++) {
-    h ^= (uint64_t)data[i];
-    h *= 0x100000001b3ULL;
-  }
-  h ^= h >> 33;
-  h *= 0xff51afd7ed558ccdULL;
-  h ^= h >> 33;
-  h *= 0xc4ceb9fe1a85ec53ULL;
-  h ^= h >> 33;
-  return h;
+  return NNCacheFileChecksum::of(data, len, seed);
 }
 
 uint64_t contextHashOf(const std::string& context) {
-  return checksumOf((const uint8_t*)context.data(), context.size(), 0);
+  return NNCacheFileName::hashOf(context);
 }
 
 //-------------------------------------------------------------------------------------
 // File handling
 //-------------------------------------------------------------------------------------
 
-// Owns a FILE* for its scope. The whole reason it exists is that the code below throws in
-// a dozen places between opening and closing.
-class ScopedFile {
- public:
-  ScopedFile(const std::string& path, const char* mode) : file_(std::fopen(path.c_str(), mode)) {}
-  ~ScopedFile() { if(file_ != nullptr) std::fclose(file_); }
-  ScopedFile(const ScopedFile&) = delete;
-  ScopedFile& operator=(const ScopedFile&) = delete;
+// The RAII file handle and the directory fsync are the evaluation container's too, so they
+// live in nncachefileformat.h. The names below are this file's original ones, kept so the
+// call sites read as they always did.
+using ScopedFile = NNCacheFileHandle;
 
-  bool isOpen() const { return file_ != nullptr; }
-  std::FILE* get() const { return file_; }
-
-  // Flushes the stdio buffer and then forces the bytes to the device. Returns false, rather
-  // than throwing, so the caller names the file in its own message.
-  bool flushAndSync() {
-    if(file_ == nullptr)
-      return false;
-    if(std::fflush(file_) != 0)
-      return false;
-#ifdef _WIN32
-    return _commit(_fileno(file_)) == 0;
-#else
-    return ::fsync(::fileno(file_)) == 0;
-#endif
-  }
-
-  // Closes early, so a rename can follow on platforms that will not rename an open file.
-  // Idempotent.
-  bool closeNow() {
-    if(file_ == nullptr)
-      return true;
-    const bool ok = std::fclose(file_) == 0;
-    file_ = nullptr;
-    return ok;
-  }
-
- private:
-  std::FILE* file_;
-};
-
-// Forces a rename to be durable, not merely the contents of the two files it renamed.
-//
-// Without this a crash can leave the old name pointing at the old inode even though both
-// files' data are on the device, because the directory entry itself was still in cache.
-// There is no portable Windows equivalent -- a directory is not openable as a file there --
-// so on Windows the rename's durability is whatever the filesystem gives, which is stated
-// here rather than assumed away.
 void syncDirectoryOf(const std::string& path) {
-#ifndef _WIN32
-  size_t slash = path.find_last_of('/');
-  const std::string dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
-  const int fd = ::open(dir.c_str(), O_RDONLY);
-  if(fd < 0)
-    return;
-  (void)::fsync(fd);
-  (void)::close(fd);
-#else
-  (void)path;
-#endif
+  NNCacheFileSync::directoryOf(path);
 }
 
 //-------------------------------------------------------------------------------------
@@ -428,33 +347,13 @@ void rewriteAsOneBlock(
 // The context name boundary
 //-------------------------------------------------------------------------------------
 
-// A context name becomes a path component. A path expression is an interpreter and there is
-// no typed value-carrier to hand a component to, so the sanctioned move is a strict
-// validation to a closed alphabet that REFUSES what it cannot honor -- never an escape,
-// never a rewrite into something acceptable (ADR-0012, the 2026-07-18 interpreter-boundary
-// amendment).
+// A context name becomes a path component, so it is validated to a closed alphabet that
+// REFUSES what it cannot honor -- never an escape, never a rewrite into something
+// acceptable (ADR-0012, the 2026-07-18 interpreter-boundary amendment). The alphabet and
+// the refusal live in nncachefileformat.h, shared with the evaluation container, because
+// the same context name becomes a component of that file's path too.
 void verifyContextName(const std::string& context) {
-  if(context.empty())
-    throw StringError("NNCacheCountLog: the context name is empty.");
-  if(context.size() > MAX_CONTEXT_NAME_LEN)
-    throw StringError(
-      "NNCacheCountLog: the context name is " + Global::uint64ToString(context.size()) +
-      " characters; at most " + Global::uint64ToString(MAX_CONTEXT_NAME_LEN) + " are allowed."
-    );
-  if(context == "." || context == "..")
-    throw StringError("NNCacheCountLog: '" + context + "' is not a usable context name.");
-  for(size_t i = 0; i < context.size(); i++) {
-    const char c = context[i];
-    const bool ok =
-      (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-      c == '.' || c == '_' || c == '-';
-    if(!ok)
-      throw StringError(
-        std::string("NNCacheCountLog: the context name contains '") + c +
-        "' at position " + Global::uint64ToString(i) +
-        "; a context name may hold only ASCII letters, digits, '.', '_' and '-'."
-      );
-  }
+  NNCacheFileName::verify(context, "NNCacheCountLog", "context name");
 }
 
 }  // namespace
