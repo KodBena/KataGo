@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -67,21 +68,27 @@ enum class NNCacheAdmissionPolicy {
 // alone would be useless in KataGo, which stores a position once (the perfmatrix sweep
 // measured 442,735 sets over 442,192 distinct keys), so every comparison would be a tie.
 // Counts are kept for NON-RESIDENT keys too, in a ghost table; without that a newcomer's
-// count is structurally zero and any comparison collapses back to `Always`.
+// count is structurally zero and any comparison collapses back to `Always`. The ghost's
+// size is nnCacheSightingGhostPowerOfTwo, and it is NOT the table's size: see
+// NNCacheShape::directMapped(replacement, ghostPowerOfTwo).
+//
+// WHY THESE ARE NAMED FOR THE SURVIVOR. "Replace the one that has been seen more often"
+// is ambiguous in English about which key ends up in the slot -- the sentence names the
+// VICTIM, and the two readings are opposite policies. This vocabulary names the key that
+// KEEPS the slot, so a config file cannot be the place that ambiguity is discovered. It
+// has already cost one round of measurement labelled against the wrong arm.
 enum class NNCacheReplacementPolicy {
   // The newcomer always wins. Today's behaviour, the default, and the only value under
   // which the shipped 1-way table is used unchanged.
   Always,
-  // The candidate seen FEWER times survives; the more-seen one is replaced. This is the
-  // operator's own proposal ("on collision replace the one that's been seen more
-  // often"), and it is the INVERSE of the usual LFU intuition. Named for the SURVIVOR
-  // rather than the victim on purpose: "replace the more-seen" is ambiguous in English
-  // about which key ends up in the slot, and a config file is the wrong place to
-  // discover that.
+  // The candidate seen FEWER times survives; the more-seen one is replaced. The INVERSE
+  // arm, carried so the mechanism can be measured in both directions -- it is one
+  // comparison flip away from KeepMoreSeen and measuring both is strictly more
+  // informative than measuring either. Not a recommendation, and not anybody's proposal.
   KeepLessSeen,
-  // The candidate seen MORE times survives; the less-seen one is replaced. The
-  // conventional, LFU-shaped direction. It is here so the two can be measured against
-  // each other, not because it is the recommended one.
+  // The candidate seen MORE times survives; the less-seen one is replaced. THIS is the
+  // "most-seen direct" the operator proposed, and it is the conventional, LFU-shaped
+  // direction.
   KeepMoreSeen,
   // Keep the incumbent if it has been sighted since it was stored, and give it exactly
   // ONE reprieve -- the second-chance rule. Needs no ghost table at all: one bool per
@@ -121,6 +128,22 @@ class NNCacheShape {
   // chained shape the newcomer never loses the contest -- it displaces the eviction
   // policy's victim -- so there is no second candidate for a replacement rule to name.
   static NNCacheShape directMapped(NNCacheReplacementPolicy replacement);
+  // As above, with the sighting-count ghost sized EXPLICITLY as 2^ghostPowerOfTwo slots
+  // rather than derived from nnCacheSizePowerOfTwo.
+  //
+  // Why this is a knob at all. The ghost is a lossy sketch: two keys landing on one ghost
+  // slot overwrite each other's counts, and a clobbered key reads as count 0. Sized from
+  // the table, its load factor IS the table's load factor -- so in exactly the regime a
+  // replacement rule exists for, where the table cannot hold the working set, the ghost
+  // cannot hold the counts either. Worse, the distortion is not symmetric: a clobbered
+  // incumbent reading 0 makes it WIN under KeepLessSeen and LOSE under KeepMoreSeen, so a
+  // measurement taken through an overloaded ghost is biased between the two arms. The
+  // ghost's natural size is the WORKING SET, which is an absolute quantity and not a
+  // function of how big a table someone chose.
+  //
+  // REFUSED for Always and KeepSighted: neither allocates a ghost, so a ghost size under
+  // them is not a setting to be validated away but a shape with no representation here.
+  static NNCacheShape directMapped(NNCacheReplacementPolicy replacement, int ghostPowerOfTwo);
   // An open-addressed table of `ways` slots per bucket, choosing its victim by `eviction`.
   static NNCacheShape probed(NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction);
   // Separate chaining: a collision costs nothing, and eviction is driven by `maxBytes`.
@@ -141,6 +164,12 @@ class NNCacheShape {
   // eviction() is refused under Direct: a probed or chained table's newcomer is never a
   // candidate for removal, so there is no two-way choice to report.
   NNCacheReplacementPolicy replacement() const;
+  // Slots in the sighting-count ghost, as a power of two. std::nullopt means "not stated,
+  // so derive it from nnCacheSizePowerOfTwo", which is what the ghost did before this key
+  // existed -- an optional rather than a negative sentinel, because that absence carries a
+  // meaning and a bare sentinel would leave the meaning in a comment (ADR-0012 P11).
+  // Refused for any shape or rule that has no ghost at all.
+  std::optional<int> sightingGhostPowerOfTwo() const;
   // Slots per bucket. Always 1 under Direct.
   int ways() const { return ways_; }
   // Byte budget the table must stay under. 0 means unbounded. Nonzero only under Chain.
@@ -158,7 +187,7 @@ class NNCacheShape {
  private:
   NNCacheShape(
     NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction, int64_t maxBytes,
-    NNCacheReplacementPolicy replacement
+    NNCacheReplacementPolicy replacement, std::optional<int> sightingGhostPowerOfTwo
   );
 
   NNCacheCollisionScheme scheme_;
@@ -166,6 +195,7 @@ class NNCacheShape {
   NNCacheEvictionPolicy eviction_;
   int64_t maxBytes_;
   NNCacheReplacementPolicy replacement_;
+  std::optional<int> sightingGhostPowerOfTwo_;
 };
 
 // Everything needed to build a cache table.
@@ -195,6 +225,7 @@ struct NNCacheConfig {
   static const char* const KEY_ADMISSION;   // nnCacheAdmission
   static const char* const KEY_MAX_BYTES;   // nnCacheMaxBytes
   static const char* const KEY_REPLACEMENT; // nnCacheReplacement
+  static const char* const KEY_SIGHTING_GHOST_POW; // nnCacheSightingGhostPowerOfTwo
 
   static const std::set<std::string>& collisionVocabulary();
   static const std::set<std::string>& evictionVocabulary();

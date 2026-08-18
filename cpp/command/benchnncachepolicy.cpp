@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -385,7 +386,7 @@ static ReplayResult replayOne(
 
 static int64_t worstCasePeakBytes(
   const vector<int>& tablePows, int mutexPow, int64_t distinctKeys, int64_t maxEntryBytes, bool anyChain,
-  int64_t chainBudget
+  int64_t chainBudget, int64_t sightingGhostBytes
 ) {
   // The peak is one configuration at a time -- tables are built and destroyed in turn --
   // so it is the largest single configuration, not the sum.
@@ -405,10 +406,14 @@ static int64_t worstCasePeakBytes(
       const int64_t chainHere = slots * 8 + std::min(chainBudget, distinctKeys * maxEntryBytes);
       here = std::max(here, chainHere);
     }
-    // The ghost tables, and the mutex pool. TWO ghosts at 4 bytes a slot, not one: a
-    // direct point with second-sighting admission AND a count-comparing replacement rule
+    // The two ghosts, and the mutex pool. The second-sighting ghost is always table-sized
+    // at 4 bytes a slot; the SIGHTING-COUNT ghost is not table-sized any more and its real
+    // resolved size is passed in, because after this change it can be much larger than the
+    // table and a preflight that assumed otherwise would guard the wrong number. A direct
+    // point with second-sighting admission AND a count-comparing replacement rule
     // allocates both, and they are deliberately not shared (see nncachesighting.cpp).
-    here += slots * 8;
+    here += slots * 4;
+    here += sightingGhostBytes;
     here += (((int64_t)1) << mutexPow) * 64;
     peak = std::max(peak,here);
   }
@@ -434,6 +439,12 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
   double minReuseRate = 0.05;
   bool precheckOnly = false;
   bool reinsertOnMiss = false;
+  // Three NAMED modes rather than a number with a magic value: "auto" derives the ghost
+  // from this trace's distinct-key count, "table" leaves it derived from each swept table
+  // size (what a .cfg does, and therefore what an operator would actually run), and a
+  // plain integer states it. A sentinel integer meaning "not a size" is the shape the
+  // ghost's own type deliberately refuses (ADR-0012 P11), so it is refused here too.
+  string ghostPowArg = "auto";
   string note;
   string backendName = "none (replay: no neural net is loaded)";
   int mutexPow = -1;
@@ -458,6 +469,7 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
     else if(a == "-admissions" && hasNext) admissionsStr = args[++i];
     else if(a == "-replacements" && hasNext) replacementsStr = args[++i];
     else if(a == "-min-reuse-rate" && hasNext) minReuseRate = Global::stringToDouble(args[++i]);
+    else if(a == "-ghost-pow" && hasNext) ghostPowArg = args[++i];
     else if(a == "-precheck") precheckOnly = true;
     else if(a == "-reinsert-on-miss") reinsertOnMiss = true;
     else if(a == "-ownership" && hasNext) ownershipStr = args[++i];
@@ -504,6 +516,20 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         "                     at an arbitrary budget.\n"
         "  -assume-v1-entry-bytes N   what a v1 (headerless, 20-byte) trace's missing footprint\n"
         "                     is taken to be. Default sizeof(NNOutput). Stamped in the results.\n"
+        "  -ghost-pow W       auto | table | <N>   (default auto). Slots in the sighting-count\n"
+        "                     ghost, as 2^N, for the keeplessseen and keepmoreseen rules.\n"
+        "                       auto  -- derived from THIS TRACE: the smallest power of two at or\n"
+        "                                above 16x its distinct-key count, capped at 26, which\n"
+        "                                keeps clobbering near 6%.\n"
+        "                       table -- derived from each swept table size, which is what a .cfg\n"
+        "                                does by default and therefore what an operator running\n"
+        "                                this in production would actually get.\n"
+        "                       <N>   -- stated outright.\n"
+        "                     The ghost is a lossy sketch and its natural size is the WORKING SET,\n"
+        "                     not the table: sized from the table it is saturated in exactly the\n"
+        "                     regime a replacement rule exists for, and a clobbered incumbent reads\n"
+        "                     as count 0, which makes it WIN under keeplessseen and LOSE under\n"
+        "                     keepmoreseen -- a bias BETWEEN the two arms, not just noise.\n"
         "  -reinsert-on-miss  after a get that MISSES, replay a set of the same key, as the live\n"
         "                     engine would have done. Off by default. The trace's set stream was\n"
         "                     recorded under one policy, so without this a swept policy that gives a\n"
@@ -625,6 +651,48 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
   const double reuseRate = traceGets > 0 ? (double)traceReusableGets / (double)traceGets : 0.0;
   const double setRepeatRate = traceSets > 0 ? (double)traceSetRepeats / (double)traceSets : 0.0;
 
+  //---- Resolve the ghost's size, now that the working set is known ----
+  // This is the ONE place a sensible default for it can be computed at all: the ghost
+  // should be sized to the number of distinct positions the workload touches, and a .cfg
+  // cannot know that number while this runner has just counted it.
+  bool ghostFromTable = false;
+  int resolvedGhostPow = 0;
+  if(ghostPowArg == "table") {
+    ghostFromTable = true;
+  }
+  else if(ghostPowArg == "auto") {
+    // Smallest power of two at or above 16x the distinct-key count, capped. 16x puts the
+    // expected clobbered fraction 1 - exp(-(N-1)/M) near 6%; the cap keeps the default
+    // from silently allocating more than 2^26 * 4 = 256 MiB on a very large trace.
+    int p = 0;
+    while(p < 26 && (((int64_t)1) << p) < distinctKeys * 16)
+      p += 1;
+    resolvedGhostPow = p;
+  }
+  else {
+    resolvedGhostPow = Global::stringToInt(ghostPowArg);
+    if(resolvedGhostPow < 0 || resolvedGhostPow > 40)
+      throw StringError(
+        "benchnncachepolicy: -ghost-pow accepts 'auto', 'table', or an integer in 0..40; got '" +
+        ghostPowArg + "'."
+      );
+  }
+  // The estimate that decides whether a measurement through this ghost is trustworthy,
+  // computed here rather than left to a reader with a calculator.
+  const double ghostClobberFraction =
+    ghostFromTable
+    ? -1.0
+    : 1.0 - std::exp(-(double)std::max((int64_t)0, distinctKeys - 1) / (double)(((int64_t)1) << resolvedGhostPow));
+  if(ghostFromTable)
+    cerr << "benchnncachepolicy: ghost sized FROM THE TABLE at every swept size (what a .cfg does "
+         << "by default). Its load factor is the table's, so the count-comparing rules are measured "
+         << "through a saturated sketch at the small sizes." << endl;
+  else
+    cerr << "benchnncachepolicy: ghost 2^" << resolvedGhostPow << " slots = "
+         << ((((int64_t)1) << resolvedGhostPow) * 4 / (1024*1024)) << " MiB, against " << distinctKeys
+         << " distinct keys -> about " << (100.0*ghostClobberFraction) << "% of keys clobbered at "
+         << "least once" << endl;
+
   //---- THE WORKLOAD PRECONDITION, before anything large is allocated ----
   //
   // WHAT THIS GATE IS FOR, and why it is not the gate that used to be here. The runbook's
@@ -738,7 +806,11 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
   const int64_t effectiveChainBudget =
     chainBudget > 0 ? chainBudget : (((int64_t)1) << tablePows[tablePows.size()-1]) * meanSetBytes;
   const int64_t peak = worstCasePeakBytes(
-    tablePows, minMutexPow, distinctKeys, maxEntryBytes, anyChain, effectiveChainBudget
+    tablePows, minMutexPow, distinctKeys, maxEntryBytes, anyChain, effectiveChainBudget,
+    // Under 'table' mode the sighting ghost is table-sized, and the largest table swept
+    // bounds it; otherwise it is the resolved size, whatever the table is.
+    ghostFromTable ? (((int64_t)1) << tablePows[tablePows.size()-1]) * 4
+                   : (((int64_t)1) << resolvedGhostPow) * 4
   );
   cerr << "benchnncachepolicy: worst-case peak footprint of one configuration = "
        << (peak / (1024*1024)) << " MiB; budget = " << (maxBytesBudget / (1024*1024)) << " MiB" << endl;
@@ -817,6 +889,19 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
     j.num("trace_reusable_gets", traceReusableGets);
     j.real("trace_reuse_rate", reuseRate);
     j.real("min_reuse_rate_floor", minReuseRate);
+    // The sketch these numbers were measured through, stamped so a later reader can tell a
+    // policy result from a saturated-ghost result without re-deriving anything.
+    j.str("sighting_ghost_mode", ghostPowArg);
+    if(ghostFromTable) {
+      j.str("sighting_ghost_pow", "per-table-pow");
+      j.str("sighting_ghost_clobber_fraction", "varies-by-table-size");
+    }
+    else {
+      j.num("sighting_ghost_pow", resolvedGhostPow);
+      j.num("sighting_ghost_slots", ((int64_t)1) << resolvedGhostPow);
+      j.num("sighting_ghost_bytes", (((int64_t)1) << resolvedGhostPow) * 4);
+      j.real("sighting_ghost_clobber_fraction", ghostClobberFraction);
+    }
     j.num("trace_mean_set_bytes", meanSetBytes);
     j.num("sizeof_NNOutput", (int64_t)sizeof(NNOutput));
     j.num("ownermap_bytes_19x19", (int64_t)(19*19*sizeof(float)));
@@ -894,7 +979,15 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         string refusal;
         unique_ptr<NNCacheConfig> config;
         try {
-          NNCacheShape shape = NNCacheShape::directMapped(pt.replacement);
+          // A ghost size is only representable for the two counting rules, so it is only
+          // passed for them -- the type refuses it for the others rather than ignoring it.
+          const bool rulePaysForGhost =
+            pt.replacement == NNCacheReplacementPolicy::KeepLessSeen ||
+            pt.replacement == NNCacheReplacementPolicy::KeepMoreSeen;
+          NNCacheShape shape =
+            (rulePaysForGhost && !ghostFromTable)
+            ? NNCacheShape::directMapped(pt.replacement, resolvedGhostPow)
+            : NNCacheShape::directMapped(pt.replacement);
           if(pt.scheme == NNCacheCollisionScheme::Chain)
             shape = NNCacheShape::chained(effectiveChainBudget, pt.eviction);
           else if(pt.scheme != NNCacheCollisionScheme::Direct)
@@ -917,6 +1010,14 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         j.str("replacement",
               pt.scheme == NNCacheCollisionScheme::Direct
               ? replacementName(pt.replacement) : "n/a-only-direct-has-two-candidates");
+        // The ghost this row's numbers were measured through, per row, because it is the
+        // difference between measuring a policy and measuring a saturated sketch.
+        if(pt.scheme == NNCacheCollisionScheme::Direct &&
+           (pt.replacement == NNCacheReplacementPolicy::KeepLessSeen ||
+            pt.replacement == NNCacheReplacementPolicy::KeepMoreSeen))
+          j.num("sighting_ghost_pow", ghostFromTable ? tablePow : resolvedGhostPow);
+        else
+          j.str("sighting_ghost_pow", "n/a-this-rule-keeps-no-ghost");
         j.num("table_pow", tablePow);
         j.num("table_slots", ((int64_t)1) << tablePow);
         j.num("mutex_pool_pow", poolPow);

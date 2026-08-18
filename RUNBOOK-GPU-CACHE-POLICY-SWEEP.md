@@ -50,7 +50,8 @@ That shape is now one option among several, chosen by five keys in your KataGo `
 | `nnCacheWays` | under the two probing schemes, how many slots a position may try |
 | `nnCacheEviction` | when something must be thrown out, which entry goes: `random`, `lru` (least recently used), or `lfu` (least frequently used) |
 | `nnCacheAdmission` | whether an evaluation offered to the cache is stored at all: `always`, or `secondsighting` (store a position only from the second time it is offered) |
-| `nnCacheReplacement` | under `direct` only: which of the **two** candidates a collision keeps — the position already in the slot, or the one arriving. `always` (the newcomer, today's behaviour), `keeplessseen`, `keepmoreseen`, or `keepsighted` |
+| `nnCacheReplacement` | under `direct` only: which of the **two** candidates a collision keeps — the position already in the slot, or the one arriving. `always` (the newcomer, today's behaviour), `keepmoreseen` (the "most-seen direct" idea), `keeplessseen` (its inverse, for contrast), or `keepsighted` |
+| `nnCacheSightingGhostPowerOfTwo` | under the two counting rules only: how many slots the sighting-count sketch has, as `2^N`. **Size it to your working set, not to your table** — see below |
 
 **Why `nnCacheReplacement` is a separate key from `nnCacheEviction`, since both sound like
 "what gets thrown out".** They are different questions and only one of them exists under
@@ -531,7 +532,8 @@ nnCacheWays        = 2..1024        (probing schemes only)
 nnCacheEviction    = random | lru | lfu
 nnCacheAdmission   = always | secondsighting
 nnCacheMaxBytes    = <bytes>        (chain only; required there)
-nnCacheReplacement = always | keeplessseen | keepmoreseen | keepsighted   (direct only)
+nnCacheReplacement = always | keepmoreseen | keeplessseen | keepsighted   (direct only)
+nnCacheSightingGhostPowerOfTwo = <N>   (keeplessseen/keepmoreseen only)
 ```
 
 **`nnCacheReplacement` in full.** It names which of the two candidates for one direct-mapped
@@ -544,9 +546,24 @@ count of zero by construction and the comparison would collapse back to `always`
 | value | which position keeps the slot | costs |
 |---|---|---|
 | `always` | the arriving one, always. Today's behaviour and the default; leaving the key unset changes nothing | nothing |
-| `keeplessseen` | the one seen **fewer** times. The inverse of the usual cache intuition, and deliberate | 4 B/slot ghost |
-| `keepmoreseen` | the one seen **more** times. The conventional, LFU-shaped direction | 4 B/slot ghost |
+| `keepmoreseen` | the one seen **more** times. The conventional, LFU-shaped direction, and the "most-seen direct" idea this axis was built for | ghost |
+| `keeplessseen` | the one seen **fewer** times. The inverse arm, carried so the mechanism can be measured in both directions | ghost |
 | `keepsighted` | the one already in the slot, if it has been re-read since it was stored — and exactly one such reprieve | no ghost; 8 B/slot in the table |
+
+**The ghost's size is its own key, and the default is wrong for the case these rules exist
+for.** The sighting counts live in a fixed sketch of `2^nnCacheSightingGhostPowerOfTwo`
+slots at 4 bytes each — **8 MB at 21, 32 MB at 23, 128 MB at 25** — and two positions
+landing on one slot overwrite each other's counts. Left unset the sketch is sized from
+`nnCacheSizePowerOfTwo`, which is what it did before the key existed, so upgrading moves
+nobody's memory. But that ties the sketch's load factor to the *table's*: precisely when
+the table is too small to hold the working set, the sketch is too small to hold the counts,
+and both rules stop being themselves. The newcomer's own sighting rewrites its slot just
+before the comparison, so it reads 1 while an overwritten incumbent reads 0 — which makes
+`keepmoreseen` admit everything (behaving as `always`) and `keeplessseen` refuse everything.
+That is measured, not feared: on one trace the same run read 0.2758 / 0.0342 through a
+table-sized sketch and 0.1715 / 0.2931 through a clean one. **Rule of thumb: set it to
+about 4 more than `log2(distinct positions you expect)`, which keeps under 6% of counts
+overwritten.** The sweep does this for you — it has counted the trace's distinct keys.
 
 On a lookup stream where no position is ever re-seen, every comparison is a tie, ties go to
 the arriving position, and all four values behave identically to `always`. So the rules
@@ -564,6 +581,8 @@ Refusals you may hit, and what each means:
 | `nnCacheMaxBytes` too small to hold one entry per lock region | refused, with the arithmetic | a table that can never retain anything is broken, not slow |
 | `nnCacheReplacement` with any collision scheme other than `direct` | refused, naming both | only direct mapping poses a two-candidate choice; under the others the arriving position never loses — it takes the slot of whichever resident `nnCacheEviction` names |
 | a `nnCacheReplacement` value not in the list | refused, naming the whole list | the two `keep…seen` words name the SURVIVOR; there is no `mostseen` |
+| `nnCacheSightingGhostPowerOfTwo` with `always` or `keepsighted` | refused, naming the two rules that do keep counts | neither allocates a sketch, so sizing one is not a setting to correct but a shape with no meaning |
+| `nnCacheSightingGhostPowerOfTwo` with any collision scheme but `direct` | refused | it sizes the sketch the replacement rules keep, and replacement exists only under `direct` |
 
 **The one accepted value that was removed.** Before this branch, `chain` *required*
 `nnCacheEviction = none`. That was wrong: a chained table's byte budget is always enforced,

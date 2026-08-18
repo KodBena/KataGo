@@ -19,6 +19,7 @@ const char* const NNCacheConfig::KEY_EVICTION = "nnCacheEviction";
 const char* const NNCacheConfig::KEY_ADMISSION = "nnCacheAdmission";
 const char* const NNCacheConfig::KEY_MAX_BYTES = "nnCacheMaxBytes";
 const char* const NNCacheConfig::KEY_REPLACEMENT = "nnCacheReplacement";
+const char* const NNCacheConfig::KEY_SIGHTING_GHOST_POW = "nnCacheSightingGhostPowerOfTwo";
 
 static const string COLLISION_DIRECT = "direct";
 static const string COLLISION_LINEAR = "linearprobe";
@@ -125,10 +126,19 @@ static string evictionPolicyToString(NNCacheEvictionPolicy eviction) {
 
 NNCacheShape::NNCacheShape(
   NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction, int64_t maxBytes,
-  NNCacheReplacementPolicy replacement
+  NNCacheReplacementPolicy replacement, std::optional<int> sightingGhostPowerOfTwo
 )
-  :scheme_(scheme), ways_(ways), eviction_(eviction), maxBytes_(maxBytes), replacement_(replacement)
+  :scheme_(scheme), ways_(ways), eviction_(eviction), maxBytes_(maxBytes), replacement_(replacement),
+   sightingGhostPowerOfTwo_(sightingGhostPowerOfTwo)
 {}
+
+// True exactly for the rules that allocate a sighting-count ghost. Named once, because
+// three different refusals and one accessor all ask this same question and a second copy
+// of the list would drift (ADR-0012 P1).
+static bool replacementNeedsGhost(NNCacheReplacementPolicy replacement) {
+  return replacement == NNCacheReplacementPolicy::KeepLessSeen ||
+         replacement == NNCacheReplacementPolicy::KeepMoreSeen;
+}
 
 NNCacheShape NNCacheShape::directMapped() {
   return NNCacheShape::directMapped(NNCacheReplacementPolicy::Always);
@@ -143,7 +153,31 @@ NNCacheShape NNCacheShape::directMapped(NNCacheReplacementPolicy replacement) {
   // collision is a real choice that the eviction axis never covered: the newcomer may
   // lose. `Always` -- the newcomer wins -- is the rule that has always been in force and
   // stays the default.
-  return NNCacheShape(NNCacheCollisionScheme::Direct, 1, NNCacheEvictionPolicy::None, 0, replacement);
+  return NNCacheShape(
+    NNCacheCollisionScheme::Direct, 1, NNCacheEvictionPolicy::None, 0, replacement, std::nullopt
+  );
+}
+
+NNCacheShape NNCacheShape::directMapped(NNCacheReplacementPolicy replacement, int ghostPowerOfTwo) {
+  if(!replacementNeedsGhost(replacement))
+    throw StringError(
+      "NNCacheShape::directMapped: " + string(NNCacheConfig::KEY_SIGHTING_GHOST_POW) +
+      " cannot be honored under " + string(NNCacheConfig::KEY_REPLACEMENT) + " = " +
+      replacementPolicyToString(replacement) + ", which allocates no sighting-count ghost at all. "
+      "Only (" + REPLACEMENT_KEEP_LESS_SEEN + "|" + REPLACEMENT_KEEP_MORE_SEEN + ") keep counts; " +
+      REPLACEMENT_KEEP_SIGHTED + " keeps one bit per slot in the table and " + REPLACEMENT_ALWAYS +
+      " keeps nothing. Sizing a structure that does not exist is not a setting to correct, it is a "
+      "shape with no meaning."
+    );
+  if(ghostPowerOfTwo < 0 || ghostPowerOfTwo > 40)
+    throw StringError(
+      "NNCacheShape::directMapped: " + string(NNCacheConfig::KEY_SIGHTING_GHOST_POW) +
+      " must be in 0..40, got " + Global::intToString(ghostPowerOfTwo) +
+      ". It is a POWER OF TWO of ghost slots at 4 bytes each, so 40 is already a terabyte."
+    );
+  return NNCacheShape(
+    NNCacheCollisionScheme::Direct, 1, NNCacheEvictionPolicy::None, 0, replacement, ghostPowerOfTwo
+  );
 }
 
 NNCacheShape NNCacheShape::probed(NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction) {
@@ -167,7 +201,7 @@ NNCacheShape NNCacheShape::probed(NNCacheCollisionScheme scheme, int ways, NNCac
     );
   // No replacement argument: a probed table's newcomer always wins its contest, taking
   // the eviction policy's victim's slot, so there is no second candidate to name.
-  return NNCacheShape(scheme, ways, eviction, 0, NNCacheReplacementPolicy::Always);
+  return NNCacheShape(scheme, ways, eviction, 0, NNCacheReplacementPolicy::Always, std::nullopt);
 }
 
 NNCacheShape NNCacheShape::chained(int64_t maxBytes, NNCacheEvictionPolicy eviction) {
@@ -188,7 +222,9 @@ NNCacheShape NNCacheShape::chained(int64_t maxBytes, NNCacheEvictionPolicy evict
       "before this axis was expressible."
     );
   // No replacement argument, for the same reason probed() has none.
-  return NNCacheShape(NNCacheCollisionScheme::Chain, 0, eviction, maxBytes, NNCacheReplacementPolicy::Always);
+  return NNCacheShape(
+    NNCacheCollisionScheme::Chain, 0, eviction, maxBytes, NNCacheReplacementPolicy::Always, std::nullopt
+  );
 }
 
 NNCacheEvictionPolicy NNCacheShape::eviction() const {
@@ -211,11 +247,27 @@ NNCacheReplacementPolicy NNCacheShape::replacement() const {
   return replacement_;
 }
 
+std::optional<int> NNCacheShape::sightingGhostPowerOfTwo() const {
+  if(scheme_ != NNCacheCollisionScheme::Direct || !replacementNeedsGhost(replacement_))
+    throw StringError(
+      "NNCacheShape::sightingGhostPowerOfTwo: this shape keeps no sighting-count ghost, so it has "
+      "no ghost size to report. Only " + string(NNCacheConfig::KEY_COLLISION) + " = " +
+      COLLISION_DIRECT + " with " + string(NNCacheConfig::KEY_REPLACEMENT) + " in (" +
+      REPLACEMENT_KEEP_LESS_SEEN + "|" + REPLACEMENT_KEEP_MORE_SEEN + ") does; this one is " +
+      toString() + "."
+    );
+  return sightingGhostPowerOfTwo_;
+}
+
 string NNCacheShape::toString() const {
-  if(scheme_ == NNCacheCollisionScheme::Direct)
-    return replacement_ == NNCacheReplacementPolicy::Always
-      ? COLLISION_DIRECT
-      : COLLISION_DIRECT + ", " + replacementPolicyToString(replacement_);
+  if(scheme_ == NNCacheCollisionScheme::Direct) {
+    if(replacement_ == NNCacheReplacementPolicy::Always)
+      return COLLISION_DIRECT;
+    string out = COLLISION_DIRECT + ", " + replacementPolicyToString(replacement_);
+    if(sightingGhostPowerOfTwo_.has_value())
+      out += ", ghost 2^" + Global::intToString(*sightingGhostPowerOfTwo_);
+    return out;
+  }
   if(scheme_ == NNCacheCollisionScheme::Chain)
     return COLLISION_CHAIN + ", maxBytes " + Global::int64ToString(maxBytes_) + ", " +
       evictionPolicyToString(eviction_);
@@ -284,9 +336,41 @@ NNCacheConfig NNCacheConfig::fromCfg(ConfigParser& cfg, int sizePowerOfTwo, int 
     // says nothing builds exactly the table it built before this key existed.
     const string replacementStr =
       cfg.contains(KEY_REPLACEMENT) ? cfg.getString(KEY_REPLACEMENT, replacementVocabulary()) : REPLACEMENT_ALWAYS;
-    config.shape = NNCacheShape::directMapped(replacementPolicyFromString(replacementStr));
+    const NNCacheReplacementPolicy replacement = replacementPolicyFromString(replacementStr);
+    // The ghost's size, when the operator states one. Left unstated it is derived from
+    // nnCacheSizePowerOfTwo, which is what it did before this key existed -- so upgrading
+    // moves nobody's memory. That derived default is stated in gtp_example.cfg as being
+    // WRONG for the regime the counting rules exist for: the ghost's natural size is the
+    // WORKING SET, an absolute quantity, and a table deliberately smaller than the working
+    // set gives a ghost that cannot hold the counts either.
+    if(cfg.contains(KEY_SIGHTING_GHOST_POW)) {
+      if(!replacementNeedsGhost(replacement))
+        throw StringError(
+          "Key '" + string(KEY_SIGHTING_GHOST_POW) + "' cannot be honored under " +
+          string(KEY_REPLACEMENT) + " = " + replacementStr + ", which keeps no sighting-count ghost. "
+          "Only (" + REPLACEMENT_KEEP_LESS_SEEN + "|" + REPLACEMENT_KEEP_MORE_SEEN + ") keep counts; " +
+          REPLACEMENT_KEEP_SIGHTED + " keeps one bit per slot inside the table and " + REPLACEMENT_ALWAYS +
+          " keeps nothing at all. Either remove '" + string(KEY_SIGHTING_GHOST_POW) + "', or set " +
+          string(KEY_REPLACEMENT) + " to one of (" + REPLACEMENT_KEEP_LESS_SEEN + "|" +
+          REPLACEMENT_KEEP_MORE_SEEN + ")."
+        );
+      config.shape = NNCacheShape::directMapped(replacement, cfg.getInt(KEY_SIGHTING_GHOST_POW, 0, 40));
+    }
+    else {
+      config.shape = NNCacheShape::directMapped(replacement);
+    }
     return config;
   }
+
+  // Same refusal one scheme out: a ghost size under a scheme that has no replacement rule
+  // to keep counts for.
+  if(cfg.contains(KEY_SIGHTING_GHOST_POW))
+    throw StringError(
+      "Key '" + string(KEY_SIGHTING_GHOST_POW) + "' is meaningless under " + string(KEY_COLLISION) +
+      " = " + collision + ". It sizes the sighting-count ghost that the " + string(KEY_REPLACEMENT) +
+      " rules keep, and " + string(KEY_REPLACEMENT) + " exists only under " + string(KEY_COLLISION) +
+      " = " + COLLISION_DIRECT + "."
+    );
 
   // Every non-direct scheme refuses the replacement key, because past this point it has
   // no representation: probed() and chained() take no such argument.

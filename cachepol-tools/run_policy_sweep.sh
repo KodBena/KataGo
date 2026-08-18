@@ -58,6 +58,10 @@ EVICTIONS="random,lru,lfu"
 ADMISSIONS="always,secondsighting"
 REPLACEMENTS="always,keeplessseen,keepmoreseen,keepsighted"
 MIN_REUSE_RATE="0.05"
+# auto | table | <N>. auto sizes the sighting-count ghost from the captured trace's own
+# distinct-key count, which is the quantity it should be sized to and the one thing a .cfg
+# cannot know. `table` reproduces what an operator running this in production would get.
+GHOST_POW="auto"
 OWNERSHIP="both"
 MAX_BYTES=""
 BENCH_VISITS=2000
@@ -108,6 +112,12 @@ REPLAY MATRIX (stage 2)
             The two "seen" values name the SURVIVOR, not the victim.
   -M F      minimum reuse rate the captured trace must clear, or stage 2 refuses before
             allocating anything (default 0.05). See the runbook's precondition section.
+  -Q W      sighting-count ghost size: auto | table | <N>  (default auto). auto sizes it
+            from the captured trace's distinct-key count so the count sketch is not
+            saturated; `table` sizes it from each swept table size, which is what an
+            operator gets from a .cfg that does not set nnCacheSightingGhostPowerOfTwo.
+            Measured through a saturated ghost, keepmoreseen degenerates to `always` and
+            keeplessseen degenerates to refusing everything, so this is not a detail.
   -W MODE   ownership: trace|off|on|both   (default both)
 
 VISITS SUBSET (stage 3)
@@ -125,7 +135,7 @@ USAGE
   exit 1
 }
 
-while getopts "k:m:c:o:b:s:t:V:G:N:J:O:p:w:C:e:a:R:M:W:v:T:B:h" opt; do
+while getopts "k:m:c:o:b:s:t:V:G:N:J:O:p:w:C:e:a:R:M:Q:W:v:T:B:h" opt; do
   case "$opt" in
     k) KATAGO="$OPTARG" ;;
     m) MODEL="$OPTARG" ;;
@@ -146,6 +156,7 @@ while getopts "k:m:c:o:b:s:t:V:G:N:J:O:p:w:C:e:a:R:M:W:v:T:B:h" opt; do
     a) ADMISSIONS="$OPTARG" ;;
     R) REPLACEMENTS="$OPTARG" ;;
     M) MIN_REUSE_RATE="$OPTARG" ;;
+    Q) GHOST_POW="$OPTARG" ;;
     W) OWNERSHIP="$OPTARG" ;;
     v) BENCH_VISITS="$OPTARG" ;;
     T) BENCH_THREADS="$OPTARG" ;;
@@ -185,7 +196,7 @@ has_stage() { case ",$STAGES," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
   echo "config          $CONFIG"
   echo "args            stages=$STAGES pows=$TABLE_POWS ways=$WAYS collisions=$COLLISIONS"
   echo "                evictions=$EVICTIONS admissions=$ADMISSIONS replacements=$REPLACEMENTS"
-  echo "                ownership=$OWNERSHIP min_reuse_rate=$MIN_REUSE_RATE"
+  echo "                ownership=$OWNERSHIP min_reuse_rate=$MIN_REUSE_RATE ghost_pow=$GHOST_POW"
   echo "                capture_games=$CAPTURE_GAMES capture_turns=$CAPTURE_TURNS"
   echo "                capture_gen_visits=$GEN_VISITS capture_visits=$VISITS_FOR_CAPTURE"
   echo "                capture_ownership=$CAPTURE_OWNERSHIP"
@@ -295,6 +306,14 @@ if has_stage replay; then
       -admissions "$ADMISSIONS" \
       -replacements "$REPLACEMENTS" \
       -min-reuse-rate "$MIN_REUSE_RATE" \
+      -ghost-pow "$GHOST_POW" \
+      `# -reinsert-on-miss is ON here, though the binary's own default is off. Without it a` \
+      `# swept policy that REFUSES a newcomer -- which only the replacement rules can do --` \
+      `# is charged for every later lookup of that key and never sees the re-insert the live` \
+      `# engine would have made, so the arms are handicapped unequally. The binary keeps the` \
+      `# old default so a hand replay reproduces earlier runs; this script sweeps the` \
+      `# replacement axis by default, so unequal handicaps would be the default condition.` \
+      -reinsert-on-miss \
       -ownership "$OWNERSHIP" \
       -max-bytes "$MAX_BYTES" \
       -backend-name "$("$KATAGO" version 2>&1 | head -2 | tr '\n' ' ')" \

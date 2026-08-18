@@ -725,10 +725,10 @@ static NNCacheConfig replacementConfig(NNCacheReplacementPolicy replacement) {
 //   set B            B = 1, and B collides with A on slot 0
 //
 // So the incumbent A stands at 4 and the newcomer B at 1.
-//   keepmoreseen (the conventional direction): the MORE-seen survives -> A stays, B is
-//     dropped.
-//   keeplessseen (the operator's direction):   the LESS-seen survives -> B takes the
-//     slot, A is gone.
+//   keepmoreseen (THE OPERATOR'S PROPOSAL, and the conventional direction): the MORE-seen
+//     survives -> A stays, B is dropped.
+//   keeplessseen (the inverse arm, carried for contrast):   the LESS-seen survives -> B
+//     takes the slot, A is gone.
 // Those are opposite outcomes on identical input, which is the point.
 static void testSightingPolaritiesDisagreeOnAHotIncumbent() {
   const Hash128 a = sightingKeyAt(0,0), b = sightingKeyAt(0,1);
@@ -917,6 +917,20 @@ static void testSightingGhostMemoryIsBoundedAndCharged() {
   // Reported rather than asserted to a literal, because it is a compiler layout fact and
   // pinning it here would be a second copy of it.
   testAssert(sightedFixed > alwaysFixed);
+
+  // And an EXPLICIT ghost size is honoured rather than quietly ignored -- the whole point
+  // of the knob is that the ghost stops being the table's size, so a test that only ever
+  // built the derived case would not notice if the argument were dropped.
+  {
+    NNCacheConfig big = replacementConfig(NNCacheReplacementPolicy::KeepMoreSeen);
+    big.shape = NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepMoreSeen, SIGHT_SIZE_POW + 6);
+    unique_ptr<NNCacheTable> bigGhost = NNCacheTable::create(big);
+    const int64_t bigFixed = bigGhost->stats().fixedStructureBytes;
+    testAssert(bigFixed - alwaysFixed == (int64_t)sightingCountGhostBytes(SIGHT_SIZE_POW + 6));
+    // 64x the slots, so 64x the ghost -- against a table of unchanged size.
+    testAssert(bigFixed - alwaysFixed == 64 * (countedFixed - alwaysFixed));
+  }
+
   cout << "  replacement fixed cost per slot, over the plain direct table:"
        << " count-ghost rules " << ((countedFixed - alwaysFixed) / (((int64_t)1) << SIGHT_SIZE_POW))
        << " B/slot (all of it ghost, none of it slot),"
@@ -983,6 +997,51 @@ static void testReplacementIsUnrepresentableOffDirectMapping() {
     testAssert(threw);
     testAssert(what.find("always") != string::npos);
   }
+  // A ghost SIZE is unconstructable for the two rules that keep no ghost. Sizing a
+  // structure that does not exist is not a setting to validate away; it is a shape with no
+  // meaning, and it is refused at the factory exactly as `direct + lru` is.
+  {
+    const NNCacheReplacementPolicy noGhost[2] =
+      {NNCacheReplacementPolicy::Always, NNCacheReplacementPolicy::KeepSighted};
+    for(int i = 0; i<2; i++) {
+      bool threw = false;
+      string what;
+      try { (void)NNCacheShape::directMapped(noGhost[i],20); }
+      catch(const StringError& e) { threw = true; what = e.what(); }
+      testAssert(threw);
+      testAssert(what.find("nnCacheSightingGhostPowerOfTwo") != string::npos);
+      testAssert(what.find("keepmoreseen") != string::npos);
+    }
+  }
+  // And the range is a real boundary rather than a guess.
+  {
+    bool threw = false;
+    try { (void)NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepMoreSeen,41); }
+    catch(const StringError&) { threw = true; }
+    testAssert(threw);
+    (void)NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepMoreSeen,40);
+    (void)NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepMoreSeen,0);
+  }
+  // The accessor refuses every shape and rule that keeps no ghost, and reports nullopt --
+  // not a number, and not a sentinel standing for one -- when no size was stated.
+  {
+    bool threw = false;
+    try { (void)NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepSighted).sightingGhostPowerOfTwo(); }
+    catch(const StringError&) { threw = true; }
+    testAssert(threw);
+    threw = false;
+    try {
+      (void)NNCacheShape::probed(NNCacheCollisionScheme::LinearProbe,4,NNCacheEvictionPolicy::Lru)
+        .sightingGhostPowerOfTwo();
+    }
+    catch(const StringError&) { threw = true; }
+    testAssert(threw);
+    testAssert(!NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepMoreSeen)
+               .sightingGhostPowerOfTwo().has_value());
+    testAssert(NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepMoreSeen,19)
+               .sightingGhostPowerOfTwo().value() == 19);
+  }
+
   // isStatusQuo is the guarantee the golden-file check rests on, so it must be false for
   // every rule but `always`.
   testAssert(NNCacheShape::directMapped().isStatusQuo());

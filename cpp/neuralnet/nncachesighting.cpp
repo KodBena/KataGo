@@ -56,16 +56,27 @@ using namespace std;
 //
 // THE BOUND, exact and fixed at construction:
 //
-//     4 bytes * 2^nnCacheSizePowerOfTwo
+//     4 bytes * 2^nnCacheSightingGhostPowerOfTwo
 //
-// which is 8 MiB at the operator's k=21 and 32 MiB at k=23 -- numerically the same bound
-// the second-sighting ghost already carries, a quarter of the slot-pointer array it sits
-// beside, and about 0.13% of the cache's cost against ~2972 bytes per resident entry.
-// Selecting BOTH second-sighting admission and a count-comparing replacement rule
-// allocates BOTH ghosts (16 MiB at k=21); they are not shared, because they hold
-// different facts and merging them would silently change second-sighting's semantics,
-// which is a question the perfmatrix report put to the operator and which is his to
-// answer.
+// which is 8 MiB at 2^21, 32 MiB at 2^23 and 128 MiB at 2^25 -- an INDEPENDENT budget
+// line, not a rider on the table's size. Selecting BOTH second-sighting admission and a
+// count-comparing replacement rule allocates BOTH ghosts; they are not shared, because
+// they hold different facts and merging them would silently change second-sighting's
+// semantics, which is a question the perfmatrix report put to the operator and which is
+// his to answer.
+//
+// WHY THE GHOST HAS ITS OWN SIZE, AND WHY DERIVING IT FROM THE TABLE WAS A MEASUREMENT
+// BUG AS WELL AS A DESIGN ONE. The ghost is a lossy sketch (below). Sized from
+// nnCacheSizePowerOfTwo -- which is what it did in the first version of this file, and
+// what it still does when the key is left unset -- its load factor IS the table's load
+// factor. So in exactly the regime a replacement rule exists for, where the table cannot
+// hold the working set, the ghost cannot hold the counts either. Worse, the resulting
+// distortion is NOT symmetric between the two counting rules: a clobbered incumbent reads
+// as count 0, which makes it WIN under KeepLessSeen and LOSE under KeepMoreSeen. A sweep
+// taken through a table-sized ghost therefore measures the two arms under different
+// handicaps, and it measured them that way once on this branch before the key existed.
+// The ghost's natural size is the WORKING SET -- an absolute quantity, and not a function
+// of how large a table someone chose.
 //
 // Each ghost word packs a 24-bit tag and an 8-bit saturating count. The slot is indexed by
 // hash1 and the tag is drawn from the top 24 bits of hash0, so neither quantity collides
@@ -73,8 +84,9 @@ using namespace std;
 // both hit-rate effects and neither a correctness effect, stated rather than left implicit:
 //
 //   * IT IS A LOSSY SKETCH, not a map. Two keys landing on one ghost slot overwrite each
-//     other's counts, and at a ghost sized to the table with a working set of the same
-//     order that is common, not rare. A key whose count was overwritten reads as unseen.
+//     other's counts, and a key whose count was overwritten reads as unseen. The fraction
+//     of keys clobbered at least once over a run of N distinct keys into M ghost slots is
+//     about 1 - exp(-(N-1)/M), so M >= 16N keeps it near 6% and M >= 64N near 1.6%.
 //     The exact structure (a count-min sketch, i.e. W-TinyLFU's admission half) is the
 //     named next thing to try if these rules measure well enough to be worth sharpening;
 //     it is a much larger structure and building it before any measurement said the cheap
@@ -184,8 +196,10 @@ class KeepLessSeenRule {
   static const bool NEEDS_GHOST = true;
   static void onHit(Meta&) {}
   static void onInsert(Meta&) {}
-  // The operator's own polarity: the candidate seen MORE often is the one replaced, so
-  // the SURVIVOR is the less-seen one. Inverse of the usual LFU intuition, deliberately.
+  // The INVERSE arm: the candidate seen MORE often is the one replaced, so the SURVIVOR
+  // is the less-seen one. Carried so the mechanism can be measured in both directions --
+  // it is one comparison flip from KeepMoreSeenRule. Not a recommendation and not
+  // anybody's proposal; the operator's proposal is KeepMoreSeenRule below.
   static bool admitNewcomer(uint32_t incumbentCount, uint32_t newcomerCount, Meta&) {
     return newcomerCount <= incumbentCount;
   }
@@ -198,8 +212,8 @@ class KeepMoreSeenRule {
   static const bool NEEDS_GHOST = true;
   static void onHit(Meta&) {}
   static void onInsert(Meta&) {}
-  // The conventional, LFU-shaped polarity: the more-seen candidate survives. Here so the
-  // two directions can be measured against each other, not as a recommendation.
+  // THE OPERATOR'S OWN PROPOSAL, "most-seen direct": the more-seen candidate survives.
+  // Also the conventional, LFU-shaped direction.
   static bool admitNewcomer(uint32_t incumbentCount, uint32_t newcomerCount, Meta&) {
     return newcomerCount >= incumbentCount;
   }
@@ -249,7 +263,9 @@ class NNCacheTableDirectSighting final : public NNCacheTable {
   uint32_t mutexPoolMask;
 
  public:
-  NNCacheTableDirectSighting(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo)
+  // ghostPowerOfTwo is EXPLICIT and is not assumed equal to sizePowerOfTwo; see the
+  // load-factor argument in this file's header.
+  NNCacheTableDirectSighting(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo, int ghostPowerOfTwo)
     :entries(NULL), ghost(NULL), mutexPool(NULL), tableSize(0), tableMask(0), mutexPoolMask(0)
   {
     if(sizePowerOfTwo < 0 || sizePowerOfTwo > 63)
@@ -268,7 +284,7 @@ class NNCacheTableDirectSighting final : public NNCacheTable {
     mutexPoolMask = mutexPoolSize - 1;
     mutexPool = new MutexPool(mutexPoolSize);
     if(Rule::NEEDS_GHOST)
-      ghost = new GhostSightingCounts(sizePowerOfTwo);
+      ghost = new GhostSightingCounts(ghostPowerOfTwo);
   }
 
   ~NNCacheTableDirectSighting() override {
@@ -407,14 +423,21 @@ unique_ptr<NNCacheTable> makeSightingDirectNNCacheTable(const NNCacheConfig& con
       "silently."
     );
   case NNCacheReplacementPolicy::KeepLessSeen:
+    // value_or is the one place the "not stated" case is resolved, and it resolves to the
+    // table's own size -- exactly what the ghost was before this key existed, so a config
+    // that says nothing builds the structure it built before.
     return unique_ptr<NNCacheTable>(new NNCacheTableDirectSighting<KeepLessSeenRule>(
-      config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo));
+      config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo,
+      config.shape.sightingGhostPowerOfTwo().value_or(config.sizePowerOfTwo)));
   case NNCacheReplacementPolicy::KeepMoreSeen:
     return unique_ptr<NNCacheTable>(new NNCacheTableDirectSighting<KeepMoreSeenRule>(
-      config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo));
+      config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo,
+      config.shape.sightingGhostPowerOfTwo().value_or(config.sizePowerOfTwo)));
   case NNCacheReplacementPolicy::KeepSighted:
+    // No ghost at all, so this argument is never read; the table's own size is passed
+    // rather than a literal, so nothing here looks like a size that means something.
     return unique_ptr<NNCacheTable>(new NNCacheTableDirectSighting<KeepSightedRule>(
-      config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo));
+      config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo, config.sizePowerOfTwo));
   default:
     break;
   }

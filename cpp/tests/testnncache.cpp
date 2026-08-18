@@ -213,16 +213,19 @@ void Tests::runNNCacheConfigTests() {
     testAssert(config.shape.replacement() == NNCacheReplacementPolicy::Always);
     testAssert(config.isStatusQuo());   // saying it explicitly is still the status quo
   }
-  // The operator's own direction: the more-seen candidate is replaced, so the SURVIVOR is
-  // the less-seen one. The vocabulary names the survivor precisely so the two directions
-  // cannot be confused for each other in a config file.
+  // The INVERSE arm: the more-seen candidate is replaced, so the SURVIVOR is the less-seen
+  // one. Carried for contrast, not proposed by anyone. The vocabulary names the survivor
+  // precisely so the two directions cannot be confused for each other in a config file --
+  // and they were confused once already, in a brief that transcribed the operator's own
+  // sentence, which named the VICTIM.
   {
     NNCacheConfig config = parseCacheCfg({{"nnCacheReplacement","keeplessseen"}});
     testAssert(config.shape.replacement() == NNCacheReplacementPolicy::KeepLessSeen);
     testAssert(!config.isStatusQuo());
     testAssert(NNCacheTable::create(config) != nullptr);
   }
-  // The conventional, LFU-shaped direction.
+  // THE OPERATOR'S OWN PROPOSAL, and the conventional LFU-shaped direction: the more-seen
+  // candidate survives.
   {
     NNCacheConfig config = parseCacheCfg({{"nnCacheReplacement","keepmoreseen"}});
     testAssert(config.shape.replacement() == NNCacheReplacementPolicy::KeepMoreSeen);
@@ -255,6 +258,48 @@ void Tests::runNNCacheConfigTests() {
   expectRefused(
     {{"nnCacheReplacement","keepmoreseen"},{"nnCacheEviction","lru"}}, {"nnCacheEviction","direct"}
   );
+  //---- nnCacheSightingGhostPowerOfTwo: the ghost is sized independently of the table ----
+  // Unstated is not a number. Absent means "derive it from nnCacheSizePowerOfTwo", which
+  // is what the ghost did before this key existed, so an unchanged config gets an
+  // unchanged structure and an unchanged memory bill.
+  {
+    NNCacheConfig config = parseCacheCfg({{"nnCacheReplacement","keepmoreseen"}});
+    testAssert(!config.shape.sightingGhostPowerOfTwo().has_value());
+  }
+  {
+    NNCacheConfig config = parseCacheCfg(
+      {{"nnCacheReplacement","keepmoreseen"},{"nnCacheSightingGhostPowerOfTwo","24"}}
+    );
+    testAssert(config.shape.sightingGhostPowerOfTwo().value() == 24);
+    testAssert(!config.isStatusQuo());
+    testAssert(NNCacheTable::create(config) != nullptr);
+  }
+  {
+    NNCacheConfig config = parseCacheCfg(
+      {{"nnCacheReplacement","keeplessseen"},{"nnCacheSightingGhostPowerOfTwo","10"}}
+    );
+    testAssert(config.shape.sightingGhostPowerOfTwo().value() == 10);
+  }
+  // Refused for the two rules that keep no ghost at all -- sizing a structure that does
+  // not exist is not a setting to correct, and the message says which rules do keep one.
+  expectRefused(
+    {{"nnCacheSightingGhostPowerOfTwo","20"}},
+    {"nnCacheSightingGhostPowerOfTwo","keeplessseen","keepmoreseen"}
+  );
+  expectRefused(
+    {{"nnCacheReplacement","keepsighted"},{"nnCacheSightingGhostPowerOfTwo","20"}},
+    {"nnCacheSightingGhostPowerOfTwo","keepsighted","keepmoreseen"}
+  );
+  // And under every collision scheme that has no replacement rule to keep counts for.
+  expectRefused(
+    {{"nnCacheCollision","linearprobe"},{"nnCacheEviction","lru"},{"nnCacheSightingGhostPowerOfTwo","20"}},
+    {"nnCacheSightingGhostPowerOfTwo","nnCacheReplacement","direct"}
+  );
+  expectRefused(
+    {{"nnCacheCollision","chain"},{"nnCacheMaxBytes","100000000"},{"nnCacheSightingGhostPowerOfTwo","20"}},
+    {"nnCacheSightingGhostPowerOfTwo","direct"}
+  );
+
   // Admission and replacement are orthogonal axes and compose.
   {
     NNCacheConfig config =
