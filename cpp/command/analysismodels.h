@@ -91,8 +91,11 @@ class ModelResolution {
 [[nodiscard]] std::optional<std::string> findInternalNameCollision(const std::vector<ModelAddress>& addresses);
 
 // Resolves a requested internal name against the name space. Searchable models resolve to
-// their index among the searchable models, which is their position in `addresses`: the
-// caller builds the vector searchable-first, and AnalysisModelHosts is the one caller.
+// their index among the searchable models, which is their position in `addresses` -- so the
+// vector must list every searchable model before any companion. That is not left to the
+// caller's good manners: it is asserted here, because a companion ordered first would shift
+// every searchable index by one and hand back a model the request did not name, which is the
+// exact failure this whole header exists to make impossible.
 [[nodiscard]] ModelResolution resolveModelName(const std::vector<ModelAddress>& addresses, const std::string& requestedName);
 
 // One hosted model: its address and the evaluator that answers for it.
@@ -100,6 +103,10 @@ struct HostedModel {
   ModelAddress address;
   NNEvaluator* eval;  // Not owned. Never null.
 };
+
+// The addresses of these models, in the same order. The one way to get an address vector out
+// of a model vector, so the uniqueness check reads the same list whoever asks it.
+[[nodiscard]] std::vector<ModelAddress> addressesOf(const std::vector<HostedModel>& models);
 
 // The models a running analysis engine hosts. Constructed once at load, read-only
 // afterwards, shared by every analysis thread.

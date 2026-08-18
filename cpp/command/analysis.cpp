@@ -165,9 +165,11 @@ int MainCmds::analysis(const vector<string>& args) {
   const bool preventEncore = cfg.contains("preventCleanupPhase") ? cfg.getBool("preventCleanupPhase") : true;
 
   //Every searchable model the process hosts, primary first. Without -extra-model this is exactly
-  //the one model the engine has always loaded, and nnEval below is that model, as before.
-  vector<NNEvaluator*> searchableEvals;
-  NNEvaluator* nnEval = NULL;
+  //the one model the engine has always loaded.
+  //There is deliberately no variable naming "the primary evaluator" that outlives this block: the
+  //only handle on a model afterwards is modelHosts, indexed by the model a request resolved to, so
+  //a later reader cannot reach for the primary net by name without meaning to.
+  vector<HostedModel> searchableModels;
   NNEvaluator* humanEval = NULL;
   {
     Setup::initializeSession(cfg);
@@ -176,21 +178,26 @@ int MainCmds::analysis(const vector<string>& args) {
     const int defaultMaxBatchSize = -1;
     const bool disableFP16 = false;
     const string expectedSha256 = "";
-    nnEval = Setup::initializeNNEvaluator(
-      modelFile,modelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
-      NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
-      Setup::SETUP_FOR_ANALYSIS
-    );
-    searchableEvals.push_back(nnEval);
-    for(const string& extraModelFile: extraModelFiles) {
-      searchableEvals.push_back(
-        Setup::initializeNNEvaluator(
-          extraModelFile,extraModelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
-          NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
-          Setup::SETUP_FOR_ANALYSIS
-        )
+    //Loads one searchable model and admits it to the name space, refusing at once if its internal
+    //name is one an already-loaded model answers to. Same rule AnalysisModelHosts::create enforces,
+    //applied as each model arrives, so a process that is going to be refused for a duplicate does
+    //not first pay to load every remaining net onto the device.
+    auto loadSearchableModel = [&](const string& file, const string& argName) {
+      NNEvaluator* eval = Setup::initializeNNEvaluator(
+        file,file,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
+        NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+        Setup::SETUP_FOR_ANALYSIS
       );
-    }
+      searchableModels.push_back(
+        HostedModel{ModelAddress{eval->getInternalModelName(), argName + " " + eval->getModelFileName(), ModelRole::Searchable}, eval}
+      );
+      const std::optional<string> collision = findInternalNameCollision(addressesOf(searchableModels));
+      if(collision.has_value())
+        throw StringError(collision.value());
+    };
+    loadSearchableModel(modelFile, "-model");
+    for(const string& extraModelFile: extraModelFiles)
+      loadSearchableModel(extraModelFile, "-extra-model");
     if(humanModelFile != "") {
       humanEval = Setup::initializeNNEvaluator(
         humanModelFile,humanModelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
@@ -207,17 +214,10 @@ int MainCmds::analysis(const vector<string>& args) {
     }
   }
 
-  //The name space of the loaded models, and the load-time refusal of a duplicate internal name.
-  //Built here, immediately after the last model is loaded and before anything can be served, so a
-  //name that cannot address exactly one model stops the process instead of reaching a request.
+  //The name space of the loaded models. The duplicate-name refusal above fires as each model is
+  //admitted; create() enforces the same rule for the whole set, including the human companion,
+  //which shares the name space because a client reads its name from query_models too.
   const AnalysisModelHosts modelHosts = [&]() {
-    vector<HostedModel> searchable;
-    for(size_t i = 0; i<searchableEvals.size(); i++) {
-      const string sourceLabel = (i == 0 ? "-model " : "-extra-model ") + searchableEvals[i]->getModelFileName();
-      searchable.push_back(
-        HostedModel{ModelAddress{searchableEvals[i]->getInternalModelName(), sourceLabel, ModelRole::Searchable}, searchableEvals[i]}
-      );
-    }
     std::optional<HostedModel> companion;
     if(humanEval != NULL) {
       companion = HostedModel{
@@ -225,11 +225,12 @@ int MainCmds::analysis(const vector<string>& args) {
         humanEval
       };
     }
-    return AnalysisModelHosts::create(std::move(searchable), std::move(companion));
+    return AnalysisModelHosts::create(std::move(searchableModels), std::move(companion));
   }();
 
 #ifndef USE_EIGEN_BACKEND
-  for(NNEvaluator* eval: searchableEvals) {
+  for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++) {
+    NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
     int nnMaxBatchSizeTotal = eval->getNumGpus() * eval->getMaxBatchSize();
     int numThreadsTotal = defaultParams.numThreads * numAnalysisThreads;
     if(nnMaxBatchSizeTotal * 1.5 <= numThreadsTotal) {
@@ -247,7 +248,10 @@ int MainCmds::analysis(const vector<string>& args) {
 
   //Check for unused config keys
   cfg.warnUnusedKeys(cerr,&logger);
-  Setup::maybeWarnHumanSLParams(defaultParams,nnEval,humanEval,cerr,&logger);
+  //Per hosted model: the default params may be honorable by one net and not another, and a warning
+  //that only ever consulted the primary would be silent about exactly the model a request names.
+  for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++)
+    Setup::maybeWarnHumanSLParams(defaultParams,modelHosts.searchableEval(modelIdx),humanEval,cerr,&logger);
 
   logger.write("Loaded config "+ cfg.getFileName());
   logger.write("Loaded model "+ modelFile);
@@ -1066,7 +1070,11 @@ int MainCmds::analysis(const vector<string>& args) {
               reportWarningForId(rbase.id, "overrideSettings", string("Unknown config params: ") + Global::concat(unusedKeys,","));
             }
             ostringstream out;
-            if(Setup::maybeWarnHumanSLParams(rbase.params,nnEval,humanEval,out,NULL)) {
+            //The request's own model, not the primary one: this check decides whether THIS request
+            //is honored, and asking a net the request did not name is the wrong-net service in the
+            //quietest register of all -- it does not serve a wrong evaluation, it refuses or admits
+            //a request on evidence from the wrong net.
+            if(Setup::maybeWarnHumanSLParams(rbase.params,modelHosts.searchableEval(rbase.modelIdx),humanEval,out,NULL)) {
               throw StringError(out.str());
             }
           }
@@ -1247,10 +1255,8 @@ int MainCmds::analysis(const vector<string>& args) {
           initialPlayer = BoardHistory::numHandicapStonesOnBoard(board) > 0 ? P_WHITE : P_BLACK;
       }
 
-      //Everything below that asks the net a question asks the net this request resolved to, not the
-      //primary one: rule support and history modes are properties of the model that will actually
-      //run the search, and answering them from a different model is the wrong-net service in a
-      //quieter register.
+      //Rule support and history modes are properties of the model that will actually run the
+      //search, so they are asked of the model this request resolved to.
       NNEvaluator* requestEval = modelHosts.searchableEval(rbase.modelIdx);
 
       bool rulesWereSupported;
@@ -1411,8 +1417,9 @@ int MainCmds::analysis(const vector<string>& args) {
     logger.write("NN batches: " + Global::int64ToString(humanEval->numBatchesProcessed()));
     logger.write("NN avg batch size: " + Global::doubleToString(humanEval->averageProcessedBatchSize()));
   }
-  for(NNEvaluator* eval: searchableEvals)
-    delete eval;
+  //main owns the evaluators; modelHosts only refers to them.
+  for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++)
+    delete modelHosts.searchableEval(modelIdx);
   delete humanEval;
   NeuralNet::globalCleanup();
   ScoreValue::freeTables();

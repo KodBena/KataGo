@@ -154,7 +154,7 @@ namespace Tests {
   void runNNCacheCountLogTests();
 
   //testanalysismodels.cpp
-  void runAnalysisModelHostsTests();
+  void runAnalysisModelNameSpaceTests();
   // Not part of runtests: it is a measurement, not an assertion, and it writes real files.
   // Reached by the runnncachecountlogbench subcommand, which names the directory.
   void runNNCacheCountLogBench(const std::string& directory);

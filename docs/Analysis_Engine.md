@@ -44,6 +44,10 @@ Two rules keep that name honest, and both refuse rather than guess:
 
 A query with no `model` field behaves exactly as it always has.
 
+`model` selects which model analyzes a *query*; no action query reads it, so including `model` on an
+action query (`query_models`, `clear_cache`, `terminate`, `terminate_all`, `query_version`) is an
+error rather than being ignored.
+
 ## Example Code
 
 For example code demonstrating how to invoke the analysis engine from Python, see [here](https://github.com/lightvector/KataGo/blob/master/python/query_analysis_engine_example.py)!

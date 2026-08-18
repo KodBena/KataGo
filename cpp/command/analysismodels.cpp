@@ -69,7 +69,24 @@ std::optional<string> findInternalNameCollision(const vector<ModelAddress>& addr
   return std::nullopt;
 }
 
+vector<ModelAddress> addressesOf(const vector<HostedModel>& models) {
+  vector<ModelAddress> addresses;
+  for(const HostedModel& model: models)
+    addresses.push_back(model.address);
+  return addresses;
+}
+
 ModelResolution resolveModelName(const vector<ModelAddress>& addresses, const string& requestedName) {
+  //Searchable-first, or a searchable model's index is not its position and resolution hands
+  //back the wrong model. See the header.
+  bool seenCompanion = false;
+  for(const ModelAddress& address: addresses) {
+    if(address.role == ModelRole::HumanCompanion)
+      seenCompanion = true;
+    else
+      testAssert(!seenCompanion);
+  }
+
   for(size_t i = 0; i < addresses.size(); i++) {
     if(addresses[i].internalName != requestedName)
       continue;
@@ -92,26 +109,28 @@ AnalysisModelHosts AnalysisModelHosts::create(vector<HostedModel> searchable, st
   if(searchable.size() <= 0)
     throw StringError("AnalysisModelHosts::create - the analysis engine must host at least one searchable model");
 
-  vector<ModelAddress> addrs;
-  vector<NNEvaluator*> evals;
-  for(const HostedModel& model: searchable) {
+  vector<HostedModel> models = std::move(searchable);
+  for(const HostedModel& model: models) {
     testAssert(model.address.role == ModelRole::Searchable);
     testAssert(model.eval != NULL);
-    addrs.push_back(model.address);
-    evals.push_back(model.eval);
   }
   if(companion.has_value()) {
     testAssert(companion.value().address.role == ModelRole::HumanCompanion);
     testAssert(companion.value().eval != NULL);
-    addrs.push_back(companion.value().address);
-    evals.push_back(companion.value().eval);
+    models.push_back(companion.value());
   }
+
+  const size_t numSearchableModels = models.size() - (companion.has_value() ? 1 : 0);
+  vector<ModelAddress> addrs = addressesOf(models);
+  vector<NNEvaluator*> evals;
+  for(const HostedModel& model: models)
+    evals.push_back(model.eval);
 
   std::optional<string> collision = findInternalNameCollision(addrs);
   if(collision.has_value())
     throw StringError(collision.value());
 
-  return AnalysisModelHosts(std::move(addrs), std::move(evals), searchable.size());
+  return AnalysisModelHosts(std::move(addrs), std::move(evals), numSearchableModels);
 }
 
 size_t AnalysisModelHosts::numSearchable() const {

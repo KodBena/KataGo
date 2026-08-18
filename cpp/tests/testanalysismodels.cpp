@@ -130,7 +130,7 @@ void testAResolutionIsEitherAnIndexOrARefusalAndNeverBoth() {
 
 }  // namespace
 
-void Tests::runAnalysisModelHostsTests() {
+void Tests::runAnalysisModelNameSpaceTests() {
   cout << "Running analysis engine model name space tests" << endl;
   testDistinctNamesCollideWithNothing();
   testDuplicateNameIsRefusedAndTheRefusalNamesTheCollision();
