@@ -208,38 +208,48 @@ void testCountLogTornTailIsDiscardedAndThePrefixSurvives() {
   const int64_t sizeAfterThreeDumps = sizeOf(log.path());
   testAssert(sizeAfterThreeDumps == sizeAfterTwoDumps + NNCacheCountLog::bytesForDumpOf(3));
 
-  // Cut the file in the MIDDLE OF THE THIRD BLOCK'S SECOND RECORD -- not on a record
-  // boundary, and not on a block boundary. This is what a process dying part-way through a
-  // write(2) leaves behind.
+  // Cut the file part-way through the third block's THIRD record: not on a record boundary
+  // and not on a block boundary, which is what a process dying part-way through a write(2)
+  // leaves behind.
+  //
+  // The cut falls where it does deliberately. The third block's first TWO records -- key 1
+  // and key 4 -- sit COMPLETE inside the region that must be discarded. So an
+  // implementation that framed by length alone, or that took whatever whole records
+  // happened to fit, would apply them, and the assertions below would see it. Cutting
+  // inside the first record instead would have made key 4's absence an accident of where
+  // the byte landed rather than an observation of the property (ADR-0021 Rule 1).
   const int64_t cutAt = sizeAfterTwoDumps + (int64_t)NNCacheCountLog::blockHeaderBytes() +
-                        (int64_t)NNCacheCountLog::recordBytes() + 9;
+                        2 * (int64_t)NNCacheCountLog::recordBytes() + 9;
   truncateTo(log.path(), cutAt);
   testAssert(sizeOf(log.path()) == cutAt);
 
   const NNCacheCountLogContents contents = log.load();
 
-  // The disposition is Truncated and names exactly how many bytes it will not use.
-  testAssert(contents.tail() == NNCacheCountLogTail::Truncated);
-  testAssert(contents.discardedTailBytes() == cutAt - sizeAfterTwoDumps);
-
-  // Exactly the two completed dumps survive, with exact totals.
-  testAssert(contents.blocksApplied() == 2);
-  testAssert(contents.recordsApplied() == 4);
+  // THE HEADLINE CLAIM FIRST, so a defect that applies part of a torn block goes red on the
+  // count being wrong rather than on the tail's byte arithmetic.
+  //
+  // Exactly the two completed dumps survive, with exact totals. Key 1's 100 hits from the
+  // torn block are not in its total: a partial block is not applied in part.
   testAssert(rowFor(contents, 1).lookups == 15 && rowFor(contents, 1).sessions == 2);
   testAssert(rowFor(contents, 2).lookups == 20 && rowFor(contents, 2).sessions == 1);
   testAssert(rowFor(contents, 3).lookups == 30 && rowFor(contents, 3).sessions == 1);
 
-  // THE PARTIAL RECORD DID NOT SURVIVE, observed positively: keys 4 and 5 were named ONLY
+  // AND THE PARTIAL DUMP DID NOT SURVIVE, observed positively: keys 4 and 5 were named ONLY
   // by the torn block, so their absence is a direct membership fact about the rows the load
-  // returned, and the assertion goes red the moment a partial block is applied.
+  // returned. Key 4's record is whole in the file and is discarded anyway, because the
+  // BLOCK it belongs to is not.
   testAssert(!hasRowFor(contents, 4));
   testAssert(!hasRowFor(contents, 5));
   testAssert(contents.rows().size() == 3);
-  // And key 1's 100 hits from the torn block are not in its total either -- a partial block
-  // must not be applied in part.
-  testAssert(rowFor(contents, 1).lookups != 115);
   // The torn block's unattributed count went with it.
   testAssert(contents.unattributedLookups() == 0);
+
+  // Then the accounting: the disposition is Truncated and names exactly how many bytes it
+  // will not use.
+  testAssert(contents.tail() == NNCacheCountLogTail::Truncated);
+  testAssert(contents.discardedTailBytes() == cutAt - sizeAfterTwoDumps);
+  testAssert(contents.blocksApplied() == 2);
+  testAssert(contents.recordsApplied() == 4);
 }
 
 // A block that is the RIGHT LENGTH but wrong in its bytes -- the shape a lost page leaves,
