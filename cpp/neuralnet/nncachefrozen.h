@@ -64,7 +64,7 @@ class NNCacheFrozenIndex {
   // unmistakably") and what every other construction refusal in this cache already does;
   // the std::expected shape ADR-0012 P9 rule 5 would prefer is a C++23 type and this tree
   // is built at C++17.
-  static NNCacheFrozenIndex build(const std::vector<Hash128>& keys);
+  static NNCacheFrozenIndex build(std::vector<Hash128> keys);
 
   NNCacheFrozenIndex(NNCacheFrozenIndex&& other) = default;
   NNCacheFrozenIndex& operator=(NNCacheFrozenIndex&& other) = default;
@@ -195,22 +195,21 @@ class NNCacheFrozen {
  private:
   NNCacheFrozen(NNCacheFrozenIndex&& index, std::vector<std::shared_ptr<NNOutput>>&& evaluations);
 
-  // One entry's mutable state. The count and the shadow flag share a single 32-bit word so
-  // that shadowing and reading out the accrued count are ONE atomic exchange: a count
-  // cannot be transferred twice and cannot be split across the transfer. The top bit is
-  // the shadow flag and the low 31 bits are the count, which is ample -- the largest
-  // lifetime reference count in the operator's whole database is 11,997 (SPEC.md 3.2).
-  struct Entry {
-    std::atomic<uint32_t> state;
-    std::shared_ptr<NNOutput> evaluation;
-    Entry() : state(0), evaluation(nullptr) {}
-  };
-
   static const uint32_t SHADOW_BIT = 0x80000000u;
   static const uint32_t COUNT_MASK = 0x7FFFFFFFu;
 
   NNCacheFrozenIndex index_;
-  std::vector<Entry> entries_;
+  // The caller's evaluation vector, MOVED in rather than copied -- so no moment of
+  // construction holds two sets of handles, and SPEC.md 6's transient-peak ceiling is met
+  // with the same margin as its resident one.
+  std::vector<std::shared_ptr<NNOutput>> evaluations_;
+  // One entry's mutable state, kept separate from the handles for the reason above. The
+  // count and the shadow flag share a single 32-bit word so that shadowing and reading out
+  // the accrued count are ONE atomic exchange: a count cannot be transferred twice and
+  // cannot be split across the transfer. The top bit is the shadow flag and the low 31 bits
+  // are the count, which is ample -- the largest lifetime reference count in the operator's
+  // whole database is 11,997 (SPEC.md 3.2).
+  std::vector<std::atomic<uint32_t>> states_;
 };
 
 //-------------------------------------------------------------------------------------

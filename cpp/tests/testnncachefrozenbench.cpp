@@ -117,9 +117,15 @@ void Tests::runNNCacheFrozenBench() {
     outputs.reserve((size_t)n);
     for(int i = 0; i < n; i++)
       outputs.push_back(outputFor(residentKey(i)));
+    // SPEC.md 1.6 is a planning budget rather than an acceptance criterion, but it asks
+    // to be told if construction is orders of magnitude off: the prototype ran about
+    // 165 ns/key at n=10,000 and about 500 ns/key at n=2,000,000.
+    ClockTimer buildTimer;
     unique_ptr<NNCacheFrozen> frozen = NNCacheFrozen::build(std::move(outputs));
+    const double buildSeconds = buildTimer.getSeconds();
 
-    cout << "n=" << n << " built; structure "
+    cout << "n=" << n << " built in " << (buildSeconds * 1000.0) << " ms ("
+         << (buildSeconds * 1.0e9 / (double)n) << " ns/key); structure "
          << ((double)frozen->structureBytes() / (double)n) << " B/entry" << endl;
 
     vector<double> hitNs;

@@ -148,18 +148,21 @@ size_t NNCacheFrozenIndex::structureBytes() const {
     disp_.size() * sizeof(uint16_t);
 }
 
-NNCacheFrozenIndex NNCacheFrozenIndex::build(const std::vector<Hash128>& keys) {
+NNCacheFrozenIndex NNCacheFrozenIndex::build(std::vector<Hash128> keysIn) {
   NNCacheFrozenIndex index;
+  // Moved, not copied: no moment of construction holds two key arrays (SPEC.md 6's
+  // transient-peak ceiling).
+  index.keys_ = std::move(keysIn);
+  const std::vector<Hash128>& keys = index.keys_;
 
-  if(keys.size() > (size_t)maxEntries())
+  if(index.keys_.size() > (size_t)maxEntries())
     throw StringError(
-      "NNCacheFrozenIndex: key count " + Global::uint64ToString((uint64_t)keys.size()) +
+      "NNCacheFrozenIndex: key count " + Global::uint64ToString((uint64_t)index.keys_.size()) +
       " exceeds what this implementation's 32-bit slot arithmetic supports (max " +
       Global::uint64ToString((uint64_t)maxEntries()) + ")."
     );
 
   const uint32_t n = (uint32_t)keys.size();
-  index.keys_ = keys;
   if(n == 0) {
     index.numBuckets_ = 0;
     index.tableSize_ = 0;
@@ -307,11 +310,8 @@ NNCacheFrozenIndex NNCacheFrozenIndex::build(const std::vector<Hash128>& keys) {
 //-------------------------------------------------------------------------------------
 
 NNCacheFrozen::NNCacheFrozen(NNCacheFrozenIndex&& index, std::vector<std::shared_ptr<NNOutput>>&& evaluations)
-  :index_(std::move(index)), entries_(evaluations.size())
-{
-  for(size_t i = 0; i < evaluations.size(); i++)
-    entries_[i].evaluation = std::move(evaluations[i]);
-}
+  :index_(std::move(index)), evaluations_(std::move(evaluations)), states_(evaluations_.size())
+{}
 
 std::unique_ptr<NNCacheFrozen> NNCacheFrozen::build(std::vector<std::shared_ptr<NNOutput>> evaluations) {
   // The key set is DERIVED from the evaluations rather than supplied beside them, so entry
@@ -327,7 +327,7 @@ std::unique_ptr<NNCacheFrozen> NNCacheFrozen::build(std::vector<std::shared_ptr<
       );
     keys.push_back(evaluations[i]->nnHash);
   }
-  NNCacheFrozenIndex index = NNCacheFrozenIndex::build(keys);
+  NNCacheFrozenIndex index = NNCacheFrozenIndex::build(std::move(keys));
   return std::unique_ptr<NNCacheFrozen>(new NNCacheFrozen(std::move(index), std::move(evaluations)));
 }
 
@@ -337,17 +337,17 @@ bool NNCacheFrozen::get(Hash128 key, std::shared_ptr<NNOutput>& ret) {
   const std::optional<uint32_t> idx = index_.find(key);
   if(!idx.has_value())
     return false;
-  Entry& entry = entries_[idx.value()];
+  std::atomic<uint32_t>& state = states_[idx.value()];
   // Count the retrieval, and refuse to serve a shadowed entry in the same operation. A
   // relaxed increment is all SPEC.md 3.2/3.3 ask for: the counters need no ordering, only
   // not to be lost or torn.
-  const uint32_t prev = entry.state.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t prev = state.fetch_add(1, std::memory_order_relaxed);
   if((prev & SHADOW_BIT) != 0) {
     // Level 1 owns this key now. Undo the increment so the transferred count stays exact.
-    entry.state.fetch_sub(1, std::memory_order_relaxed);
+    state.fetch_sub(1, std::memory_order_relaxed);
     return false;
   }
-  ret = entry.evaluation;
+  ret = evaluations_[idx.value()];
   return true;
 }
 
@@ -355,18 +355,18 @@ bool NNCacheFrozen::contains(Hash128 key) const {
   const std::optional<uint32_t> idx = index_.find(key);
   if(!idx.has_value())
     return false;
-  return (entries_[idx.value()].state.load(std::memory_order_relaxed) & SHADOW_BIT) == 0;
+  return (states_[idx.value()].load(std::memory_order_relaxed) & SHADOW_BIT) == 0;
 }
 
 std::optional<uint32_t> NNCacheFrozen::shadow(Hash128 key) {
   const std::optional<uint32_t> idx = index_.find(key);
   if(!idx.has_value())
     return std::nullopt;
-  Entry& entry = entries_[idx.value()];
+  std::atomic<uint32_t>& state = states_[idx.value()];
   // One atomic exchange both retires the entry and reads out everything it accrued, so the
   // count can be neither split across the transfer nor transferred twice: a racing second
   // caller sees SHADOW_BIT already set and hands out nothing.
-  const uint32_t prev = entry.state.exchange(SHADOW_BIT, std::memory_order_relaxed);
+  const uint32_t prev = state.exchange(SHADOW_BIT, std::memory_order_relaxed);
   if((prev & SHADOW_BIT) != 0)
     return std::nullopt;
   return prev & COUNT_MASK;
@@ -376,32 +376,32 @@ bool NNCacheFrozen::addHits(Hash128 key, uint32_t amount) {
   const std::optional<uint32_t> idx = index_.find(key);
   if(!idx.has_value())
     return false;
-  Entry& entry = entries_[idx.value()];
-  uint32_t cur = entry.state.load(std::memory_order_relaxed);
+  std::atomic<uint32_t>& state = states_[idx.value()];
+  uint32_t cur = state.load(std::memory_order_relaxed);
   while(true) {
     if((cur & SHADOW_BIT) != 0)
       return false;
     const uint32_t next = (cur + amount) & COUNT_MASK;
-    if(entry.state.compare_exchange_weak(cur, next, std::memory_order_relaxed))
+    if(state.compare_exchange_weak(cur, next, std::memory_order_relaxed))
       return true;
   }
 }
 
 uint32_t NNCacheFrozen::hitCountAt(uint32_t i) const {
-  const uint32_t state = entries_[i].state.load(std::memory_order_relaxed);
+  const uint32_t state = states_[i].load(std::memory_order_relaxed);
   if((state & SHADOW_BIT) != 0)
     return 0;
   return state & COUNT_MASK;
 }
 
 bool NNCacheFrozen::isShadowedAt(uint32_t i) const {
-  return (entries_[i].state.load(std::memory_order_relaxed) & SHADOW_BIT) != 0;
+  return (states_[i].load(std::memory_order_relaxed) & SHADOW_BIT) != 0;
 }
 
 std::shared_ptr<NNOutput> NNCacheFrozen::evaluationAt(uint32_t i) const {
   if(isShadowedAt(i))
     return nullptr;
-  return entries_[i].evaluation;
+  return evaluations_[i];
 }
 
 std::vector<NNCacheHitCount> NNCacheFrozen::harvest() const {
@@ -409,7 +409,7 @@ std::vector<NNCacheHitCount> NNCacheFrozen::harvest() const {
   const uint32_t n = index_.numEntries();
   out.reserve(n);
   for(uint32_t i = 0; i < n; i++) {
-    const uint32_t state = entries_[i].state.load(std::memory_order_relaxed);
+    const uint32_t state = states_[i].load(std::memory_order_relaxed);
     if((state & SHADOW_BIT) != 0)
       continue;
     NNCacheHitCount row;
@@ -421,35 +421,38 @@ std::vector<NNCacheHitCount> NNCacheFrozen::harvest() const {
 }
 
 size_t NNCacheFrozen::structureBytes() const {
-  return index_.structureBytes() + entries_.size() * sizeof(Entry);
+  return
+    index_.structureBytes() +
+    evaluations_.size() * sizeof(std::shared_ptr<NNOutput>) +
+    states_.size() * sizeof(uint32_t);
 }
 
 int64_t NNCacheFrozen::reachablePayloadBytes() const {
   int64_t bytes = 0;
-  for(size_t i = 0; i < entries_.size(); i++) {
-    if((entries_[i].state.load(std::memory_order_relaxed) & SHADOW_BIT) != 0)
+  for(size_t i = 0; i < evaluations_.size(); i++) {
+    if((states_[i].load(std::memory_order_relaxed) & SHADOW_BIT) != 0)
       continue;
-    if(entries_[i].evaluation != nullptr)
-      bytes += (int64_t)nnOutputFootprintBytes(*entries_[i].evaluation);
+    if(evaluations_[i] != nullptr)
+      bytes += (int64_t)nnOutputFootprintBytes(*evaluations_[i]);
   }
   return bytes;
 }
 
 int64_t NNCacheFrozen::shadowedPayloadBytes() const {
   int64_t bytes = 0;
-  for(size_t i = 0; i < entries_.size(); i++) {
-    if((entries_[i].state.load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
+  for(size_t i = 0; i < evaluations_.size(); i++) {
+    if((states_[i].load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
       continue;
-    if(entries_[i].evaluation != nullptr)
-      bytes += (int64_t)nnOutputFootprintBytes(*entries_[i].evaluation);
+    if(evaluations_[i] != nullptr)
+      bytes += (int64_t)nnOutputFootprintBytes(*evaluations_[i]);
   }
   return bytes;
 }
 
 int64_t NNCacheFrozen::numReachableEntries() const {
   int64_t count = 0;
-  for(size_t i = 0; i < entries_.size(); i++) {
-    if((entries_[i].state.load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
+  for(size_t i = 0; i < states_.size(); i++) {
+    if((states_[i].load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
       count += 1;
   }
   return count;
