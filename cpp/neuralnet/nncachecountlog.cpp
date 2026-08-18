@@ -582,7 +582,14 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   const bool overMultiple = liveSet > 0 && scan.recordsApplied > (int64_t)liveSetMultiple * liveSet;
   if(!torn && !overMultiple)
     return false;
-  rewriteAsOneBlock(path_, scan.rows, scan.unattributedLookups, contextHash_);
+  // DELEGATES rather than rewriting here. "Rewrite this log" has exactly one home; a
+  // second call to rewriteAsOneBlock at this site would be a second statement of the same
+  // act, and a change to either one would silently leave the other saying the old thing.
+  // That is not hypothetical: a seen-red leg that mutated compact() left this path green
+  // while it still carried its own copy. The cost is one extra scan on the compacting
+  // path -- a read of at most a few megabytes, on an explicitly-invoked dump.
+  const NNCacheCountLogContents written = compact();
+  (void)written;
   return true;
 }
 
