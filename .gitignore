@@ -95,3 +95,9 @@ cpp/external/katagocoreml/proto/
 
 # Session-local harness logs; never part of the source tree.
 .claude/logs/
+
+# Scratch directories that the tests needing a real file on disk create beside themselves. They
+# remove themselves on a normal return or a throw, but a failed testAssert calls quick_exit and
+# runs no destructors, so a red test run does leave one behind.
+tmpnncachecountlog_*
+tmpanalysismodels_*

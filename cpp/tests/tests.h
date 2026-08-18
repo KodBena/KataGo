@@ -170,6 +170,26 @@ namespace Tests {
 namespace TestCommon {
   bool boardsSeemEqual(const Board& b1, const Board& b2);
 
+  // A uniquely-named directory under the working directory that removes itself when the test
+  // that made it returns or throws. For the tests that genuinely need a file on disk -- a count
+  // log, a model file the loader will open -- not for tests in general.
+  //
+  // One thing it does NOT survive, stated because the name suggests otherwise: a failed
+  // testAssert calls Global::fatalError, which calls quick_exit, which runs no destructors. A
+  // red leg therefore does leave its directory behind (witnessed), which is why the names are
+  // in .gitignore. The unique suffix is what keeps that from tripping up the next run.
+  class ScopedTempDir {
+   public:
+    explicit ScopedTempDir(const std::string& namePrefix);
+    ~ScopedTempDir();
+    ScopedTempDir(const ScopedTempDir&) = delete;
+    ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+    const std::string& path() const;
+
+   private:
+    std::string path_;
+  };
+
   constexpr int MIN_BENCHMARK_SGF_DATA_SIZE = 7;
   constexpr int MAX_BENCHMARK_SGF_DATA_SIZE = 19;
   constexpr int DEFAULT_BENCHMARK_SGF_DATA_SIZE = std::min(Board::DEFAULT_LEN,MAX_BENCHMARK_SGF_DATA_SIZE);
