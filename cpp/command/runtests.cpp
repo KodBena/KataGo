@@ -63,6 +63,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runNNCacheConfigTests();
   Tests::runNNCachePolicyTests();
   Tests::runNNCacheFrozenTests();
+  Tests::runNNCacheCountLogTests();
 
   // Pick an arbitrary file that the test uses
   if(FileUtils::exists("tests/data/configs/folded/test-parent.cfg"))
@@ -95,6 +96,18 @@ int MainCmds::runnncachefrozenbench(const vector<string>& args) {
   ScoreValue::initTables();
   Tests::runNNCacheFrozenBench();
   ScoreValue::freeTables();
+  return 0;
+}
+
+// The count log's write-volume-per-dump measurement. Not part of runtests for the same
+// reason as the two above, and additionally because it writes real files: the directory is
+// named on the command line rather than defaulted, so a measurement never scatters logs
+// into whatever the working directory happened to be.
+int MainCmds::runnncachecountlogbench(const vector<string>& args) {
+  // args[0] is the subcommand name itself, per handleSubcommand's own slicing in main.cpp.
+  if(args.size() != 2)
+    throw StringError("runnncachecountlogbench: expected exactly one argument, the directory to write under.");
+  Tests::runNNCacheCountLogBench(args[1]);
   return 0;
 }
 

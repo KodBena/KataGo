@@ -149,6 +149,13 @@ namespace Tests {
 
   //testnncachefrozen.cpp
   void runNNCacheFrozenTests();
+
+  //testnncachecountlog.cpp
+  void runNNCacheCountLogTests();
+  // Not part of runtests: it is a measurement, not an assertion, and it writes real files.
+  // Reached by the runnncachecountlogbench subcommand, which names the directory.
+  void runNNCacheCountLogBench(const std::string& directory);
+
   // Not part of runtests: it is a measurement, not an assertion. Reached by the
   // runnncachefrozenbench subcommand.
   void runNNCacheFrozenBench();
