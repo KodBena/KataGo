@@ -28,8 +28,9 @@ struct AnalyzeRequest {
   //field against the loaded name space. The request carries the resolved index and never the
   //requested name: resolution happens once, at the boundary that can refuse it, so no later
   //stage can resolve it differently or fail to resolve it at all.
-  //A request that named no model carries AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX.
-  size_t modelIdx;
+  //A request that named no model carries AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX, which is
+  //also what a freshly-built request carries before its "model" field has been read.
+  SearchableModelIdx modelIdx = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
 
   Board board;
   BoardHistory hist;
@@ -62,6 +63,30 @@ struct AnalyzeRequest {
   static constexpr int STATUS_POPPED = -2;
   static constexpr int STATUS_TERMINATED = -3;
   std::atomic<int> status;
+};
+
+//The bots one analysis thread owns, one per hosted searchable model.
+//
+//This is a type rather than a plain vector<AsyncBot*> for one reason. The engine stores bots on
+//two axes -- analysis thread, then model -- and as two bare size_t subscripts both
+//bots[threadIdx][modelIdx] and bots[modelIdx][threadIdx] compile; whenever the two counts happen
+//to be equal, which two analysis threads hosting two models makes an ordinary shape, the
+//transposed one is in bounds too and quietly serves requests from the wrong model's bot. This
+//type is subscriptable only by a SearchableModelIdx, so the transposition is a compile error.
+class BotsByModel {
+ public:
+  void add(AsyncBot* bot) { bots.push_back(bot); }
+  [[nodiscard]] AsyncBot* at(SearchableModelIdx idx) const {
+    //The second and last place a SearchableModelIdx is unwrapped: this is the storage it indexes.
+    testAssert(idx.value() < bots.size());
+    return bots[idx.value()];
+  }
+  //For the operations that are per-bot rather than per-model -- stopping, killing, deleting them
+  //all -- where no index is involved and so none can be confused.
+  [[nodiscard]] const std::vector<AsyncBot*>& all() const { return bots; }
+
+ private:
+  std::vector<AsyncBot*> bots;
 };
 
 
@@ -229,7 +254,7 @@ int MainCmds::analysis(const vector<string>& args) {
   }();
 
 #ifndef USE_EIGEN_BACKEND
-  for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++) {
+  for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {
     NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
     int nnMaxBatchSizeTotal = eval->getNumGpus() * eval->getMaxBatchSize();
     int numThreadsTotal = defaultParams.numThreads * numAnalysisThreads;
@@ -250,7 +275,7 @@ int MainCmds::analysis(const vector<string>& args) {
   cfg.warnUnusedKeys(cerr,&logger);
   //Per hosted model: the default params may be honorable by one net and not another, and a warning
   //that only ever consulted the primary would be silent about exactly the model a request names.
-  for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++)
+  for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs())
     Setup::maybeWarnHumanSLParams(defaultParams,modelHosts.searchableEval(modelIdx),humanEval,cerr,&logger);
 
   logger.write("Loaded config "+ cfg.getFileName());
@@ -399,7 +424,7 @@ int MainCmds::analysis(const vector<string>& args) {
   //the idle bots, not the concurrent searches: the thread budget is unchanged.
   auto analysisLoop = [
     &logger,&toAnalyzeQueue,&reportAnalysis,&reportNoAnalysis,&logSearchInfo,&modelHosts,&openRequestsMutex,&openRequests
-  ](vector<AsyncBot*>* botsByModel, int threadIdx) {
+  ](BotsByModel* botsByModel, int threadIdx) {
     while(true) {
       std::pair<std::pair<int64_t,int64_t>,AnalyzeRequest*> analysisItem;
       bool suc = toAnalyzeQueue.waitPop(analysisItem);
@@ -407,8 +432,7 @@ int MainCmds::analysis(const vector<string>& args) {
         break;
       AnalyzeRequest* request = analysisItem.second;
       //The model was resolved when the request was parsed; this is where that resolution is spent.
-      testAssert(request->modelIdx < botsByModel->size());
-      AsyncBot* bot = (*botsByModel)[request->modelIdx];
+      AsyncBot* bot = botsByModel->at(request->modelIdx);
       int expected = AnalyzeRequest::STATUS_IN_QUEUE;
       //If it's already terminated, then there's nothing for us to do
       if(!request->status.compare_exchange_strong(expected, AnalyzeRequest::STATUS_POPPED, std::memory_order_acq_rel)) {
@@ -484,22 +508,22 @@ int MainCmds::analysis(const vector<string>& args) {
       delete request;
     }
   };
-  auto analysisLoopProtected = [&logger,&analysisLoop](vector<AsyncBot*>* botsByModel, int threadIdx) {
+  auto analysisLoopProtected = [&logger,&analysisLoop](BotsByModel* botsByModel, int threadIdx) {
     Logger::logThreadUncaught("analysis loop", &logger, [&](){ analysisLoop(botsByModel, threadIdx); });
   };
 
   vector<std::thread> threads;
   std::thread write_thread = std::thread(writeLoop);
-  //bots[threadIdx][modelIdx]. Reserved up front so that the pointers handed to the threads below
-  //stay valid as later threads' pools are appended.
-  vector<vector<AsyncBot*>> bots(numAnalysisThreads);
+  //One pool per analysis thread, each holding one bot per model. Sized up front so that the
+  //pointers handed to the threads below stay valid as later threads' pools are filled.
+  vector<BotsByModel> bots(numAnalysisThreads);
   for(int threadIdx = 0; threadIdx<numAnalysisThreads; threadIdx++) {
-    for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++) {
+    for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {
       string searchRandSeed = Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
       AsyncBot* bot = new AsyncBot(defaultParams, modelHosts.searchableEval(modelIdx), humanEval, &logger, searchRandSeed);
       bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
       bot->setExternalEvalCache(evalCache);
-      bots[threadIdx].push_back(bot);
+      bots[threadIdx].add(bot);
     }
     threads.emplace_back(analysisLoopProtected,&bots[threadIdx],threadIdx);
   }
@@ -531,7 +555,7 @@ int MainCmds::analysis(const vector<string>& args) {
       int threadIdx = prevStatus;
       //Terminate it by thread index, and within that thread by the model the request resolved to:
       //that is the one bot of that thread's pool the request can be running on.
-      bots[threadIdx][request->modelIdx]->stopWithoutWait();
+      bots[threadIdx].at(request->modelIdx)->stopWithoutWait();
     }
   };
 
@@ -589,7 +613,7 @@ int MainCmds::analysis(const vector<string>& args) {
           //has always been, and the "internalName" a client reads here is exactly the name the
           //"model" field of a request takes.
           input["models"] = json::array();
-          for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++) {
+          for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {
             NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
             json modelInfo;
             modelInfo["name"] = eval->getModelName();
@@ -617,7 +641,7 @@ int MainCmds::analysis(const vector<string>& args) {
           //Every hosted model's cache: the action has always meant "drop everything cached", and a
           //model whose cache it silently skipped would keep serving entries the client asked to be
           //rid of. With one model this is the one clearCache it has always been.
-          for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++)
+          for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs())
             modelHosts.searchableEval(modelIdx)->clearCache();
           if(humanEval != NULL)
             humanEval->clearCache();
@@ -1379,10 +1403,10 @@ int MainCmds::analysis(const vector<string>& args) {
     toAnalyzeQueue.setReadOnly();
     //Interrupt any searches going on to help the analysis threads realize to terminate faster.
     for(size_t i = 0; i<bots.size(); i++)
-      for(AsyncBot* bot: bots[i])
+      for(AsyncBot* bot: bots[i].all())
         bot->stopWithoutWait();
     for(size_t i = 0; i<bots.size(); i++)
-      for(AsyncBot* bot: bots[i])
+      for(AsyncBot* bot: bots[i].all())
         bot->setKilled();
     for(int i = 0; i<threads.size(); i++)
       threads[i].join();
@@ -1400,11 +1424,11 @@ int MainCmds::analysis(const vector<string>& args) {
   }
 
   for(size_t i = 0; i<bots.size(); i++)
-    for(AsyncBot* bot: bots[i])
+    for(AsyncBot* bot: bots[i].all())
       delete bot;
 
   //Per hosted model, so a session that ran two nets can be read for how much work each one did.
-  for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++) {
+  for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {
     NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
     logger.write(eval->getModelFileName());
     logger.write("NN rows: " + Global::int64ToString(eval->numRowsProcessed()));
@@ -1418,7 +1442,7 @@ int MainCmds::analysis(const vector<string>& args) {
     logger.write("NN avg batch size: " + Global::doubleToString(humanEval->averageProcessedBatchSize()));
   }
   //main owns the evaluators; modelHosts only refers to them.
-  for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++)
+  for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs())
     delete modelHosts.searchableEval(modelIdx);
   delete humanEval;
   NeuralNet::globalCleanup();

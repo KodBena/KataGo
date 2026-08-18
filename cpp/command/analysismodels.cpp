@@ -9,11 +9,11 @@ using namespace std;
 // ModelResolution
 //-------------------------------------------------------------------------------------
 
-ModelResolution::ModelResolution(std::optional<size_t> idx_, std::optional<std::string> refusalMessage_)
+ModelResolution::ModelResolution(std::optional<SearchableModelIdx> idx_, std::optional<std::string> refusalMessage_)
   : idx(idx_), refusalMessage(std::move(refusalMessage_))
 {}
 
-ModelResolution ModelResolution::resolved(size_t searchableIdx_) {
+ModelResolution ModelResolution::resolved(SearchableModelIdx searchableIdx_) {
   return ModelResolution(searchableIdx_, std::nullopt);
 }
 
@@ -41,7 +41,7 @@ ModelResolution ModelResolution::unknownRefusal(const string& requestedName, con
   );
 }
 
-std::optional<size_t> ModelResolution::searchableIdx() const {
+std::optional<SearchableModelIdx> ModelResolution::searchableIdx() const {
   return idx;
 }
 
@@ -92,7 +92,7 @@ ModelResolution resolveModelName(const vector<ModelAddress>& addresses, const st
       continue;
     if(addresses[i].role == ModelRole::HumanCompanion)
       return ModelResolution::companionRefusal(requestedName);
-    return ModelResolution::resolved(i);
+    return ModelResolution::resolved(SearchableModelIdx(i));
   }
   return ModelResolution::unknownRefusal(requestedName, addresses);
 }
@@ -137,9 +137,17 @@ size_t AnalysisModelHosts::numSearchable() const {
   return numSearchableModels;
 }
 
-NNEvaluator* AnalysisModelHosts::searchableEval(size_t idx) const {
-  testAssert(idx < numSearchableModels);
-  return evals[idx];
+NNEvaluator* AnalysisModelHosts::searchableEval(SearchableModelIdx idx) const {
+  //One of the two places a SearchableModelIdx is unwrapped: this is the storage it indexes.
+  testAssert(idx.value() < numSearchableModels);
+  return evals[idx.value()];
+}
+
+vector<SearchableModelIdx> AnalysisModelHosts::searchableIdxs() const {
+  vector<SearchableModelIdx> idxs;
+  for(size_t i = 0; i < numSearchableModels; i++)
+    idxs.push_back(SearchableModelIdx(i));
+  return idxs;
 }
 
 ModelResolution AnalysisModelHosts::resolve(const string& requestedName) const {

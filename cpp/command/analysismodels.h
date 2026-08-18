@@ -40,6 +40,32 @@
 // uniqueness check, since a companion sharing a searchable model's name is the same
 // ambiguity as any other collision.
 
+// Which searchable model, as a value that can only mean that.
+//
+// Not a bare size_t, and the reason is specific rather than decorative. The analysis engine
+// stores its bots on two axes -- the analysis thread, then the model -- and both are counts, so
+// as bare size_ts they are distinguished only by the order they are written in. A transposed
+// pair compiles; worse, when the two counts happen to be equal, which two analysis threads
+// hosting two models makes an ordinary deployment shape, the transposed subscript is also in
+// bounds, so every request is served by some bot and some of them by the wrong model's, with no
+// assertion left to notice. Giving the model axis its own type makes that transposition a
+// compile error instead of a silent mis-service -- the shape ADR-0000 asks for in place of a
+// runtime guard against a class the types could have forbidden.
+//
+// value() exists because an index is finally for subscripting, but it is called in exactly two
+// places -- the accessors of the two containers that hold one entry per searchable model -- and
+// nowhere else, which is what keeps the type from being a bare size_t wearing a hat.
+class SearchableModelIdx {
+ public:
+  explicit constexpr SearchableModelIdx(size_t value) : v(value) {}
+  [[nodiscard]] constexpr size_t value() const { return v; }
+  [[nodiscard]] constexpr bool operator==(const SearchableModelIdx& other) const { return v == other.v; }
+  [[nodiscard]] constexpr bool operator!=(const SearchableModelIdx& other) const { return v != other.v; }
+
+ private:
+  size_t v;
+};
+
 // What a model may be asked to do. The companion model is named but not searchable; the
 // distinction is a property of the model, not of the request, so it lives here.
 enum class ModelRole {
@@ -67,20 +93,20 @@ struct ModelAddress {
 class ModelResolution {
  public:
   // Selects the searchable model at this index.
-  static ModelResolution resolved(size_t searchableIdx);
+  static ModelResolution resolved(SearchableModelIdx searchableIdx);
   // The name is loaded, but names the companion model, which is not independently searchable.
   static ModelResolution companionRefusal(const std::string& requestedName);
   // The name is not loaded at all. The message lists what is.
   static ModelResolution unknownRefusal(const std::string& requestedName, const std::vector<ModelAddress>& addresses);
 
   // Present exactly when the name selected a searchable model.
-  [[nodiscard]] std::optional<size_t> searchableIdx() const;
+  [[nodiscard]] std::optional<SearchableModelIdx> searchableIdx() const;
   // Present exactly when it did not, and then it says why, for the client to read.
   [[nodiscard]] std::optional<std::string> refusal() const;
 
  private:
-  ModelResolution(std::optional<size_t> idx, std::optional<std::string> refusalMessage);
-  std::optional<size_t> idx;
+  ModelResolution(std::optional<SearchableModelIdx> idx, std::optional<std::string> refusalMessage);
+  std::optional<SearchableModelIdx> idx;
   std::optional<std::string> refusalMessage;
 };
 
@@ -115,7 +141,7 @@ class AnalysisModelHosts {
   // The model a request that names none is served by: the -model the engine was started
   // with, whose behaviour this class leaves exactly as it was before more than one model
   // could be hosted.
-  static constexpr size_t PRIMARY_SEARCHABLE_IDX = 0;
+  static constexpr SearchableModelIdx PRIMARY_SEARCHABLE_IDX{0};
 
   // Refuses with a StringError naming the collision if two of these models share an
   // internal name. `searchable` must be non-empty and its first element is the primary.
@@ -124,8 +150,12 @@ class AnalysisModelHosts {
   static AnalysisModelHosts create(std::vector<HostedModel> searchable, std::optional<HostedModel> companion);
 
   [[nodiscard]] size_t numSearchable() const;
-  // idx must be < numSearchable().
-  [[nodiscard]] NNEvaluator* searchableEval(size_t idx) const;
+  // idx must be one of searchableIdxs().
+  [[nodiscard]] NNEvaluator* searchableEval(SearchableModelIdx idx) const;
+  // Every searchable model's index, primary first. The way to walk the hosted models, so that
+  // ordinary engine code never mints a SearchableModelIdx from a loop counter that could as
+  // easily have been the thread counter.
+  [[nodiscard]] std::vector<SearchableModelIdx> searchableIdxs() const;
   [[nodiscard]] ModelResolution resolve(const std::string& requestedName) const;
 
  private:
