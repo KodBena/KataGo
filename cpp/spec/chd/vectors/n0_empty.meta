@@ -1,0 +1,7 @@
+name	n0_empty
+outcome	BUILD_OK
+n_keys	0
+n_queries	8
+n_expect_member	0
+n_expect_absent	8
+note	empty key set; every lookup must report absent

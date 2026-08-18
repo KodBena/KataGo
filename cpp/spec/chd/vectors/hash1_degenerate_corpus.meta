@@ -1,0 +1,5 @@
+name	hash1_degenerate_corpus
+outcome	BUILD_FAIL
+n_keys	64
+n_queries	0
+note	64 DISTINCT keys all sharing one hash1 value; bucket-mates are unavoidable and construction must be refused

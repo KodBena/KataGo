@@ -115,6 +115,12 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::runnncachebench(subArgs);
   else if(subcommand == "benchnncachepolicy")
     return MainCmds::benchnncachepolicy(subArgs);
+  // The cpp/spec/chd conformance driver. Deliberately absent from printHelp: it is an
+  // instrument check_vectors.py drives, not an operator verb.
+  else if(subcommand == "chdvectordriver")
+    return MainCmds::chdvectordriver(subArgs);
+  else if(subcommand == "runnncachefrozenbench")
+    return MainCmds::runnncachefrozenbench(subArgs);
   else if(subcommand == "runnnlayertests")
     return MainCmds::runnnlayertests(subArgs);
   else if(subcommand == "runnnontinyboardtest")

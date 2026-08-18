@@ -979,6 +979,8 @@ add_executable(katago
   neuralnet/nncachechained.cpp
   neuralnet/nncacheadmission.cpp
   neuralnet/nncachesighting.cpp
+  neuralnet/nncachefrozen.cpp
+  neuralnet/nncachetwolevel.cpp
   neuralnet/nncachetrace.cpp
   neuralnet/desc.cpp
   neuralnet/debugprint.cpp
@@ -1022,6 +1024,8 @@ add_executable(katago
   tests/testmisc.cpp
   tests/testnncache.cpp
   tests/testnncachepolicy.cpp
+  tests/testnncachefrozen.cpp
+  tests/testnncachefrozenbench.cpp
   tests/testnncachebench.cpp
   tests/testnnevalcanary.cpp
   tests/testbackendreference.cpp
@@ -1052,6 +1056,7 @@ add_executable(katago
   command/analysis.cpp
   command/benchmark.cpp
   command/benchnncachepolicy.cpp
+  command/chdvectordriver.cpp
   command/contribute.cpp
   command/dumponnx.cpp
   command/evalsgf.cpp

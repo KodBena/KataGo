@@ -1,0 +1,7 @@
+name	real_card5074
+outcome	BUILD_OK
+n_keys	1203
+n_queries	3609
+n_expect_member	1203
+n_expect_absent	2406
+note	real nnHash corpus from the operator's database, in the order the prototype's SQL selection delivers it (num_refs descending)

@@ -1,0 +1,7 @@
+name	extremal_keys
+outcome	BUILD_OK
+n_keys	8
+n_queries	264
+n_expect_member	8
+n_expect_absent	256
+note	all-zero, all-ones and sign-bit-boundary key values, with hash1 values kept pairwise distinct so the per-bucket precondition holds

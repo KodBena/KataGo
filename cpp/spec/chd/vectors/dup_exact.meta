@@ -1,0 +1,5 @@
+name	dup_exact
+outcome	BUILD_FAIL
+n_keys	101
+n_queries	0
+note	the key at input position 7 appears a second time at the end; construction must be refused

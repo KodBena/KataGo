@@ -1,0 +1,7 @@
+name	shared_hash0_one_bucket
+outcome	BUILD_OK
+n_keys	12
+n_queries	268
+n_expect_member	12
+n_expect_absent	256
+note	12 distinct keys sharing one hash0, so all land in the same bucket

@@ -612,6 +612,53 @@ NNCacheStats NNCacheTableDirect::stats() const {
 NNCacheTable::NNCacheTable() {}
 NNCacheTable::~NNCacheTable() {}
 
+//-------------------------------------------------------------------------------------
+// The unified hit-count surface
+//-------------------------------------------------------------------------------------
+
+NNCacheHitLedger::NNCacheHitLedger(
+  NNCacheHitLedgerDisposition disposition, vector<NNCacheHitCount> entries, int64_t unrecordedHits
+)
+  :disposition_(disposition), entries_(std::move(entries)), unrecordedHits_(unrecordedHits)
+{}
+
+NNCacheHitLedger NNCacheHitLedger::notCounted() {
+  return NNCacheHitLedger(NNCacheHitLedgerDisposition::NotCounted, vector<NNCacheHitCount>(), 0);
+}
+
+NNCacheHitLedger NNCacheHitLedger::counted(vector<NNCacheHitCount> entries, int64_t unrecordedHits) {
+  return NNCacheHitLedger(NNCacheHitLedgerDisposition::Counted, std::move(entries), unrecordedHits);
+}
+
+// Refuses rather than handing back an empty vector, which a caller could read as "this
+// session hit nothing" when the truth is "this table never counted" (ADR-0012 P11).
+const vector<NNCacheHitCount>& NNCacheHitLedger::entries() const {
+  if(disposition_ != NNCacheHitLedgerDisposition::Counted)
+    throw StringError(
+      "NNCacheHitLedger: this table keeps no per-key hit counts, so it has no rows to hand "
+      "out. Check disposition() before asking; an empty row list would be indistinguishable "
+      "from a session in which nothing was hit."
+    );
+  return entries_;
+}
+
+int64_t NNCacheHitLedger::unrecordedHits() const {
+  if(disposition_ != NNCacheHitLedgerDisposition::Counted)
+    throw StringError(
+      "NNCacheHitLedger: this table keeps no per-key hit counts, so it has no unrecorded "
+      "count to report either."
+    );
+  return unrecordedHits_;
+}
+
+// Every single-level table's answer, inherited rather than implemented four times: hit
+// counting is a property of the TWO-LEVEL strategy, which exists exactly when a frozen
+// level 0 does. So the default configuration -- no level 0, one ordinary table -- gains no
+// field, no branch and no allocation from this surface existing.
+NNCacheHitLedger NNCacheTable::harvestHitCounts() const {
+  return NNCacheHitLedger::notCounted();
+}
+
 // Builds the collision-resolution layer the shape asks for, then wraps it in the
 // admission layer if one is asked for. Admission is orthogonal to collision
 // resolution, so it composes over all four shapes rather than being repeated in each.

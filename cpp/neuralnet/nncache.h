@@ -6,6 +6,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "../core/global.h"
 #include "../core/hash.h"
@@ -285,6 +286,62 @@ struct NNCacheStats {
   int64_t capacitySlots;
 };
 
+// One row of the unified hit-count surface: a key, and how many times an evaluation was
+// retrieved for it this session -- whichever level served the retrieval.
+struct NNCacheHitCount {
+  Hash128 key;
+  uint32_t hits;
+};
+
+// Whether a table counts hits at all.
+//
+// This is a typed disposition rather than an empty row vector standing in for two quite
+// different facts (ADR-0012 P11): "this table counts and nothing was hit" and "this table
+// does not count" are not the same answer, and a caller that read an empty vector as the
+// first when it was the second would silently persist nothing.
+enum class NNCacheHitLedgerDisposition {
+  // This table keeps no per-key hit counts. Every single-level table is here: counting is
+  // a property of the two-level strategy, which exists exactly when a level 0 does, so the
+  // default configuration pays nothing for a surface it does not use.
+  NotCounted,
+  // The rows are this session's counts, one row per key, from every level.
+  Counted,
+};
+
+// The unified per-key hit-count surface. See NNCacheTable::harvestHitCounts.
+//
+// ONE ROW PER KEY, ALWAYS, because at most one level ever owns a key. Level 0 is frozen,
+// so a key it holds is answered there and no evaluation follows; the two engine paths that
+// can still offer a set for a level-0 key (a caller passing skipCache, and the
+// ownership-map fall-through in NNEvaluator::evaluate) transfer that key's ownership --
+// and its accrued count -- to level 1 rather than duplicating it. So a persistence layer
+// reading this surface never merges, never double-counts, and never has to ask which
+// structure answered.
+class NNCacheHitLedger {
+ public:
+  static NNCacheHitLedger notCounted();
+  static NNCacheHitLedger counted(std::vector<NNCacheHitCount> entries, int64_t unrecordedHits);
+
+  NNCacheHitLedgerDisposition disposition() const { return disposition_; }
+  bool isCounted() const { return disposition_ == NNCacheHitLedgerDisposition::Counted; }
+
+  // The rows. Throws under NotCounted rather than handing back an empty vector a caller
+  // could read as "nothing was hit".
+  const std::vector<NNCacheHitCount>& entries() const;
+
+  // Hits that occurred and could NOT be attributed to a row, because the level-1 ledger
+  // had no room for the key. Zero in every ordinary run; nonzero means this harvest is
+  // incomplete and says by how much, rather than being silently short (ADR-0002).
+  int64_t unrecordedHits() const;
+
+ private:
+  NNCacheHitLedger(NNCacheHitLedgerDisposition disposition, std::vector<NNCacheHitCount> entries, int64_t unrecordedHits);
+
+  NNCacheHitLedgerDisposition disposition_;
+  std::vector<NNCacheHitCount> entries_;
+  int64_t unrecordedHits_;
+};
+
 // A concurrent, hash-sharded table mapping an NN input hash to its NNOutput.
 //
 // The same position must land on the same slot whichever thread asks, so the
@@ -303,6 +360,14 @@ class NNCacheTable {
 
   // Thread-safe, and O(table). See NNCacheStats: a reporting call, not a hot-path one.
   virtual NNCacheStats stats() const = 0;
+
+  // The unified per-key hit counts of this session, for whoever persists them. Thread-safe
+  // and O(table); a reporting call taken between sessions, never inside a search.
+  //
+  // A single-level table returns NotCounted, which is the default configuration's answer
+  // and is why the default get/set path is untouched by this surface existing. The
+  // two-level table returns Counted with one row per key.
+  virtual NNCacheHitLedger harvestHitCounts() const;
 
   // Builds the table a config asks for. Throws, naming what is missing, for a
   // shape that is coherent but not implemented yet -- never silently substituting

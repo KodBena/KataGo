@@ -146,6 +146,12 @@ namespace Tests {
   //testnncache.cpp
   void runNNCacheConfigTests();
   void runNNCachePolicyTests();
+
+  //testnncachefrozen.cpp
+  void runNNCacheFrozenTests();
+  // Not part of runtests: it is a measurement, not an assertion. Reached by the
+  // runnncachefrozenbench subcommand.
+  void runNNCacheFrozenBench();
   // Not part of runtests: it is a measurement, not an assertion. Reached by the
   // runnncachebench subcommand.
   void runNNCacheBench();

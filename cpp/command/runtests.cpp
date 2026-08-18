@@ -62,6 +62,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runInlineConfigTests();
   Tests::runNNCacheConfigTests();
   Tests::runNNCachePolicyTests();
+  Tests::runNNCacheFrozenTests();
 
   // Pick an arbitrary file that the test uses
   if(FileUtils::exists("tests/data/configs/folded/test-parent.cfg"))
@@ -82,6 +83,17 @@ int MainCmds::runnncachebench(const vector<string>& args) {
   Board::initHash();
   ScoreValue::initTables();
   Tests::runNNCacheBench();
+  ScoreValue::freeTables();
+  return 0;
+}
+
+// The SPEC.md 8 performance floor for the frozen level-0 cache. A measurement, so it is
+// not part of runtests, for the same reason runnncachebench is not.
+int MainCmds::runnncachefrozenbench(const vector<string>& args) {
+  (void)args;
+  Board::initHash();
+  ScoreValue::initTables();
+  Tests::runNNCacheFrozenBench();
   ScoreValue::freeTables();
   return 0;
 }

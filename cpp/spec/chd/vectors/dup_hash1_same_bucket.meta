@@ -1,0 +1,5 @@
+name	dup_hash1_same_bucket
+outcome	BUILD_FAIL
+n_keys	2
+n_queries	0
+note	two DISTINCT keys sharing a hash1 value and landing in the same bucket; construction must be refused
