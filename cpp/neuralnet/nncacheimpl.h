@@ -33,6 +33,26 @@ std::unique_ptr<NNCacheTable> makeSecondSightingNNCacheTable(
   int sizePowerOfTwo
 );
 
+// A 1-way direct-mapped table whose collisions are resolved by config.shape.replacement()
+// rather than by unconditionally taking the newcomer. Reached ONLY when that rule is not
+// Always -- the shipped NNCacheTableDirect is untouched and still serves the default -- so
+// nothing on the default get/set path pays for this axis existing.
+//
+// Throws if the shape is not direct-mapped, or if it is direct-mapped with the Always
+// rule, which is NNCacheTableDirect's job and not this one's.
+std::unique_ptr<NNCacheTable> makeSightingDirectNNCacheTable(const NNCacheConfig& config);
+
+// The exact resident cost of the sighting-count ghost table the two count-comparing
+// replacement rules allocate. Named here so the bound is stated in one place and can be
+// asserted rather than estimated (ADR-0012 P1).
+//
+// It is numerically the same 4 bytes per slot as secondSightingGhostBytes below, and it is
+// deliberately a SEPARATE function rather than a call to that one: the two ghosts hold
+// different facts (a one-bit "has been stored before" against an eight-bit presentation
+// count) and a table that selects both policies allocates both. Sharing the arithmetic
+// would make a future change to either silently change the other.
+size_t sightingCountGhostBytes(int sizePowerOfTwo);
+
 // The per-region share of a chained table's byte budget, and what one entry costs it.
 // Both re-export the chained table's own arithmetic so a caller or a test asserts
 // against the implementation rather than against a second copy of it (ADR-0012 P1).

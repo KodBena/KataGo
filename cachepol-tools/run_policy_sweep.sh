@@ -39,17 +39,30 @@ CONFIG=""
 OUTDIR=""
 STAGES="capture,replay,visits"
 TRACE=""
-VISITS_FOR_CAPTURE=20000
-TABLE_POWS="17,18,19,20,21"
+# MANY QUERIES x MODEST VISITS. These defaults are the inversion of the ones that produced
+# a trace with 136 hits in 1.96M lookups: 4 games x ~200 turns = ~800 review queries at 500
+# visits each, about 400k visits in the whole capture against the old 24 x 100000 = 2.4M.
+# Fewer visits AND a usable workload; the visits were never what the cache needed.
+VISITS_FOR_CAPTURE=500
+CAPTURE_GAMES=4
+CAPTURE_TURNS=200
+GEN_VISITS=8
+# Swept DOWNWARD by default now. A replacement or eviction policy can only act where the
+# table cannot hold the working set; a capture of this size saturates around 2^17, so the
+# sizes where the policies separate are below it. 2^21 is kept so the operator's own
+# setting is on the curve -- as the right-hand end of it, not as the whole of it.
+TABLE_POWS="13,14,15,16,17,19,21"
 WAYS="2,4,8,16"
 COLLISIONS="direct,linearprobe,quadraticprobe,chain"
 EVICTIONS="random,lru,lfu"
 ADMISSIONS="always,secondsighting"
+REPLACEMENTS="always,keeplessseen,keepmoreseen,keepsighted"
+MIN_REUSE_RATE="0.05"
 OWNERSHIP="both"
 MAX_BYTES=""
 BENCH_VISITS=2000
 BENCH_THREADS=16
-BENCH_CONFIGS="direct|linearprobe:8:lru|linearprobe:8:lru+secondsighting|chain:lru"
+BENCH_CONFIGS="direct|direct:keepmoreseen|direct:keepsighted|linearprobe:8:lru|linearprobe:8:lru+secondsighting|chain:lru"
 CAPTURE_OWNERSHIP=1
 
 usage() {
@@ -69,20 +82,32 @@ REQUIRED
 STAGES
   -s LIST   comma-separated from capture,replay,visits (default all three)
   -t PATH   trace file. Written by capture; read by replay. Defaults to OUTDIR/trace.bin.
-  -V N      visits per query during capture (default 20000). BIGGER IS THE POINT: the
-            trace must contain enough DISTINCT positions to fill the tables you sweep,
-            or every policy will look identical because none of them had anything to do.
-            See "How big a trace do I need" in the runbook.
+  -V N      visits per REVIEW query during capture (default 500). MODEST IS THE POINT.
+            Visits do not buy reuse: a KataGo SearchNode holds its own NNOutput, so a
+            position evaluated inside one search is never asked of the NN cache again,
+            however deep that search is. The cache earns its keep ACROSS searches. What
+            buys reuse is many queries over RELATED positions -- see -G and -N.
+  -G N      games generated for the capture (default 4). Different seeded openings.
+  -N N      moves per generated game (default 200). The review then issues one query per
+            turn of each game, so queries ~= games x turns.
+  -J N      visits per move while GENERATING the games (default 8). This is throwaway
+            search whose only job is to produce a plausible game; it is not captured.
   -O 0|1    capture with ownership requested (default 1). Ownership roughly doubles the
             per-entry footprint and is what a reviewing GUI asks for as a matter of
             course, so 1 is the realistic setting.
 
 REPLAY MATRIX (stage 2)
-  -p LIST   table powers            (default 17,18,19,20,21)
+  -p LIST   table powers            (default 13,14,15,16,17,19,21 -- swept DOWNWARD,
+            because a policy can only act where the table cannot hold the working set)
   -w LIST   ways                    (default 2,4,8,16)
   -C LIST   collision schemes       (default direct,linearprobe,quadraticprobe,chain)
   -e LIST   eviction policies       (default random,lru,lfu)
   -a LIST   admission policies      (default always,secondsighting)
+  -R LIST   replacement rules, DIRECT MAPPING ONLY: which of the two candidates a
+            collision keeps (default always,keeplessseen,keepmoreseen,keepsighted).
+            The two "seen" values name the SURVIVOR, not the victim.
+  -M F      minimum reuse rate the captured trace must clear, or stage 2 refuses before
+            allocating anything (default 0.05). See the runbook's precondition section.
   -W MODE   ownership: trace|off|on|both   (default both)
 
 VISITS SUBSET (stage 3)
@@ -90,15 +115,17 @@ VISITS SUBSET (stage 3)
   -T N      threads                  (default 16)
   -B LIST   pipe-separated configurations, each of
               direct
+              direct:<keeplessseen|keepmoreseen|keepsighted>
               <linearprobe|quadraticprobe>:<ways>:<random|lru|lfu>
               chain:<random|lru|lfu>
             with an optional "+secondsighting" suffix on any of them.
-            (default: direct|linearprobe:8:lru|linearprobe:8:lru+secondsighting|chain:lru)
+            (default: direct|direct:keepmoreseen|direct:keepsighted|
+                      linearprobe:8:lru|linearprobe:8:lru+secondsighting|chain:lru)
 USAGE
   exit 1
 }
 
-while getopts "k:m:c:o:b:s:t:V:O:p:w:C:e:a:W:v:T:B:h" opt; do
+while getopts "k:m:c:o:b:s:t:V:G:N:J:O:p:w:C:e:a:R:M:W:v:T:B:h" opt; do
   case "$opt" in
     k) KATAGO="$OPTARG" ;;
     m) MODEL="$OPTARG" ;;
@@ -108,12 +135,17 @@ while getopts "k:m:c:o:b:s:t:V:O:p:w:C:e:a:W:v:T:B:h" opt; do
     s) STAGES="$OPTARG" ;;
     t) TRACE="$OPTARG" ;;
     V) VISITS_FOR_CAPTURE="$OPTARG" ;;
+    G) CAPTURE_GAMES="$OPTARG" ;;
+    N) CAPTURE_TURNS="$OPTARG" ;;
+    J) GEN_VISITS="$OPTARG" ;;
     O) CAPTURE_OWNERSHIP="$OPTARG" ;;
     p) TABLE_POWS="$OPTARG" ;;
     w) WAYS="$OPTARG" ;;
     C) COLLISIONS="$OPTARG" ;;
     e) EVICTIONS="$OPTARG" ;;
     a) ADMISSIONS="$OPTARG" ;;
+    R) REPLACEMENTS="$OPTARG" ;;
+    M) MIN_REUSE_RATE="$OPTARG" ;;
     W) OWNERSHIP="$OPTARG" ;;
     v) BENCH_VISITS="$OPTARG" ;;
     T) BENCH_THREADS="$OPTARG" ;;
@@ -152,8 +184,11 @@ has_stage() { case ",$STAGES," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
   echo "model sha256    $( [ -f "$MODEL" ] && sha256sum "$MODEL" | cut -d' ' -f1 || echo NOT-A-FILE )"
   echo "config          $CONFIG"
   echo "args            stages=$STAGES pows=$TABLE_POWS ways=$WAYS collisions=$COLLISIONS"
-  echo "                evictions=$EVICTIONS admissions=$ADMISSIONS ownership=$OWNERSHIP"
-  echo "                capture_visits=$VISITS_FOR_CAPTURE capture_ownership=$CAPTURE_OWNERSHIP"
+  echo "                evictions=$EVICTIONS admissions=$ADMISSIONS replacements=$REPLACEMENTS"
+  echo "                ownership=$OWNERSHIP min_reuse_rate=$MIN_REUSE_RATE"
+  echo "                capture_games=$CAPTURE_GAMES capture_turns=$CAPTURE_TURNS"
+  echo "                capture_gen_visits=$GEN_VISITS capture_visits=$VISITS_FOR_CAPTURE"
+  echo "                capture_ownership=$CAPTURE_OWNERSHIP"
   echo "                bench_visits=$BENCH_VISITS bench_threads=$BENCH_THREADS"
   echo "max_bytes       $MAX_BYTES"
   if [ -n "$(command -v nvidia-smi)" ]; then
@@ -180,35 +215,22 @@ if has_stage capture; then
 
   QUERIES="$OUTDIR/capture-queries.jsonl"
   if [ ! -f "$QUERIES" ]; then
-    echo "run_policy_sweep.sh: writing capture queries to $QUERIES"
-    python3 - "$QUERIES" "$VISITS_FOR_CAPTURE" "$CAPTURE_OWNERSHIP" <<'PYEOF'
-import json, sys, random
-path, visits, own = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
-# One query per game, each a different random opening, so the positions the search
-# explores do not overlap between queries any more than real review traffic would. The
-# point of many distinct games is DISTINCT POSITIONS: a trace that revisits one game
-# cannot fill a table, and a table that is never full cannot distinguish two eviction
-# policies from each other.
-random.seed(20260817)
-cols = "ABCDEFGHJKLMNOPQRST"
-with open(path, "w") as f:
-    for g in range(24):
-        moves, seen = [], set()
-        pl = "B"
-        for m in range(30):
-            while True:
-                x, y = random.randrange(19), random.randrange(19)
-                if (x, y) not in seen:
-                    seen.add((x, y)); break
-            moves.append([pl, "%s%d" % (cols[x], y + 1)])
-            pl = "W" if pl == "B" else "B"
-        q = {"id": "cap%d" % g, "moves": moves, "rules": "tromp-taylor",
-             "komi": 7.5, "boardXSize": 19, "boardYSize": 19,
-             "maxVisits": visits, "analyzeTurns": [len(moves)]}
-        if own:
-            q["includeOwnership"] = True
-        f.write(json.dumps(q) + "\n")
-PYEOF
+    echo "run_policy_sweep.sh: generating games and writing per-turn review queries to $QUERIES"
+    # The queries are REAL GAMES WALKED TURN BY TURN, not scattered positions. The previous
+    # generator wrote 24 unrelated random-move positions and searched each at 100000 visits,
+    # and the resulting trace had 136 hits in 1,957,525 lookups -- an entire GPU sweep that
+    # could not answer anything. See make_capture_queries.py's own header for the two
+    # mechanisms and the witnessed contrast. The knobs are inverted accordingly: many
+    # queries at modest visits, not a few at enormous ones.
+    python3 "$SCRIPT_DIR/make_capture_queries.py" \
+      --katago "$KATAGO" --model "$MODEL" --config "$CONFIG" \
+      --out "$QUERIES" --log "$OUTDIR/capture-gamegen.log" \
+      --games "$CAPTURE_GAMES" --turns "$CAPTURE_TURNS" \
+      --gen-visits "$GEN_VISITS" --visits "$VISITS_FOR_CAPTURE" \
+      --ownership "$CAPTURE_OWNERSHIP" || {
+        echo "run_policy_sweep.sh: game generation failed; see $OUTDIR/capture-gamegen.log"
+        exit 1
+      }
   fi
 
   echo "run_policy_sweep.sh: STAGE 1 capture -> $TRACE"
@@ -231,6 +253,28 @@ PYEOF
   fi
   [ "$RC" = "0" ] || { echo "run_policy_sweep.sh: capture failed; see $OUTDIR/capture-engine.log"; exit "$RC"; }
   ls -l "$TRACE"
+
+  # THE PRECONDITION, applied where the capture was produced rather than an hour later.
+  # It reads the trace and refuses if its REUSE RATE -- the fraction of lookups for a key
+  # this stream had stored earlier, which is the hit rate a perfect unbounded cache would
+  # deliver and therefore a ceiling on how far any two policies can differ -- is below
+  # -M. The check that used to guard this stage asked about trace SIZE, and a 1252-second
+  # GPU sweep passed it and answered nothing.
+  echo "run_policy_sweep.sh: PRECHECK on $TRACE"
+  # -table-pows is passed even though nothing is swept here, so the load-factor warning
+  # is about the sweep that is actually going to run rather than about the flag's default.
+  "$KATAGO" benchnncachepolicy -trace "$TRACE" -precheck \
+    -min-reuse-rate "$MIN_REUSE_RATE" -table-pows "$TABLE_POWS" \
+    2>&1 | tee "$OUTDIR/capture-precheck.txt"
+  RC=${PIPESTATUS[0]}
+  if [ "$RC" != "0" ]; then
+    echo "run_policy_sweep.sh: THE CAPTURE CANNOT ANSWER THE POLICY QUESTION. Refused above,"
+    echo "  before any sweep time was spent. The trace is still at $TRACE if you want to keep it."
+    echo "  Fix the CAPTURE, not the threshold: raise -G (more games) or -N (longer games), which"
+    echo "  is what produces reuse. Raising -V (visits) does NOT: a search never re-asks the cache"
+    echo "  for a position its own tree already holds."
+    exit "$RC"
+  fi
 fi
 
 #-------------------------------------------------------------------------------------
@@ -249,6 +293,8 @@ if has_stage replay; then
       -collisions "$COLLISIONS" \
       -evictions "$EVICTIONS" \
       -admissions "$ADMISSIONS" \
+      -replacements "$REPLACEMENTS" \
+      -min-reuse-rate "$MIN_REUSE_RATE" \
       -ownership "$OWNERSHIP" \
       -max-bytes "$MAX_BYTES" \
       -backend-name "$("$KATAGO" version 2>&1 | head -2 | tr '\n' ' ')" \
@@ -283,6 +329,11 @@ if has_stage visits; then
       case "$base" in
         direct)
           echo "nnCacheCollision = direct" ;;
+        direct:*)
+          # The replacement axis: which of the two candidates a direct-mapped collision
+          # keeps. Only direct mapping has two candidates, so only this arm can carry it.
+          echo "nnCacheCollision = direct"
+          echo "nnCacheReplacement = ${base#direct:}" ;;
         chain:*)
           echo "nnCacheCollision = chain"
           echo "nnCacheEviction = ${base#chain:}"

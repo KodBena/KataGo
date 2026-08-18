@@ -46,7 +46,11 @@ def load(path):
 def shape_name(r):
     c = r["collision"]
     if c == "direct":
-        base = "direct"
+        # Four different tables answer to "direct" now, distinguished by which of the two
+        # candidates a collision keeps. Labelling them all "direct" would silently collapse
+        # a swept axis into one row-name; the status quo keeps the bare name.
+        rep = r.get("replacement", "always")
+        base = "direct" if rep in ("always", None) else "direct/%s" % rep
     elif c == "chain":
         base = "chain/%s" % r["eviction"]
     else:
@@ -65,7 +69,9 @@ def print_substrate(s, after):
               "katago_version", "git_revision", "backend_that_built_the_trace",
               "trace_path", "trace_format", "trace_records", "trace_gets",
               "trace_hits_as_recorded", "trace_sets", "trace_sets_with_ownermap",
-              "trace_distinct_set_keys", "trace_mean_set_bytes",
+              "trace_distinct_set_keys", "trace_set_repeats", "trace_set_repeat_rate",
+              "trace_reusable_gets", "trace_reuse_rate", "min_reuse_rate_floor",
+              "trace_mean_set_bytes",
               "sizeof_NNOutput", "ownership_mode_arg",
               "max_bytes_budget", "preflight_peak_bytes", "chain_budget_bytes", "note"):
         if k in s:
@@ -116,7 +122,7 @@ def main():
         return
 
     if "--csv" in flags:
-        cols = ["collision", "ways", "eviction", "admission", "table_pow", "mutex_pool_pow",
+        cols = ["collision", "ways", "eviction", "admission", "replacement", "table_pow", "mutex_pool_pow",
                 "ownership_mode", "status", "hit_rate", "occupancy", "re_miss_rate_of_gets",
                 "resident_entries", "resident_payload_bytes", "fixed_structure_bytes",
                 "cache_ops_per_sec"]
@@ -137,7 +143,12 @@ def main():
             groups.setdefault((r["table_pow"], r["ownership_mode"]), []).append(r)
         for key in sorted(groups):
             g = groups[key]
-            base = [r for r in g if r["collision"] == "direct" and r["admission"] == "always"]
+            # The baseline is the STATUS QUO direct table, so it must also carry the
+            # status-quo replacement rule -- otherwise a run that sweeps the replacement
+            # axis picks whichever direct row happened to come first as its baseline.
+            base = [r for r in g
+                    if r["collision"] == "direct" and r["admission"] == "always"
+                    and r.get("replacement", "always") == "always"]
             print("=== 2^%d, ownership %s ===" % key)
             if base:
                 b = base[0]

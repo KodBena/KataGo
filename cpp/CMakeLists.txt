@@ -978,6 +978,7 @@ add_executable(katago
   neuralnet/nncacheprobed.cpp
   neuralnet/nncachechained.cpp
   neuralnet/nncacheadmission.cpp
+  neuralnet/nncachesighting.cpp
   neuralnet/nncachetrace.cpp
   neuralnet/desc.cpp
   neuralnet/debugprint.cpp

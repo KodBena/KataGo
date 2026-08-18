@@ -678,6 +678,321 @@ static void testSecondSightingComposesWithEveryShape() {
 }
 
 //-------------------------------------------------------------------------------------
+// The collision replacement axis: which of the TWO candidates a direct-mapped
+// collision keeps
+//-------------------------------------------------------------------------------------
+//
+// Everything here is a direct-mapped table of 16 slots, so its ghost sighting-count array
+// is 16 words too. The keys are built so that a named group SHARES home slot 0 -- they
+// therefore contend for exactly one slot and the contest is the whole scenario -- while
+// each of them lands on a DISTINCT ghost slot, so no scenario's counts can be silently
+// clobbered by the ghost's own aliasing. That separation is deliberate: the aliasing is a
+// real property of the structure (see nncachesighting.cpp) and is measured in the sweep,
+// but a correctness test must not be at its mercy.
+//
+// The trap from the top of this file applies here with full force and then some: a get()
+// is a SIGHTING, and under these rules it is a sighting even when it MISSES, because the
+// ghost is written before the table is consulted. So every scenario does all of its
+// membership assertions after its last set, and any scenario that needs to continue past
+// a probe is rebuilt from scratch.
+
+static Hash128 sightingKeyAt(uint64_t home, int serial) {
+  // hash0's low bits are the table's index, so `home` decides the slot; hash0's top bits
+  // are the ghost's tag; hash1 is the ghost's index. Setting all three explicitly means a
+  // scenario's ghost layout is constructed rather than inherited from a hash function.
+  return Hash128(home | (((uint64_t)(serial + 1)) << 40), (uint64_t)serial);
+}
+
+static const int SIGHT_SIZE_POW = 4;   // 16 slots, and a 16-word ghost
+static const int SIGHT_POOL_POW = 2;
+
+static NNCacheConfig replacementConfig(NNCacheReplacementPolicy replacement) {
+  NNCacheConfig config = {
+    SIGHT_SIZE_POW, SIGHT_POOL_POW,
+    NNCacheShape::directMapped(replacement),
+    NNCacheAdmissionPolicy::Always
+  };
+  return config;
+}
+
+// Scenario ONE, run under both polarities in one test so that the two are proven to
+// DIFFER rather than merely to work.
+//
+// Counts, exactly, at the moment of the contest -- a sighting is every presentation, get
+// or set:
+//   set A            A = 1
+//   get A, get A, get A   A = 4   (three hits)
+//   set B            B = 1, and B collides with A on slot 0
+//
+// So the incumbent A stands at 4 and the newcomer B at 1.
+//   keepmoreseen (the conventional direction): the MORE-seen survives -> A stays, B is
+//     dropped.
+//   keeplessseen (the operator's direction):   the LESS-seen survives -> B takes the
+//     slot, A is gone.
+// Those are opposite outcomes on identical input, which is the point.
+static void testSightingPolaritiesDisagreeOnAHotIncumbent() {
+  const Hash128 a = sightingKeyAt(0,0), b = sightingKeyAt(0,1);
+
+  {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepMoreSeen));
+    table->set(entryFor(a,false));
+    testAssert(present(*table,a));
+    testAssert(present(*table,a));
+    testAssert(present(*table,a));       // A: 4 sightings
+    table->set(entryFor(b,false));       // B: 1
+    testAssert(present(*table,a));       // the more-seen incumbent survived
+    testAssert(!present(*table,b));      // and the newcomer was refused outright
+  }
+  {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepLessSeen));
+    table->set(entryFor(a,false));
+    testAssert(present(*table,a));
+    testAssert(present(*table,a));
+    testAssert(present(*table,a));       // A: 4 sightings
+    table->set(entryFor(b,false));       // B: 1
+    testAssert(!present(*table,a));      // the more-seen incumbent was replaced
+    testAssert(present(*table,b));       // by the less-seen newcomer
+  }
+}
+
+// Scenario TWO, the mirror of scenario one, and the one that fails outright under any
+// design that keeps sighting counts only for RESIDENT keys.
+//
+// Here the HOT key is the newcomer and it is never resident until the contest:
+//   set B                               B = 1, B is resident on slot 0
+//   get A x4  -- every one of them a MISS, and every one of them a sighting   A = 4
+//   set A                               A = 5, and A collides with B
+//
+// A's count of 5 exists only because the ghost table records keys that are not in the
+// cache. Drop the ghost and A arrives at 0, every comparison degenerates, and both
+// polarities collapse into today's unconditional always-replace. So:
+//   keepmoreseen: A(5) beats B(1) -> A takes the slot.
+//   keeplessseen: B(1) is the less-seen -> B keeps it and A is dropped, which is a
+//     newcomer being REFUSED, something no shape in this cache could previously do.
+static void testSightingCountsForNonResidentKeysDecideTheContest() {
+  const Hash128 a = sightingKeyAt(0,0), b = sightingKeyAt(0,1);
+
+  {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepMoreSeen));
+    table->set(entryFor(b,false));
+    for(int i = 0; i<4; i++)
+      testAssert(!present(*table,a));    // misses, and sightings all the same
+    table->set(entryFor(a,false));
+    testAssert(present(*table,a));
+    testAssert(!present(*table,b));
+  }
+  {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepLessSeen));
+    table->set(entryFor(b,false));
+    for(int i = 0; i<4; i++)
+      testAssert(!present(*table,a));
+    table->set(entryFor(a,false));
+    testAssert(!present(*table,a));      // the newcomer LOST -- new behaviour entirely
+    testAssert(present(*table,b));
+  }
+}
+
+// The tie rule, and why it is load-bearing. On a stream where no key is ever re-seen,
+// every key stands at exactly two sightings when it contends (its own miss and its own
+// set), so every comparison is a tie. A tie goes to the newcomer under BOTH polarities,
+// which makes such a stream behave EXACTLY as `always` does. That is what confines these
+// policies to deviating only where there is real count information -- and it is what
+// makes the default-configuration guarantee something other than a hope.
+static void testSightingRulesMatchAlwaysWhenNoKeyIsEverReseen() {
+  const NNCacheReplacementPolicy rules[3] = {
+    NNCacheReplacementPolicy::Always,
+    NNCacheReplacementPolicy::KeepLessSeen,
+    NNCacheReplacementPolicy::KeepMoreSeen
+  };
+  const int numKeys = 6;
+  for(int r = 0; r<3; r++) {
+    unique_ptr<NNCacheTable> table = NNCacheTable::create(replacementConfig(rules[r]));
+    for(int i = 0; i<numKeys; i++) {
+      const Hash128 k = sightingKeyAt(0,i);
+      testAssert(!present(*table,k));    // the engine's miss...
+      table->set(entryFor(k,false));     // ...followed by its store
+    }
+    for(int i = 0; i<numKeys; i++)
+      testAssert(present(*table,sightingKeyAt(0,i)) == (i == numKeys-1));
+  }
+}
+
+// keepsighted: the incumbent is kept if it has been re-read since it was stored, and it
+// gets exactly ONE reprieve. Two tables rather than one, because probing the incumbent
+// between the two collisions would itself re-sight it and there would be nothing left to
+// test -- the same rebuild-from-scratch discipline the LFU aging scenarios use.
+static void testKeepSightedGivesExactlyOneReprieve() {
+  const Hash128 a = sightingKeyAt(0,0), b = sightingKeyAt(0,1), c = sightingKeyAt(0,2);
+
+  // A has been read, so it survives B and spends its reprieve.
+  {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepSighted));
+    table->set(entryFor(a,false));
+    testAssert(present(*table,a));       // the sighting that earns the reprieve
+    table->set(entryFor(b,false));
+    testAssert(present(*table,a));
+    testAssert(!present(*table,b));
+  }
+  // The very next collision finds the reprieve spent, so C takes the slot.
+  {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepSighted));
+    table->set(entryFor(a,false));
+    testAssert(present(*table,a));
+    table->set(entryFor(b,false));       // refused; A's reprieve is now spent
+    table->set(entryFor(c,false));       // C finds an unsighted incumbent and takes it
+    testAssert(!present(*table,a));
+    testAssert(!present(*table,b));
+    testAssert(present(*table,c));
+  }
+  // And an incumbent that was never read is replaced immediately, exactly as `always`
+  // would have replaced it -- so the reprieve is earned, not free.
+  {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepSighted));
+    table->set(entryFor(a,false));
+    table->set(entryFor(b,false));
+    testAssert(!present(*table,a));
+    testAssert(present(*table,b));
+  }
+}
+
+// nneval re-offers a key it already holds when it upgrades an entry with an ownership
+// map. That is not a contest between two keys and it must NEVER be refused: refusing it
+// would silently discard a result the engine had already computed. Asserted for every
+// rule, because it is the one path where a replacement rule could do real damage.
+static void testAReofferedKeyIsNeverRefused() {
+  const NNCacheReplacementPolicy rules[3] = {
+    NNCacheReplacementPolicy::KeepLessSeen,
+    NNCacheReplacementPolicy::KeepMoreSeen,
+    NNCacheReplacementPolicy::KeepSighted
+  };
+  shared_ptr<NNOutput> bareProto = entryFor(sightingKeyAt(0,0),false);
+  shared_ptr<NNOutput> ownerProto = entryFor(sightingKeyAt(0,0),true);
+  for(int r = 0; r<3; r++) {
+    unique_ptr<NNCacheTable> table = NNCacheTable::create(replacementConfig(rules[r]));
+    const Hash128 a = sightingKeyAt(0,0);
+    table->set(entryFor(a,false));
+    testAssert(present(*table,a));                 // a hit, which under keepsighted also
+                                                   // sets the very flag that would refuse
+    table->set(entryFor(a,true));                  // the ownermap upgrade
+    testAssert(present(*table,a));
+    const NNCacheStats s = table->stats();
+    testAssert(s.residentEntries == 1);
+    // The upgrade is really resident, not merely "something is in the slot".
+    testAssert(s.residentPayloadBytes == (int64_t)nnOutputFootprintBytes(*ownerProto));
+    testAssert(s.residentPayloadBytes > (int64_t)nnOutputFootprintBytes(*bareProto));
+  }
+}
+
+// The ghost's memory bound is exact, fixed at construction, derived from a knob that
+// already exists -- and it is CHARGED, so the axis cannot look free.
+static void testSightingGhostMemoryIsBoundedAndCharged() {
+  testAssert(sightingCountGhostBytes(21) == (size_t)4 * (((size_t)1) << 21));
+  testAssert(sightingCountGhostBytes(0) == 4);
+
+  unique_ptr<NNCacheTable> always =
+    NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::Always));
+  unique_ptr<NNCacheTable> counted =
+    NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepMoreSeen));
+  unique_ptr<NNCacheTable> sighted =
+    NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepSighted));
+
+  const int64_t alwaysFixed = always->stats().fixedStructureBytes;
+  const int64_t countedFixed = counted->stats().fixedStructureBytes;
+  const int64_t sightedFixed = sighted->stats().fixedStructureBytes;
+
+  // A count-comparing table costs the ghost and NOTHING else: its slot carries no
+  // metadata, which is empty-base optimization doing its job. If that ever stopped
+  // holding, this equality would be the thing that noticed.
+  testAssert(countedFixed - alwaysFixed == (int64_t)sightingCountGhostBytes(SIGHT_SIZE_POW));
+
+  // keepsighted is the other trade and it is NOT the cheaper one in bytes: it allocates
+  // no ghost at all, and pays instead in the slot, where alignment inflates one bool.
+  // Reported rather than asserted to a literal, because it is a compiler layout fact and
+  // pinning it here would be a second copy of it.
+  testAssert(sightedFixed > alwaysFixed);
+  cout << "  replacement fixed cost per slot, over the plain direct table:"
+       << " count-ghost rules " << ((countedFixed - alwaysFixed) / (((int64_t)1) << SIGHT_SIZE_POW))
+       << " B/slot (all of it ghost, none of it slot),"
+       << " keepsighted " << ((sightedFixed - alwaysFixed) / (((int64_t)1) << SIGHT_SIZE_POW))
+       << " B/slot (all of it slot, no ghost)" << endl;
+}
+
+// The replacement axis and the admission axis are orthogonal and compose, the same way
+// admission composes over the four collision schemes.
+static void testReplacementComposesWithSecondSighting() {
+  const NNCacheReplacementPolicy rules[3] = {
+    NNCacheReplacementPolicy::KeepLessSeen,
+    NNCacheReplacementPolicy::KeepMoreSeen,
+    NNCacheReplacementPolicy::KeepSighted
+  };
+  for(int r = 0; r<3; r++) {
+    unique_ptr<NNCacheTable> table =
+      NNCacheTable::create(withAdmission(replacementConfig(rules[r]), NNCacheAdmissionPolicy::SecondSighting));
+    const Hash128 key = sightingKeyAt(9,r);
+    table->set(entryFor(key,false));
+    testAssert(!present(*table,key));   // admission still needs two stores
+    table->set(entryFor(key,false));
+    testAssert(present(*table,key));
+  }
+}
+
+// The coherence rules, at the TYPE layer rather than only at the .cfg Port -- a caller
+// that bypasses the text must fail too.
+static void testReplacementIsUnrepresentableOffDirectMapping() {
+  // A probed or chained shape has no replacement rule to report.
+  {
+    bool threw = false;
+    string what;
+    try {
+      (void)NNCacheShape::probed(NNCacheCollisionScheme::LinearProbe,4,NNCacheEvictionPolicy::Lru).replacement();
+    }
+    catch(const StringError& e) { threw = true; what = e.what(); }
+    testAssert(threw);
+    testAssert(what.find("direct-mapped") != string::npos);
+  }
+  {
+    bool threw = false;
+    try { (void)NNCacheShape::chained(4000000000LL,NNCacheEvictionPolicy::Lru).replacement(); }
+    catch(const StringError&) { threw = true; }
+    testAssert(threw);
+  }
+  // And the reverse, unchanged: a direct-mapped shape still has no eviction policy,
+  // whichever replacement rule it carries. Adding this axis did not open that door.
+  {
+    bool threw = false;
+    try { (void)NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepMoreSeen).eviction(); }
+    catch(const StringError&) { threw = true; }
+    testAssert(threw);
+  }
+  // The default rule belongs to the shipped table, not to this one. Reaching the sighting
+  // factory with `always` would mean the DEFAULT configuration was running a generalised
+  // table configured to imitate the shipped one, and that is refused rather than allowed
+  // to happen quietly.
+  {
+    bool threw = false;
+    string what;
+    try { (void)makeSightingDirectNNCacheTable(replacementConfig(NNCacheReplacementPolicy::Always)); }
+    catch(const StringError& e) { threw = true; what = e.what(); }
+    testAssert(threw);
+    testAssert(what.find("always") != string::npos);
+  }
+  // isStatusQuo is the guarantee the golden-file check rests on, so it must be false for
+  // every rule but `always`.
+  testAssert(NNCacheShape::directMapped().isStatusQuo());
+  testAssert(NNCacheShape::directMapped(NNCacheReplacementPolicy::Always).isStatusQuo());
+  testAssert(!NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepLessSeen).isStatusQuo());
+  testAssert(!NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepMoreSeen).isStatusQuo());
+  testAssert(!NNCacheShape::directMapped(NNCacheReplacementPolicy::KeepSighted).isStatusQuo());
+}
+
+//-------------------------------------------------------------------------------------
 // Every shape builds, and honours the plain cache contract
 //-------------------------------------------------------------------------------------
 
@@ -693,6 +1008,19 @@ static void testEveryShapeConstructsAndCaches() {
       configs.push_back(probedConfig(schemes[s],4,evictions[e],8,4));
   shared_ptr<NNOutput> proto = entryFor(keyAt(0,0),false);
   configs.push_back(chainedConfig((int64_t)chainedEntryBytes(*proto) * 8 * 16, 8, 4, NNCacheEvictionPolicy::Lru));
+  // The three direct-mapped replacement rules are shapes too, and must honour the plain
+  // cache contract exactly as the others do.
+  {
+    const NNCacheReplacementPolicy rules[3] = {
+      NNCacheReplacementPolicy::KeepLessSeen,
+      NNCacheReplacementPolicy::KeepMoreSeen,
+      NNCacheReplacementPolicy::KeepSighted
+    };
+    for(int r = 0; r<3; r++) {
+      NNCacheConfig c = {8, 4, NNCacheShape::directMapped(rules[r]), NNCacheAdmissionPolicy::Always};
+      configs.push_back(c);
+    }
+  }
 
   for(size_t i = 0; i<configs.size(); i++) {
     unique_ptr<NNCacheTable> table = NNCacheTable::create(configs[i]);
@@ -777,6 +1105,15 @@ void Tests::runNNCachePolicyTests() {
 
   testSecondSightingAdmission();
   testSecondSightingComposesWithEveryShape();
+
+  testSightingPolaritiesDisagreeOnAHotIncumbent();
+  testSightingCountsForNonResidentKeysDecideTheContest();
+  testSightingRulesMatchAlwaysWhenNoKeyIsEverReseen();
+  testKeepSightedGivesExactlyOneReprieve();
+  testAReofferedKeyIsNeverRefused();
+  testSightingGhostMemoryIsBoundedAndCharged();
+  testReplacementComposesWithSecondSighting();
+  testReplacementIsUnrepresentableOffDirectMapping();
 
   testEveryShapeConstructsAndCaches();
   testWaysBeyondALockRegionIsRefused();

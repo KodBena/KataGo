@@ -18,6 +18,7 @@ const char* const NNCacheConfig::KEY_WAYS = "nnCacheWays";
 const char* const NNCacheConfig::KEY_EVICTION = "nnCacheEviction";
 const char* const NNCacheConfig::KEY_ADMISSION = "nnCacheAdmission";
 const char* const NNCacheConfig::KEY_MAX_BYTES = "nnCacheMaxBytes";
+const char* const NNCacheConfig::KEY_REPLACEMENT = "nnCacheReplacement";
 
 static const string COLLISION_DIRECT = "direct";
 static const string COLLISION_LINEAR = "linearprobe";
@@ -32,6 +33,15 @@ static const string EVICTION_NONE = "none";
 static const string ADMISSION_ALWAYS = "always";
 static const string ADMISSION_SECOND_SIGHTING = "secondsighting";
 
+// The replacement vocabulary names the SURVIVOR of a direct-mapped collision, never the
+// victim. "Replace the more-seen" is ambiguous in English about which key ends up in the
+// slot, and the two readings are opposite policies; naming the survivor makes the two
+// impossible to confuse and impossible to select by accident.
+static const string REPLACEMENT_ALWAYS = "always";
+static const string REPLACEMENT_KEEP_LESS_SEEN = "keeplessseen";
+static const string REPLACEMENT_KEEP_MORE_SEEN = "keepmoreseen";
+static const string REPLACEMENT_KEEP_SIGHTED = "keepsighted";
+
 const set<string>& NNCacheConfig::collisionVocabulary() {
   static const set<string> vocab = {COLLISION_DIRECT, COLLISION_LINEAR, COLLISION_QUADRATIC, COLLISION_CHAIN};
   return vocab;
@@ -42,6 +52,12 @@ const set<string>& NNCacheConfig::evictionVocabulary() {
 }
 const set<string>& NNCacheConfig::admissionVocabulary() {
   static const set<string> vocab = {ADMISSION_ALWAYS, ADMISSION_SECOND_SIGHTING};
+  return vocab;
+}
+const set<string>& NNCacheConfig::replacementVocabulary() {
+  static const set<string> vocab = {
+    REPLACEMENT_ALWAYS, REPLACEMENT_KEEP_LESS_SEEN, REPLACEMENT_KEEP_MORE_SEEN, REPLACEMENT_KEEP_SIGHTED
+  };
   return vocab;
 }
 
@@ -67,6 +83,32 @@ static NNCacheEvictionPolicy evictionPolicyFromString(const string& s) {
   throw StringError("NNCacheConfig: unrecognized eviction policy '" + s + "'");
 }
 
+// The one decode of a replacement word, so the Port and any future caller cannot drift
+// (ADR-0012 P1). Its input is always a word getString() has already checked against
+// replacementVocabulary(), so the fallthrough is unreachable text, not a default.
+static NNCacheReplacementPolicy replacementPolicyFromString(const string& s) {
+  if(s == REPLACEMENT_ALWAYS) return NNCacheReplacementPolicy::Always;
+  if(s == REPLACEMENT_KEEP_LESS_SEEN) return NNCacheReplacementPolicy::KeepLessSeen;
+  if(s == REPLACEMENT_KEEP_MORE_SEEN) return NNCacheReplacementPolicy::KeepMoreSeen;
+  if(s == REPLACEMENT_KEEP_SIGHTED) return NNCacheReplacementPolicy::KeepSighted;
+  throw StringError("NNCacheConfig: unrecognized replacement policy '" + s + "'");
+}
+
+static string replacementPolicyToString(NNCacheReplacementPolicy replacement) {
+  switch(replacement) {
+  case NNCacheReplacementPolicy::Always: return REPLACEMENT_ALWAYS;
+  case NNCacheReplacementPolicy::KeepLessSeen: return REPLACEMENT_KEEP_LESS_SEEN;
+  case NNCacheReplacementPolicy::KeepMoreSeen: return REPLACEMENT_KEEP_MORE_SEEN;
+  case NNCacheReplacementPolicy::KeepSighted: return REPLACEMENT_KEEP_SIGHTED;
+  // A value added to the enum and not to this switch reaches the throw below rather than
+  // an unspecified return. The four sibling switches in this file warn identically under
+  // -Wswitch-default and are pre-existing on the parent branch; they are left alone as
+  // outside this change (ADR-0004) rather than swept in silently.
+  default: break;
+  }
+  throw StringError("NNCacheShape: unhandled replacement policy");
+}
+
 static string evictionPolicyToString(NNCacheEvictionPolicy eviction) {
   switch(eviction) {
   case NNCacheEvictionPolicy::Random: return EVICTION_RANDOM;
@@ -81,16 +123,27 @@ static string evictionPolicyToString(NNCacheEvictionPolicy eviction) {
 // NNCacheShape
 //-------------------------------------------------------------------------------------
 
-NNCacheShape::NNCacheShape(NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction, int64_t maxBytes)
-  :scheme_(scheme), ways_(ways), eviction_(eviction), maxBytes_(maxBytes)
+NNCacheShape::NNCacheShape(
+  NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction, int64_t maxBytes,
+  NNCacheReplacementPolicy replacement
+)
+  :scheme_(scheme), ways_(ways), eviction_(eviction), maxBytes_(maxBytes), replacement_(replacement)
 {}
 
 NNCacheShape NNCacheShape::directMapped() {
-  // Eviction is not a parameter here, and that is the whole point: under 1-way
-  // direct mapping a collision presents exactly one candidate victim, so there is
-  // no policy to state. The stored eviction_ is a placeholder eviction() refuses
-  // to hand out.
-  return NNCacheShape(NNCacheCollisionScheme::Direct, 1, NNCacheEvictionPolicy::None, 0);
+  return NNCacheShape::directMapped(NNCacheReplacementPolicy::Always);
+}
+
+NNCacheShape NNCacheShape::directMapped(NNCacheReplacementPolicy replacement) {
+  // EVICTION is not a parameter here, and that is still the whole point: under 1-way
+  // direct mapping there is exactly one RESIDENT candidate, so there is no victim to
+  // choose among. The stored eviction_ is a placeholder eviction() refuses to hand out.
+  //
+  // REPLACEMENT is a parameter here, and only here, because the other half of the same
+  // collision is a real choice that the eviction axis never covered: the newcomer may
+  // lose. `Always` -- the newcomer wins -- is the rule that has always been in force and
+  // stays the default.
+  return NNCacheShape(NNCacheCollisionScheme::Direct, 1, NNCacheEvictionPolicy::None, 0, replacement);
 }
 
 NNCacheShape NNCacheShape::probed(NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction) {
@@ -112,7 +165,9 @@ NNCacheShape NNCacheShape::probed(NNCacheCollisionScheme scheme, int ways, NNCac
       ". A probed table has finite ways and must choose a victim; valid here are (" +
       EVICTION_RANDOM + "|" + EVICTION_LRU + "|" + EVICTION_LFU + ")."
     );
-  return NNCacheShape(scheme, ways, eviction, 0);
+  // No replacement argument: a probed table's newcomer always wins its contest, taking
+  // the eviction policy's victim's slot, so there is no second candidate to name.
+  return NNCacheShape(scheme, ways, eviction, 0, NNCacheReplacementPolicy::Always);
 }
 
 NNCacheShape NNCacheShape::chained(int64_t maxBytes, NNCacheEvictionPolicy eviction) {
@@ -132,7 +187,8 @@ NNCacheShape NNCacheShape::chained(int64_t maxBytes, NNCacheEvictionPolicy evict
       EVICTION_LRU + "|" + EVICTION_LFU + "); " + EVICTION_LRU + " is the order that was in force "
       "before this axis was expressible."
     );
-  return NNCacheShape(NNCacheCollisionScheme::Chain, 0, eviction, maxBytes);
+  // No replacement argument, for the same reason probed() has none.
+  return NNCacheShape(NNCacheCollisionScheme::Chain, 0, eviction, maxBytes, NNCacheReplacementPolicy::Always);
 }
 
 NNCacheEvictionPolicy NNCacheShape::eviction() const {
@@ -144,9 +200,22 @@ NNCacheEvictionPolicy NNCacheShape::eviction() const {
   return eviction_;
 }
 
+NNCacheReplacementPolicy NNCacheShape::replacement() const {
+  if(scheme_ != NNCacheCollisionScheme::Direct)
+    throw StringError(
+      "NNCacheShape::replacement: only a 1-way direct-mapped table has a replacement rule -- under " +
+      collisionSchemeToString(scheme_) + " the newcomer always wins its contest and takes the "
+      "eviction policy's victim's slot, so there is no second candidate to keep or give up. "
+      "Ask this shape for eviction() instead."
+    );
+  return replacement_;
+}
+
 string NNCacheShape::toString() const {
   if(scheme_ == NNCacheCollisionScheme::Direct)
-    return COLLISION_DIRECT;
+    return replacement_ == NNCacheReplacementPolicy::Always
+      ? COLLISION_DIRECT
+      : COLLISION_DIRECT + ", " + replacementPolicyToString(replacement_);
   if(scheme_ == NNCacheCollisionScheme::Chain)
     return COLLISION_CHAIN + ", maxBytes " + Global::int64ToString(maxBytes_) + ", " +
       evictionPolicyToString(eviction_);
@@ -210,9 +279,28 @@ NNCacheConfig NNCacheConfig::fromCfg(ConfigParser& cfg, int sizePowerOfTwo, int 
         COLLISION_CHAIN + " to use " + string(KEY_MAX_BYTES) + ", or bound memory with "
         "nnCacheSizePowerOfTwo instead -- noting that that key counts SLOTS, not bytes."
       );
-    config.shape = NNCacheShape::directMapped();
+    // The one key this scheme, and only this scheme, accepts beyond the default. Absent
+    // means `always`, which is the rule that has always been in force, so a config that
+    // says nothing builds exactly the table it built before this key existed.
+    const string replacementStr =
+      cfg.contains(KEY_REPLACEMENT) ? cfg.getString(KEY_REPLACEMENT, replacementVocabulary()) : REPLACEMENT_ALWAYS;
+    config.shape = NNCacheShape::directMapped(replacementPolicyFromString(replacementStr));
     return config;
   }
+
+  // Every non-direct scheme refuses the replacement key, because past this point it has
+  // no representation: probed() and chained() take no such argument.
+  if(cfg.contains(KEY_REPLACEMENT))
+    throw StringError(
+      "Key '" + string(KEY_REPLACEMENT) + "' is meaningless under " + string(KEY_COLLISION) + " = " +
+      collision + ". It names which of the TWO candidates a 1-WAY DIRECT-MAPPED collision keeps, the "
+      "resident incumbent or the offered newcomer. Under " + collision + " the newcomer never loses: it "
+      "takes the slot of whichever resident '" + string(KEY_EVICTION) + "' names. Either remove '" +
+      string(KEY_REPLACEMENT) + "', or set " + string(KEY_COLLISION) + " = " + COLLISION_DIRECT + ". "
+      "(A replacement rule for the probed and chained shapes -- one where the newcomer may also be "
+      "refused -- is a real and deliberately UNIMPLEMENTED extension, not an oversight; it is named "
+      "here rather than left silent.)"
+    );
 
   if(collision == COLLISION_CHAIN) {
     if(cfg.contains(KEY_WAYS))
@@ -452,9 +540,19 @@ unique_ptr<NNCacheTable> NNCacheTable::create(const NNCacheConfig& config) {
   unique_ptr<NNCacheTable> table;
   switch(config.shape.scheme()) {
   case NNCacheCollisionScheme::Direct:
-    table = unique_ptr<NNCacheTable>(
-      new NNCacheTableDirect(config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo)
-    );
+    // The shipped 1-way table is reached only under `always`, and it is not the class
+    // that carries the replacement rule: the sighting-count table lives in its own
+    // translation unit and is constructed only when a rule was asked for. So the DEFAULT
+    // configuration runs exactly the code it ran before this axis existed -- byte for
+    // byte, no branch added to its get or set -- rather than running a generalised table
+    // that happens to be configured to behave the same (ADR-0009: the instrument stays
+    // outside the instrument).
+    if(config.shape.replacement() == NNCacheReplacementPolicy::Always)
+      table = unique_ptr<NNCacheTable>(
+        new NNCacheTableDirect(config.sizePowerOfTwo, config.mutexPoolSizePowerOfTwo)
+      );
+    else
+      table = makeSightingDirectNNCacheTable(config);
     break;
   case NNCacheCollisionScheme::LinearProbe:
   case NNCacheCollisionScheme::QuadraticProbe:

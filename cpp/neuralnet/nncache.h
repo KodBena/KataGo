@@ -45,6 +45,56 @@ enum class NNCacheAdmissionPolicy {
   SecondSighting,  // store a key only from its second sighting onward
 };
 
+// Which of the TWO candidates a 1-way direct-mapped collision keeps.
+//
+// This is a third axis, and it is neither of the two above. Eviction answers "which of
+// the `ways` residents is given up", and is meaningless at one way -- that is the whole
+// reason NNCacheShape::directMapped() takes no eviction argument. But a direct-mapped
+// collision still presents exactly TWO candidates, the resident INCUMBENT and the
+// offered NEWCOMER, and something has to choose between them. Until this enum existed
+// the choice was made and unnameable: the table unconditionally took the newcomer, which
+// is `Always` below. That is the same defect the chained table's capacity order had
+// before NNCacheShape::chained gained an eviction argument -- a policy in force under no
+// name -- and it is fixed the same way.
+//
+// It is also not ADMISSION. NNCacheAdmissionPolicy is a decorator that never sees the
+// resident entry: it decides whether an offer is stored at all, from the offered key
+// alone. A rule that compares the newcomer against the incumbent cannot be decided
+// there.
+//
+// SIGHTINGS. A key's sighting count is the number of times it has been PRESENTED to the
+// table -- every get and every set, hit or miss -- saturating at 255. Counting stores
+// alone would be useless in KataGo, which stores a position once (the perfmatrix sweep
+// measured 442,735 sets over 442,192 distinct keys), so every comparison would be a tie.
+// Counts are kept for NON-RESIDENT keys too, in a ghost table; without that a newcomer's
+// count is structurally zero and any comparison collapses back to `Always`.
+enum class NNCacheReplacementPolicy {
+  // The newcomer always wins. Today's behaviour, the default, and the only value under
+  // which the shipped 1-way table is used unchanged.
+  Always,
+  // The candidate seen FEWER times survives; the more-seen one is replaced. This is the
+  // operator's own proposal ("on collision replace the one that's been seen more
+  // often"), and it is the INVERSE of the usual LFU intuition. Named for the SURVIVOR
+  // rather than the victim on purpose: "replace the more-seen" is ambiguous in English
+  // about which key ends up in the slot, and a config file is the wrong place to
+  // discover that.
+  KeepLessSeen,
+  // The candidate seen MORE times survives; the less-seen one is replaced. The
+  // conventional, LFU-shaped direction. It is here so the two can be measured against
+  // each other, not because it is the recommended one.
+  KeepMoreSeen,
+  // Keep the incumbent if it has been sighted since it was stored, and give it exactly
+  // ONE reprieve -- the second-chance rule. Needs no ghost table at all: one bool per
+  // slot, in the cache line the lookup already touched, so it costs no extra memory
+  // access per operation. It is NOT cheaper in bytes: alignment inflates that bool to
+  // 8 bytes per slot against the two counting rules' 4-byte ghost entry, which the test
+  // suite measures and prints rather than asserting from a comment. The alternative
+  // trade, not the cheap one. Its inverse ("keep the incumbent only if it has NOT been
+  // sighted") is deliberately not offered: a never-sighted incumbent would then own its
+  // slot forever, which is not a policy but a leak.
+  KeepSighted,
+};
+
 // The coherent composition of the collision-resolution and eviction axes.
 //
 // Why this is a class with a private constructor rather than two independent enum
@@ -61,6 +111,16 @@ class NNCacheShape {
  public:
   // 1-way direct-mapped, overwrite-on-collision. Today's behaviour, and the default.
   static NNCacheShape directMapped();
+  // 1-way direct-mapped, with `replacement` deciding which of the two candidates a
+  // collision keeps. directMapped(Always) is exactly directMapped().
+  //
+  // `replacement` is an argument of THIS factory and of no other, which is what keeps
+  // the incoherent shapes unrepresentable in the direction this axis opens: probed() and
+  // chained() take no replacement argument, so "linearprobe + keepmoreseen" has no
+  // representation here at all, exactly as "direct + lru" has none. Under a probed or
+  // chained shape the newcomer never loses the contest -- it displaces the eviction
+  // policy's victim -- so there is no second candidate for a replacement rule to name.
+  static NNCacheShape directMapped(NNCacheReplacementPolicy replacement);
   // An open-addressed table of `ways` slots per bucket, choosing its victim by `eviction`.
   static NNCacheShape probed(NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction);
   // Separate chaining: a collision costs nothing, and eviction is driven by `maxBytes`.
@@ -77,23 +137,35 @@ class NNCacheShape {
   // Under a probed scheme it is the collision victim; under Chain it is the capacity
   // victim. Both are "which resident entry is given up", so they share the axis.
   NNCacheEvictionPolicy eviction() const;
+  // Meaningful only when scheme() == Direct, and refused otherwise for the same reason
+  // eviction() is refused under Direct: a probed or chained table's newcomer is never a
+  // candidate for removal, so there is no two-way choice to report.
+  NNCacheReplacementPolicy replacement() const;
   // Slots per bucket. Always 1 under Direct.
   int ways() const { return ways_; }
   // Byte budget the table must stay under. 0 means unbounded. Nonzero only under Chain.
   int64_t maxBytes() const { return maxBytes_; }
 
-  // True exactly for the shape that reproduces today's cache behaviour.
-  bool isStatusQuo() const { return scheme_ == NNCacheCollisionScheme::Direct; }
+  // True exactly for the shape that reproduces today's cache behaviour. Direct mapping
+  // alone is no longer sufficient: a direct-mapped table with a replacement rule is a
+  // different table.
+  bool isStatusQuo() const {
+    return scheme_ == NNCacheCollisionScheme::Direct && replacement_ == NNCacheReplacementPolicy::Always;
+  }
 
   std::string toString() const;
 
  private:
-  NNCacheShape(NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction, int64_t maxBytes);
+  NNCacheShape(
+    NNCacheCollisionScheme scheme, int ways, NNCacheEvictionPolicy eviction, int64_t maxBytes,
+    NNCacheReplacementPolicy replacement
+  );
 
   NNCacheCollisionScheme scheme_;
   int ways_;
   NNCacheEvictionPolicy eviction_;
   int64_t maxBytes_;
+  NNCacheReplacementPolicy replacement_;
 };
 
 // Everything needed to build a cache table.
@@ -122,10 +194,12 @@ struct NNCacheConfig {
   static const char* const KEY_EVICTION;    // nnCacheEviction
   static const char* const KEY_ADMISSION;   // nnCacheAdmission
   static const char* const KEY_MAX_BYTES;   // nnCacheMaxBytes
+  static const char* const KEY_REPLACEMENT; // nnCacheReplacement
 
   static const std::set<std::string>& collisionVocabulary();
   static const std::set<std::string>& evictionVocabulary();
   static const std::set<std::string>& admissionVocabulary();
+  static const std::set<std::string>& replacementVocabulary();
 
   // True exactly when this configuration reproduces today's behaviour.
   bool isStatusQuo() const;

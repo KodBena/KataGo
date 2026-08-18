@@ -200,6 +200,70 @@ void Tests::runNNCacheConfigTests() {
   }
   expectRefused({{"nnCacheAdmission","never"}}, {"always","secondsighting"});
 
+  //---- nnCacheReplacement: which of the TWO candidates a direct-mapped collision keeps ----
+  // Absent means `always`, the rule that has always been in force, so a config that says
+  // nothing about this key builds the table it built before the key existed.
+  {
+    NNCacheConfig config = parseCacheCfg({});
+    testAssert(config.shape.replacement() == NNCacheReplacementPolicy::Always);
+    testAssert(config.isStatusQuo());
+  }
+  {
+    NNCacheConfig config = parseCacheCfg({{"nnCacheReplacement","always"}});
+    testAssert(config.shape.replacement() == NNCacheReplacementPolicy::Always);
+    testAssert(config.isStatusQuo());   // saying it explicitly is still the status quo
+  }
+  // The operator's own direction: the more-seen candidate is replaced, so the SURVIVOR is
+  // the less-seen one. The vocabulary names the survivor precisely so the two directions
+  // cannot be confused for each other in a config file.
+  {
+    NNCacheConfig config = parseCacheCfg({{"nnCacheReplacement","keeplessseen"}});
+    testAssert(config.shape.replacement() == NNCacheReplacementPolicy::KeepLessSeen);
+    testAssert(!config.isStatusQuo());
+    testAssert(NNCacheTable::create(config) != nullptr);
+  }
+  // The conventional, LFU-shaped direction.
+  {
+    NNCacheConfig config = parseCacheCfg({{"nnCacheReplacement","keepmoreseen"}});
+    testAssert(config.shape.replacement() == NNCacheReplacementPolicy::KeepMoreSeen);
+    testAssert(!config.isStatusQuo());
+    testAssert(NNCacheTable::create(config) != nullptr);
+  }
+  {
+    NNCacheConfig config = parseCacheCfg({{"nnCacheReplacement","keepsighted"}});
+    testAssert(config.shape.replacement() == NNCacheReplacementPolicy::KeepSighted);
+    testAssert(!config.isStatusQuo());
+    testAssert(NNCacheTable::create(config) != nullptr);
+  }
+  expectRefused({{"nnCacheReplacement","mostseen"}}, {"keeplessseen","keepmoreseen","keepsighted","always"});
+  // And it is meaningless under every other collision scheme, because past the Port it has
+  // no representation at all: probed() and chained() take no replacement argument.
+  expectRefused(
+    {{"nnCacheCollision","linearprobe"},{"nnCacheEviction","lru"},{"nnCacheReplacement","keepmoreseen"}},
+    {"nnCacheReplacement","direct","linearprobe"}
+  );
+  expectRefused(
+    {{"nnCacheCollision","quadraticprobe"},{"nnCacheEviction","lru"},{"nnCacheReplacement","keeplessseen"}},
+    {"nnCacheReplacement","direct"}
+  );
+  expectRefused(
+    {{"nnCacheCollision","chain"},{"nnCacheMaxBytes","100000000"},{"nnCacheReplacement","keepsighted"}},
+    {"nnCacheReplacement","direct","chain"}
+  );
+  // The direct-mapped refusals this key sits beside are untouched: it does not become an
+  // excuse for eviction, ways or a byte budget under direct.
+  expectRefused(
+    {{"nnCacheReplacement","keepmoreseen"},{"nnCacheEviction","lru"}}, {"nnCacheEviction","direct"}
+  );
+  // Admission and replacement are orthogonal axes and compose.
+  {
+    NNCacheConfig config =
+      parseCacheCfg({{"nnCacheReplacement","keepmoreseen"},{"nnCacheAdmission","secondsighting"}});
+    testAssert(config.shape.replacement() == NNCacheReplacementPolicy::KeepMoreSeen);
+    testAssert(config.admission == NNCacheAdmissionPolicy::SecondSighting);
+    testAssert(NNCacheTable::create(config) != nullptr);
+  }
+
   //---- The coherence rule again, at the type layer rather than the cfg layer ----
   // directMapped() carries no eviction argument, so "direct + lru" has no
   // representation to construct; asking a direct-mapped shape for its eviction

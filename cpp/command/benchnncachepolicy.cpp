@@ -158,6 +158,11 @@ struct PolicyPoint {
   NNCacheEvictionPolicy eviction;
   bool hasEviction;          // false only under direct
   NNCacheAdmissionPolicy admission;
+  // Which of the two candidates a direct-mapped collision keeps. Meaningful ONLY under
+  // direct -- the type refuses to carry it anywhere else -- so every other point holds
+  // Always here and reports "n/a" in the results file rather than a value a reader could
+  // mistake for a swept one.
+  NNCacheReplacementPolicy replacement;
 };
 
 static string schemeName(NNCacheCollisionScheme s) {
@@ -190,6 +195,29 @@ static NNCacheEvictionPolicy evictionFromName(const string& s) {
     "benchnncachepolicy: -evictions accepts (random|lru|lfu), got '" + s + "'. "
     "'none' is not a sweepable policy: it names the absence of a choice, and every shape "
     "in this matrix makes one."
+  );
+}
+
+static string replacementName(NNCacheReplacementPolicy r) {
+  switch(r) {
+  case NNCacheReplacementPolicy::Always: return "always";
+  case NNCacheReplacementPolicy::KeepLessSeen: return "keeplessseen";
+  case NNCacheReplacementPolicy::KeepMoreSeen: return "keepmoreseen";
+  case NNCacheReplacementPolicy::KeepSighted: return "keepsighted";
+  default: break;
+  }
+  throw StringError("benchnncachepolicy: unhandled replacement policy");
+}
+
+static NNCacheReplacementPolicy replacementFromName(const string& s) {
+  if(s == "always") return NNCacheReplacementPolicy::Always;
+  if(s == "keeplessseen") return NNCacheReplacementPolicy::KeepLessSeen;
+  if(s == "keepmoreseen") return NNCacheReplacementPolicy::KeepMoreSeen;
+  if(s == "keepsighted") return NNCacheReplacementPolicy::KeepSighted;
+  throw StringError(
+    "benchnncachepolicy: -replacements accepts (always|keeplessseen|keepmoreseen|keepsighted), got '" +
+    s + "'. The two 'seen' values name which candidate SURVIVES a direct-mapped collision, not which "
+    "one is thrown out."
   );
 }
 
@@ -230,6 +258,10 @@ struct ReplayResult {
   // whose re-miss count is near zero is one where every policy must score the same,
   // whatever its hit rate looks like.
   int64_t reMisses;
+  // Sets this replay invented because a get missed and -reinsert-on-miss was on. Reported
+  // per configuration so a reader can see how much of the run was the trace and how much
+  // was the correction, rather than having to trust that the correction was small.
+  int64_t synthesizedSets;
   double seconds;
   NNCacheStats stats;
 };
@@ -250,11 +282,43 @@ static shared_ptr<NNOutput> payloadFor(Hash128 hash, uint32_t recordedBytes, boo
   return p;
 }
 
+// Replaying a get that MISSED, when the live engine would have re-inserted the key.
+//
+// WHY THIS EXISTS, and why it is off by default. The trace's SET stream was produced by
+// whatever policy the capture ran under. A swept policy that gives a key up is then
+// charged for every later lookup of it, because the trace holds no re-insert -- the real
+// engine would have recomputed and re-stored the position on the very next miss. That
+// biases every policy-to-policy spread upward, which the sweep's own report already
+// states.
+//
+// What that report did not notice is that the bias is NOT uniform across the matrix. A
+// replacement rule can REFUSE A NEWCOMER outright -- no shape in this cache could do that
+// before the axis existed -- and a refused key is never resident at all, so it is charged
+// for every one of its lookups rather than for the tail of them. Comparing a refusing rule
+// against `always` under plain replay therefore compares them under unequal handicaps.
+//
+// With this on, a miss is followed by a synthesised set of the same key, which is what the
+// engine does, so the arms are handicapped equally. It is OFF by default because turning
+// it on changes what every previously-reported number means, and a silently redefined
+// instrument is worse than a stated bias.
+static bool shouldSynthesizeSetAfterMiss(const vector<NNCacheTraceRecord>& trace, size_t i) {
+  // Not when the trace itself already stores this key next -- that is the ordinary
+  // miss-then-store pair the capture recorded, and synthesising here would double it.
+  if(i + 1 >= trace.size())
+    return true;
+  const NNCacheTraceRecord& next = trace[i+1];
+  if((next.flags & NNCacheTrace::FLAG_IS_SET) == 0)
+    return true;
+  return !(next.hash0 == trace[i].hash0 && next.hash1 == trace[i].hash1);
+}
+
 static ReplayResult replayOne(
   const NNCacheConfig& config,
   const vector<NNCacheTraceRecord>& trace,
   bool forceOwnerMap,
-  bool forceNoOwnerMap
+  bool forceNoOwnerMap,
+  bool reinsertOnMiss,
+  uint32_t meanSetBytes
 ) {
   unique_ptr<NNCacheTable> table = NNCacheTable::create(config);
 
@@ -263,7 +327,7 @@ static ReplayResult replayOne(
   // measured here depends on the table maintaining a statistic for us.
   std::set<uint64_t> everHeld;
 
-  ReplayResult r = {0,0,0,0,0.0,{0,0,0,0}};
+  ReplayResult r = {0,0,0,0,0,0.0,{0,0,0,0}};
   shared_ptr<NNOutput> got;
   ClockTimer timer;
   for(size_t i = 0; i<trace.size(); i++) {
@@ -283,8 +347,24 @@ static ReplayResult replayOne(
       r.gets += 1;
       if(found)
         r.hits += 1;
-      else if(everHeld.count(rec.hash0 ^ rec.hash1) != 0)
-        r.reMisses += 1;
+      else {
+        if(everHeld.count(rec.hash0 ^ rec.hash1) != 0)
+          r.reMisses += 1;
+        if(reinsertOnMiss && shouldSynthesizeSetAfterMiss(trace,i)) {
+          // The engine recomputed the position and offered it back. The footprint is the
+          // trace's MEAN rather than this key's own recorded one: keeping a per-key byte
+          // map would cost about a hundred megabytes on a two-million-key trace, on a box
+          // that has already produced one OOM kill on this programme. Under -ownership
+          // on/off it is overridden anyway and the approximation does not arise.
+          uint32_t bytes = meanSetBytes;
+          if(forceOwnerMap) bytes = (uint32_t)(sizeof(NNOutput) + 19*19*sizeof(float));
+          if(forceNoOwnerMap) bytes = (uint32_t)sizeof(NNOutput);
+          bool attached = false;
+          table->set(payloadFor(hash,bytes,attached));
+          r.synthesizedSets += 1;
+          everHeld.insert(rec.hash0 ^ rec.hash1);
+        }
+      }
     }
   }
   r.seconds = timer.getSeconds();
@@ -325,8 +405,10 @@ static int64_t worstCasePeakBytes(
       const int64_t chainHere = slots * 8 + std::min(chainBudget, distinctKeys * maxEntryBytes);
       here = std::max(here, chainHere);
     }
-    // The ghost table under second-sighting, and the mutex pool.
-    here += slots * 4;
+    // The ghost tables, and the mutex pool. TWO ghosts at 4 bytes a slot, not one: a
+    // direct point with second-sighting admission AND a count-comparing replacement rule
+    // allocates both, and they are deliberately not shared (see nncachesighting.cpp).
+    here += slots * 8;
     here += (((int64_t)1) << mutexPow) * 64;
     peak = std::max(peak,here);
   }
@@ -345,7 +427,13 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
   string collisionsStr = "direct,linearprobe,quadraticprobe,chain";
   string evictionsStr = "random,lru,lfu";
   string admissionsStr = "always,secondsighting";
+  // Defaults to the status quo alone, so an existing invocation sweeps exactly the matrix
+  // it swept before this axis existed.
+  string replacementsStr = "always";
   string ownershipStr = "trace";
+  double minReuseRate = 0.05;
+  bool precheckOnly = false;
+  bool reinsertOnMiss = false;
   string note;
   string backendName = "none (replay: no neural net is loaded)";
   int mutexPow = -1;
@@ -368,6 +456,10 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
     else if(a == "-collisions" && hasNext) collisionsStr = args[++i];
     else if(a == "-evictions" && hasNext) evictionsStr = args[++i];
     else if(a == "-admissions" && hasNext) admissionsStr = args[++i];
+    else if(a == "-replacements" && hasNext) replacementsStr = args[++i];
+    else if(a == "-min-reuse-rate" && hasNext) minReuseRate = Global::stringToDouble(args[++i]);
+    else if(a == "-precheck") precheckOnly = true;
+    else if(a == "-reinsert-on-miss") reinsertOnMiss = true;
     else if(a == "-ownership" && hasNext) ownershipStr = args[++i];
     else if(a == "-mutex-pow" && hasNext) mutexPow = Global::stringToInt(args[++i]);
     else if(a == "-max-bytes" && hasNext) maxBytesBudget = Global::stringToInt64(args[++i]);
@@ -391,6 +483,16 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         "  -collisions L      default direct,linearprobe,quadraticprobe,chain\n"
         "  -evictions L       default random,lru,lfu\n"
         "  -admissions L      default always,secondsighting\n"
+        "  -replacements L    default always. Which of the TWO candidates a DIRECT-MAPPED\n"
+        "                     collision keeps: always | keeplessseen | keepmoreseen | keepsighted.\n"
+        "                     The two 'seen' values name the SURVIVOR, not the victim. Applied to\n"
+        "                     `direct` points only; the other schemes have no such choice.\n"
+        "  -min-reuse-rate F  default 0.05. The floor this run's trace must clear on REUSE RATE --\n"
+        "                     the fraction of gets whose key was SET earlier in the same stream,\n"
+        "                     i.e. the hit rate a perfect cache of unbounded size would deliver.\n"
+        "                     Below it, the sweep is REFUSED before anything is allocated: no\n"
+        "                     replacement policy can differ from any other by more than this, so a\n"
+        "                     workload without reuse cannot answer the question the sweep asks.\n"
         "  -ownership W       trace | off | on | both   (default trace: use each set's\n"
         "                     RECORDED footprint. off/on override every entry; both runs each\n"
         "                     configuration twice, once each way.)\n"
@@ -402,6 +504,18 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         "                     at an arbitrary budget.\n"
         "  -assume-v1-entry-bytes N   what a v1 (headerless, 20-byte) trace's missing footprint\n"
         "                     is taken to be. Default sizeof(NNOutput). Stamped in the results.\n"
+        "  -reinsert-on-miss  after a get that MISSES, replay a set of the same key, as the live\n"
+        "                     engine would have done. Off by default. The trace's set stream was\n"
+        "                     recorded under one policy, so without this a swept policy that gives a\n"
+        "                     key up -- or REFUSES it, which only the replacement rules can do -- is\n"
+        "                     charged for every later lookup of it and no re-insert ever arrives.\n"
+        "                     That handicap is not equal across the matrix. Turning this on makes it\n"
+        "                     equal; leaving it off reproduces every earlier run's semantics.\n"
+        "  -precheck          read the trace, print the workload statistics the precondition is\n"
+        "                     computed from, apply the precondition, and EXIT without sweeping.\n"
+        "                     Same code as the gate, so the same numbers. Run it right after a\n"
+        "                     capture, so a workload that cannot answer anything is refused where\n"
+        "                     it was produced rather than an hour later.\n"
         "  -max-ops N         replay only the first N trace records (a smoke test knob)\n"
         "  -backend-name S    recorded verbatim in the substrate line; say what BUILT the trace\n"
         "  -note S            free text recorded in the substrate line\n"
@@ -410,9 +524,11 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
 
   if(tracePath.empty())
     throw StringError("benchnncachepolicy: -trace is required. Run with an unknown flag for the full usage.");
-  if(outPath.empty())
+  // -out and -max-bytes are about a SWEEP. A precheck allocates nothing and writes nothing,
+  // so requiring them there would be ceremony that discourages running the check.
+  if(outPath.empty() && !precheckOnly)
     throw StringError("benchnncachepolicy: -out is required. Run with an unknown flag for the full usage.");
-  if(maxBytesBudget <= 0)
+  if(maxBytesBudget <= 0 && !precheckOnly)
     throw StringError(
       "benchnncachepolicy: -max-bytes is REQUIRED and has no default. It is the memory this run may\n"
       "not exceed, in bytes. There is no default because the sweep this replaces was planned against\n"
@@ -458,6 +574,12 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
       else throw StringError("benchnncachepolicy: -admissions accepts (always|secondsighting), got '" + parts[i] + "'");
     }
   }
+  vector<NNCacheReplacementPolicy> replacements;
+  {
+    vector<string> parts = splitList(replacementsStr);
+    for(size_t i = 0; i<parts.size(); i++)
+      replacements.push_back(replacementFromName(parts[i]));
+  }
   // ownership: which footprint each set is replayed with.
   vector<string> ownershipModes;
   if(ownershipStr == "both") { ownershipModes.push_back("off"); ownershipModes.push_back("on"); }
@@ -475,23 +597,133 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
     trace.resize((size_t)maxOps);
 
   int64_t traceGets = 0, traceHits = 0, traceSets = 0, traceOwnerSets = 0, traceSetBytes = 0;
+  int64_t traceSetRepeats = 0, traceReusableGets = 0;
   std::set<uint64_t> distinctSetKeys;
   for(size_t i = 0; i<trace.size(); i++) {
+    const uint64_t key = trace[i].hash0 ^ trace[i].hash1;
     if((trace[i].flags & NNCacheTrace::FLAG_IS_SET) != 0) {
       traceSets += 1;
       traceSetBytes += trace[i].bytes;
       if(trace[i].bytes >= (uint32_t)(sizeof(NNOutput) + 19*19*sizeof(float)))
         traceOwnerSets += 1;
-      distinctSetKeys.insert(trace[i].hash0 ^ trace[i].hash1);
+      if(!distinctSetKeys.insert(key).second)
+        traceSetRepeats += 1;
     }
     else {
       traceGets += 1;
       if((trace[i].flags & NNCacheTrace::FLAG_HIT) != 0)
         traceHits += 1;
+      // The one quantity the whole sweep stands or falls on: was this key SET earlier in
+      // this same stream? Counted here, in the pass the runner already makes, at zero
+      // extra memory -- distinctSetKeys is exactly the set of keys stored so far.
+      if(distinctSetKeys.count(key) != 0)
+        traceReusableGets += 1;
     }
   }
   const int64_t distinctKeys = (int64_t)distinctSetKeys.size();
   const int64_t meanSetBytes = traceSets > 0 ? traceSetBytes / traceSets : (int64_t)sizeof(NNOutput);
+  const double reuseRate = traceGets > 0 ? (double)traceReusableGets / (double)traceGets : 0.0;
+  const double setRepeatRate = traceSets > 0 ? (double)traceSetRepeats / (double)traceSets : 0.0;
+
+  //---- THE WORKLOAD PRECONDITION, before anything large is allocated ----
+  //
+  // WHAT THIS GATE IS FOR, and why it is not the gate that used to be here. The runbook's
+  // previous precondition asked whether the trace held enough DISTINCT positions to fill
+  // the smallest table swept. A 1252-second GPU sweep PASSED that check and answered
+  // nothing: its 1,957,525 gets produced 136 hits, because its 24 queries were searches of
+  // mutually unrelated random positions and nothing was ever asked for twice. Trace size
+  // was simply the wrong quantity.
+  //
+  // Nor is it the repeat rate in the SET stream, which sounds like the right correction
+  // and is not. That worthless trace carries 77 set repeats in 1,957,389 sets; a known-good
+  // capture -- a real game walked move by move, hit rate 0.3667 -- carries TEN in 36,248,
+  // fewer in absolute terms. The set stream cannot separate the two workloads because
+  // KataGo stores a position once either way.
+  //
+  // The quantity that does separate them, by four orders of magnitude, is the REUSE RATE:
+  // the fraction of gets whose key was set earlier in the same stream. It is exactly the
+  // hit-rate CEILING -- no cache of any shape or size can exceed it -- so it is also a hard
+  // upper bound on how far any two policies in the matrix can possibly differ. It is not a
+  // new invention: it is the number the sweep's own report already quotes as the ceiling,
+  // promoted from something computed afterwards to something checked beforehand, from the
+  // same code, so the gate and the report cannot disagree (ADR-0011 Rule 2, ADR-0012 P1).
+  //
+  // THE FLOOR AND ITS REASONING. The default is 0.05. The smallest policy-to-policy
+  // difference this programme has treated as decision-relevant is about 0.4 percentage
+  // points (lfu against lru at 2^16); a ceiling has to sit at least an order of magnitude
+  // above the effect it is meant to make visible, which puts the floor at 4-5%. Measured
+  // against real captures it separates cleanly rather than finely: a game-walk trace sits
+  // at 0.30-0.37, six times the floor, and the failed capture sits at 7.0e-05, seven
+  // hundred times below it. Nothing is being tuned at the margin here.
+  cerr << "benchnncachepolicy: trace reuse rate = " << reuseRate
+       << " (" << traceReusableGets << " of " << traceGets
+       << " gets were for a key set earlier in this stream); floor = " << minReuseRate << endl;
+  if(reuseRate < minReuseRate)
+    throw StringError(
+      "benchnncachepolicy: REFUSING to start. This trace has a reuse rate of " +
+      Global::doubleToString(reuseRate) + ", below the -min-reuse-rate floor of " +
+      Global::doubleToString(minReuseRate) + ".\n"
+      "  " + Global::int64ToString(traceReusableGets) + " of " + Global::int64ToString(traceGets) +
+      " gets were for a key this stream had SET earlier. That fraction is the hit rate a PERFECT\n"
+      "  cache of unbounded size would deliver on this workload, so it is also a hard ceiling on how\n"
+      "  far any two policies in this matrix can differ. Sweeping it would spend the machine's time\n"
+      "  measuring " + Global::int64ToString((int64_t)replacements.size()) + " x N configurations that "
+      "must all score the same, and would produce a\n"
+      "  results file whose flatness looks like a finding and is not one.\n"
+      "\n"
+      "  This is NOT a trace-size problem and NOT a repeat-rate problem, and checking either of those\n"
+      "  is how a 1252-second GPU sweep came back clean and uninformative. The trace holds " +
+      Global::int64ToString(distinctKeys) + " distinct\n"
+      "  keys and " + Global::int64ToString(traceSetRepeats) + " repeated sets (rate " +
+      Global::doubleToString(setRepeatRate) + "); a KNOWN-GOOD game-walk capture has fewer repeated\n"
+      "  sets than that and a reuse rate of 0.37, because KataGo stores a position once whatever the\n"
+      "  workload is. Reuse lives in the GET stream, not the set stream.\n"
+      "\n"
+      "  The fix is the capture, not this flag. The NN cache earns its keep ACROSS searches, never\n"
+      "  within one -- a SearchNode holds its own NNOutput, so a position evaluated inside a tree is\n"
+      "  never asked of the cache again. So capture MANY queries at MODEST visits over RELATED\n"
+      "  positions -- a game walked turn by turn, which is what a reviewing GUI does -- rather than a\n"
+      "  few enormous searches of unrelated ones. cachepol-tools/run_policy_sweep.sh does this by\n"
+      "  default. Pass -min-reuse-rate 0 only if you deliberately intend to measure a no-reuse\n"
+      "  workload and know that every policy will tie."
+    );
+
+  // The second quantity, and it is a WARNING rather than a refusal. A replacement or
+  // eviction policy can only act where the table cannot hold the working set; if every
+  // table swept is larger than the trace's distinct-key count, the run is not worthless --
+  // "at this size nothing helps" is a real and useful answer, and it is the answer the
+  // previous sweep established at the operator's own 2^21 -- but it cannot RANK the
+  // policies, and a reader deserves to be told which of the two runs he asked for.
+  {
+    double maxLoadFactor = 0.0;
+    for(size_t i = 0; i<tablePows.size(); i++)
+      maxLoadFactor = std::max(maxLoadFactor, (double)distinctKeys / (double)(((int64_t)1) << tablePows[i]));
+    if(maxLoadFactor < 2.0)
+      cerr << "benchnncachepolicy: WARNING -- the trace holds " << distinctKeys
+           << " distinct keys and the SMALLEST table swept holds more than half of that (load factor "
+           << maxLoadFactor << " < 2). Every table in this sweep can hold most of the working set, so "
+           << "the policies will converge on the ceiling and this run can report THAT nothing helps at "
+           << "these sizes, but cannot rank the policies against each other. Add smaller -table-pows "
+           << "if ranking is what you want." << endl;
+  }
+
+  if(precheckOnly) {
+    cerr << "benchnncachepolicy: PRECHECK for " << tracePath << "\n"
+         << "  records                " << (int64_t)trace.size() << "\n"
+         << "  gets                   " << traceGets << "  (recorded hits " << traceHits << ")\n"
+         << "  sets                   " << traceSets << "\n"
+         << "  distinct keys set      " << distinctKeys << "\n"
+         << "  repeated sets          " << traceSetRepeats << "  (rate " << setRepeatRate
+         << ")  <- NOT the quantity this gate uses; see below\n"
+         << "  gets for a key set earlier " << traceReusableGets << "\n"
+         << "  REUSE RATE             " << reuseRate << "   floor " << minReuseRate << "  -> PASS\n"
+         << "  The reuse rate is the hit rate a perfect, unbounded cache would deliver on this\n"
+         << "  workload, so it also bounds how far any two policies in the sweep can differ. The\n"
+         << "  repeated-set rate is reported beside it only to show that it does NOT separate a\n"
+         << "  usable capture from an unusable one: KataGo stores a position once either way.\n"
+         << "benchnncachepolicy: precheck passed; nothing was swept and nothing was written." << endl;
+    return 0;
+  }
 
   //---- The memory preflight, before anything large is allocated ----
   const int64_t maxEntryBytes =
@@ -578,10 +810,18 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
     j.num("trace_sets", traceSets);
     j.num("trace_sets_with_ownermap", traceOwnerSets);
     j.num("trace_distinct_set_keys", distinctKeys);
+    j.num("trace_set_repeats", traceSetRepeats);
+    j.real("trace_set_repeat_rate", setRepeatRate);
+    // The precondition's own quantity, recorded whether it passed narrowly or by a mile,
+    // so a reader of the file alone can see what the run was allowed to answer.
+    j.num("trace_reusable_gets", traceReusableGets);
+    j.real("trace_reuse_rate", reuseRate);
+    j.real("min_reuse_rate_floor", minReuseRate);
     j.num("trace_mean_set_bytes", meanSetBytes);
     j.num("sizeof_NNOutput", (int64_t)sizeof(NNOutput));
     j.num("ownermap_bytes_19x19", (int64_t)(19*19*sizeof(float)));
     j.str("ownership_mode_arg", ownershipStr);
+    j.boolean("reinsert_on_miss", reinsertOnMiss);
     j.num("max_bytes_budget", maxBytesBudget);
     j.num("preflight_peak_bytes", peak);
     j.num("chain_budget_bytes", effectiveChainBudget);
@@ -617,19 +857,26 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         for(size_t ai = 0; ai<admissions.size(); ai++) {
           const NNCacheAdmissionPolicy adm = admissions[ai];
           if(scheme == NNCacheCollisionScheme::Direct) {
-            PolicyPoint p = {"direct", scheme, 1, NNCacheEvictionPolicy::None, false, adm};
-            points.push_back(p);
+            // The replacement axis lives here and only here. The other three schemes take
+            // no such argument, so there is nothing to iterate over for them.
+            for(size_t ri = 0; ri<replacements.size(); ri++) {
+              PolicyPoint p = {"direct", scheme, 1, NNCacheEvictionPolicy::None, false, adm, replacements[ri]};
+              points.push_back(p);
+            }
           }
           else if(scheme == NNCacheCollisionScheme::Chain) {
             for(size_t ei = 0; ei<evictions.size(); ei++) {
-              PolicyPoint p = {"chain", scheme, 1, evictions[ei], true, adm};
+              PolicyPoint p = {"chain", scheme, 1, evictions[ei], true, adm, NNCacheReplacementPolicy::Always};
               points.push_back(p);
             }
           }
           else {
             for(size_t wi = 0; wi<waysList.size(); wi++) {
               for(size_t ei = 0; ei<evictions.size(); ei++) {
-                PolicyPoint p = {schemeName(scheme), scheme, waysList[wi], evictions[ei], true, adm};
+                PolicyPoint p = {
+                  schemeName(scheme), scheme, waysList[wi], evictions[ei], true, adm,
+                  NNCacheReplacementPolicy::Always
+                };
                 points.push_back(p);
               }
             }
@@ -647,7 +894,7 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         string refusal;
         unique_ptr<NNCacheConfig> config;
         try {
-          NNCacheShape shape = NNCacheShape::directMapped();
+          NNCacheShape shape = NNCacheShape::directMapped(pt.replacement);
           if(pt.scheme == NNCacheCollisionScheme::Chain)
             shape = NNCacheShape::chained(effectiveChainBudget, pt.eviction);
           else if(pt.scheme != NNCacheCollisionScheme::Direct)
@@ -664,6 +911,12 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
               ? 1 : pt.ways);
         j.str("eviction", pt.hasEviction ? evictionName(pt.eviction) : "n/a-direct-is-1-way");
         j.str("admission", pt.admission == NNCacheAdmissionPolicy::Always ? "always" : "secondsighting");
+        // "n/a" rather than "always" off direct mapping: under a probed or chained shape
+        // the newcomer never loses, so there is no rule in force to report, and writing a
+        // value there would invite a reader to compare a swept cell against an unswept one.
+        j.str("replacement",
+              pt.scheme == NNCacheCollisionScheme::Direct
+              ? replacementName(pt.replacement) : "n/a-only-direct-has-two-candidates");
         j.num("table_pow", tablePow);
         j.num("table_slots", ((int64_t)1) << tablePow);
         j.num("mutex_pool_pow", poolPow);
@@ -679,7 +932,7 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
 
         ReplayResult r;
         try {
-          r = replayOne(*config, trace, forceOn, forceOff);
+          r = replayOne(*config, trace, forceOn, forceOff, reinsertOnMiss, (uint32_t)meanSetBytes);
         }
         catch(const StringError& e) {
           j.str("status","REFUSED_AT_CONSTRUCTION");
@@ -694,6 +947,7 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         j.num("hits", r.hits);
         j.real("hit_rate", r.gets > 0 ? (double)r.hits / (double)r.gets : 0.0);
         j.num("sets_offered", r.sets);
+        j.num("synthesized_sets_on_miss", r.synthesizedSets);
         j.num("re_misses", r.reMisses);
         j.real("re_miss_rate_of_gets", r.gets > 0 ? (double)r.reMisses / (double)r.gets : 0.0);
         j.num("resident_entries", r.stats.residentEntries);
@@ -716,7 +970,7 @@ int MainCmds::benchnncachepolicy(const vector<string>& args) {
         out.flush();
         configsRun += 1;
         cerr << "  [" << configsRun << "] " << schemeName(pt.scheme) << " ways=" << pt.ways
-             << " " << (pt.hasEviction ? evictionName(pt.eviction) : "-")
+             << " " << (pt.hasEviction ? evictionName(pt.eviction) : replacementName(pt.replacement))
              << " 2^" << tablePow << " own=" << ownMode
              << " hit=" << ((double)r.hits/(double)std::max((int64_t)1,r.gets))
              << " occ=" << (r.stats.capacitySlots > 0

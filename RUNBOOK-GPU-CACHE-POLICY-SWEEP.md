@@ -1,23 +1,36 @@
 # Runbook: running the NN-cache policy sweep on the GPU host
 
-## READ THIS FIRST: this runbook is UNEXERCISED
+## READ THIS FIRST: what has been run, and what has not
 
-**Nobody has run any command in this document.** It was written inside a virtual machine
-that has no GPU, cannot build a CUDA or TensorRT binary, and cannot reach the host these
-steps are for. Every command below is therefore a **claim awaiting your execution**, not a
-transcript of something that worked.
+**The GPU-host commands in this document have not been run.** This was written inside a
+virtual machine that has no GPU, cannot build a CUDA or TensorRT binary, and cannot reach
+the host these steps are for. Every command that touches the GPU is a **claim awaiting your
+execution**, not a transcript.
 
 What *has* been exercised, on the VM, with an Eigen CPU build:
 
 - the C++ code these commands invoke compiles, its tests pass, and `runoutputtests`
   differs from its committed golden by exactly the one known unrelated line;
-- the replay stage (Stage 2 below) ran to completion against a real recorded trace and
-  produced a results file;
-- the driver script and the summariser were written against that results file.
+- the replay stage (Stage 2 below) ran to completion against real recorded traces and
+  produced results files;
+- **the capture stage ran end to end at reduced size** — games generated, reviewed turn by
+  turn, the tracer writing a v2 trace file, and the precondition passing on it. Small (2
+  games, 60 turns, 40 visits) because this box is a 4-core CPU, but every code path in the
+  stage was taken, including the v2 trace *write* path, which no earlier run had exercised;
+- **the precondition was exercised in both directions**: it refused the previous GPU run's
+  own trace and passed a freshly-captured one, from the same code;
+- the driver script and the summariser were written against those results files.
 
 What has **not** been exercised: the CUDA/TensorRT build, the capture stage against a GPU
-backend, the benchmark stage, and every path and assumption about your host. Places where
-this document is **guessing** about your machine are marked **GUESS** inline.
+backend *at GPU scale*, the benchmark stage, and every path and assumption about your host.
+Places where this document is **guessing** about your machine are marked **GUESS** inline.
+
+**One earlier claim in this document has been withdrawn rather than quietly edited.** The
+section "How big a trace do I need?" told you to gate the capture on the number of distinct
+positions in the trace, and to raise `-V` to get more of them. That check passed on a
+1252-second GPU sweep that answered nothing, and that advice is what produced it. It is
+replaced by "What makes a capture usable", below, which gates on a different quantity and
+inverts the knobs.
 
 ---
 
@@ -29,7 +42,7 @@ had exactly one shape, with no settings: a table of N slots, each position landi
 exactly one slot determined by its hash, and a new position simply overwriting whatever
 was in its slot.
 
-That shape is now one option among several, chosen by four keys in your KataGo `.cfg`:
+That shape is now one option among several, chosen by five keys in your KataGo `.cfg`:
 
 | key | what it chooses |
 |---|---|
@@ -37,6 +50,18 @@ That shape is now one option among several, chosen by four keys in your KataGo `
 | `nnCacheWays` | under the two probing schemes, how many slots a position may try |
 | `nnCacheEviction` | when something must be thrown out, which entry goes: `random`, `lru` (least recently used), or `lfu` (least frequently used) |
 | `nnCacheAdmission` | whether an evaluation offered to the cache is stored at all: `always`, or `secondsighting` (store a position only from the second time it is offered) |
+| `nnCacheReplacement` | under `direct` only: which of the **two** candidates a collision keeps — the position already in the slot, or the one arriving. `always` (the newcomer, today's behaviour), `keeplessseen`, `keepmoreseen`, or `keepsighted` |
+
+**Why `nnCacheReplacement` is a separate key from `nnCacheEviction`, since both sound like
+"what gets thrown out".** They are different questions and only one of them exists under
+1-way direct mapping. `nnCacheEviction` asks *which of the several positions already in
+the table gives up its place* — a question with no content when a position has exactly one
+possible slot and therefore exactly one possible predecessor. `nnCacheReplacement` asks
+*whether the arriving position takes the slot at all*, which is a real, binary choice that
+direct mapping poses and that KataGo has always answered the same way without saying so:
+the newcomer wins, every time. The two `keep…seen` values name the position that
+**SURVIVES**, deliberately — "replace the more-seen one" is ambiguous in English about
+which position ends up in the slot, and the two readings are opposite policies.
 
 **The question this sweep answers** is which of those settings is worth having: for each
 combination, what fraction of lookups hit, how many bytes the cache is actually holding to
@@ -61,7 +86,7 @@ locate whatever table size you actually run.
 
 | stage | what it does | needs the GPU? | roughly how long |
 |---|---|---|---|
-| 1. capture | runs KataGo's analysis engine once, recording every cache operation to a file | **yes** | tens of minutes to hours, your choice |
+| 1. capture | plays a few complete games with KataGo at very low visits, then reviews them turn by turn with the cache tracer on, recording every cache operation to a file — and checks the result before letting stage 2 start | **yes** | minutes to tens of minutes |
 | 2. replay | replays that one recording through every cache configuration | no | minutes |
 | 3. visits | runs `katago benchmark` for a few named configurations, for visits/s | **yes** | minutes each |
 
@@ -283,9 +308,14 @@ $KG/cachepol-tools/run_policy_sweep.sh \
     -c $KG/cpp/configs/analysis_example.cfg \
     -o /opt/katago-cachepol-results/run1 \
     -b "$MAXBYTES" \
-    -V 20000 \
-    -p 17,18,19,20,21
+    -G 4 -N 200 -V 500 \
+    -p 13,14,15,16,17,19,21
 ```
+
+Note the shape of those knobs, because it is the opposite of what the first version of this
+runbook told you: **many queries at modest visits** (`-G` games × `-N` turns of review, at
+`-V` visits each), not a few queries at enormous ones. The reason is in "What makes a
+capture usable" below, and it cost a full GPU run to learn.
 
 Run `$KG/cachepol-tools/run_policy_sweep.sh -h` for every option.
 
@@ -299,39 +329,88 @@ $KG/cachepol-tools/run_policy_sweep.sh -s capture -k "$KATAGO" -m "$MODEL" \
 
 # just the replay, against the trace the capture left behind
 $KG/cachepol-tools/run_policy_sweep.sh -s replay -k "$KATAGO" \
-    -o /opt/katago-cachepol-results/run1 -b "$MAXBYTES" -p 17,18,19,20,21
+    -o /opt/katago-cachepol-results/run1 -b "$MAXBYTES" -p 13,14,15,16,17,19,21
 
 # just the visits check
 $KG/cachepol-tools/run_policy_sweep.sh -s visits -k "$KATAGO" -m "$MODEL" \
     -c $KG/cpp/configs/analysis_example.cfg -o /opt/katago-cachepol-results/run1 -b "$MAXBYTES"
 ```
 
-### How big a trace do I need?
+### What makes a capture usable, and the check that now enforces it
 
-This is the one parameter that decides whether the sweep answers anything.
+**This section replaces one that gave the wrong advice, and the replacement is not a
+refinement of it — it is a correction.** The section that stood here said the thing that
+decides whether the sweep answers anything is whether the trace holds enough *distinct
+positions* to fill the smallest table swept, and told you to raise `-V` (visits per query)
+to get more of them. A sweep was run on that advice. It was clean by every substrate
+measure — `VERDICT=QUALIFIED`, zero swap-in across a 1252-second window — it **passed the
+distinct-positions check comfortably**, and it answered nothing at all: **1,957,525 lookups
+produced 136 hits, a hit rate of 6.9e-05.** Every policy scored the same because nothing
+was ever asked for twice.
 
-The sweep can only saturate a table of `2^k` slots if the trace contains **more than `2^k`
-distinct positions**. Roughly one distinct position per visit:
+**Why visits do not buy what the cache needs.** A KataGo `SearchNode` holds its own
+`shared_ptr<NNOutput>`. A position evaluated once inside a search tree is never asked of
+the NN cache again, however many visits that search is given. **The NN cache earns its keep
+ACROSS searches, never within one.** So a capture of a few enormous searches over unrelated
+positions produces an enormous trace with no reuse in it, and `-V` is the knob that makes
+that worse rather than better.
 
-| you want to saturate | distinct positions needed | with `-V 20000`, queries needed |
+**What does buy reuse: many queries, at modest visits, over RELATED positions.** Walking a
+game turn by turn is exactly that — consecutive turns share nearly all of their search
+space — and it is also what a reviewing GUI does. The capture stage now does this by
+default: it plays complete games with KataGo itself at very low visits (`-G` games of `-N`
+moves, generated at `-J` visits per move) and then issues **one review query per turn** at
+`-V` visits. Defaults: 4 games × 200 turns ≈ 800 queries at 500 visits, about 400k visits
+in the whole capture — fewer than the 2.4M the failed run spent, and usable.
+
+#### The precondition: REUSE RATE, and why not "repeat rate"
+
+The quantity that decides whether a capture can answer anything is the **reuse rate**: the
+fraction of lookups whose position had been **stored earlier in the same stream**. That is
+exactly the hit rate a *perfect cache of unbounded size* would deliver on the workload, so
+it is also a hard ceiling on how far any two policies in the matrix can differ from each
+other. It is checked from the trace itself, before the sweep allocates anything:
+
+```sh
+$KATAGO benchnncachepolicy -trace run1/trace.bin -precheck -table-pows 13,14,15,16,17,19,21
+```
+
+which the driver script runs automatically at the end of the capture stage. Below the floor
+the sweep is **refused**, with the arithmetic and the reason, and nothing is written.
+
+**The floor is 0.05, overridable with `-M`.** The reasoning: the smallest policy-to-policy
+difference this programme has treated as decision-relevant is about 0.4 percentage points,
+and a ceiling has to sit at least an order of magnitude above the effect it is meant to make
+visible, which puts the floor at 4–5%. It is not a fine judgement in practice — real
+captures sit either far above it or far below:
+
+| capture | reuse rate | verdict |
 |---|---|---|
-| 2^17 = 131,072 | ~131k | ~7 |
-| 2^18 = 262,144 | ~262k | ~14 |
-| 2^19 = 524,288 | ~524k | ~27 |
-| 2^20 = 1,048,576 | ~1.05M | ~53 |
-| 2^21 = 2,097,152 | ~2.1M | ~105 |
+| a game walked turn by turn, 500 visits | 0.367 | 7× the floor |
+| a 6000-visit analysis workload | 0.304 | 6× the floor |
+| the failed run: 24 unrelated positions at 100000 visits | 0.000070 | 700× **below** it |
 
-The capture stage writes 24 queries by default. **Raise `-V` rather than editing the
-queries** if you want a bigger trace; the script regenerates the query file only if it is
-absent, so delete `run1/capture-queries.jsonl` if you want it rewritten.
+**And it is specifically NOT the rate of repeated *stores*, which sounds like the obvious
+correction and is worse than useless here.** KataGo stores a position once, on the first
+miss, whatever the workload; a repeated store means only that a position was re-offered
+(the ownership-map upgrade path). Measured on this programme's own trace files: the failed
+capture has **77** repeated stores in 1,957,389; a known-good game-walk capture has **ten**
+in 36,248, and a freshly-taken one has **zero**. Gating on repeated stores with any positive
+threshold would have **accepted the useless capture and refused the good ones.** Reuse lives
+in the *lookup* stream, not the store stream.
 
-A trace of 2 million distinct positions is about **48 MB** on disk (24 bytes per operation,
-and there are more operations than positions), so disk is not the constraint; GPU time is.
+#### A second quantity, reported as a warning rather than a refusal
 
-**The honest floor:** if your trace has fewer distinct positions than the smallest table
-you sweep, every eviction policy will score identically and the sweep will tell you
-nothing. The results file records `trace_distinct_set_keys` so you can check this
-afterwards — but check it before you spend the GPU time.
+A replacement or eviction policy can only act where the table cannot hold the working set.
+If every table size you sweep is bigger than the trace's distinct-position count, the run
+still says something true and useful — *at these sizes nothing helps* — but it cannot rank
+the policies against each other. The precheck prints a warning when the smallest table
+swept holds more than half the working set. That is a warning and not a refusal because the
+null result is a legitimate answer; a trace with no reuse is not, because it answers nothing
+at any size.
+
+A trace of 2 million operations is about **48 MB** on disk (24 bytes per operation), so disk
+is not the constraint; GPU time is.
 
 ### Which stream carries what
 
@@ -447,12 +526,31 @@ you will need it to put a chosen setting into your real `.cfg`, and KataGo **ref
 incoherent combinations rather than ignoring them, so knowing why is useful.
 
 ```
-nnCacheCollision = direct | linearprobe | quadraticprobe | chain
-nnCacheWays      = 2..1024        (probing schemes only)
-nnCacheEviction  = random | lru | lfu
-nnCacheAdmission = always | secondsighting
-nnCacheMaxBytes  = <bytes>        (chain only; required there)
+nnCacheCollision   = direct | linearprobe | quadraticprobe | chain
+nnCacheWays        = 2..1024        (probing schemes only)
+nnCacheEviction    = random | lru | lfu
+nnCacheAdmission   = always | secondsighting
+nnCacheMaxBytes    = <bytes>        (chain only; required there)
+nnCacheReplacement = always | keeplessseen | keepmoreseen | keepsighted   (direct only)
 ```
+
+**`nnCacheReplacement` in full.** It names which of the two candidates for one direct-mapped
+slot **survives** a collision. A position's *sighting count* is the number of times it has
+been presented to the cache — every lookup and every store, hit or miss — and counts are
+kept for positions the cache is **not** holding, in a fixed ghost array of 4 bytes per slot
+(8 MB at `nnCacheSizePowerOfTwo = 21`). Without those, an arriving position would have a
+count of zero by construction and the comparison would collapse back to `always`.
+
+| value | which position keeps the slot | costs |
+|---|---|---|
+| `always` | the arriving one, always. Today's behaviour and the default; leaving the key unset changes nothing | nothing |
+| `keeplessseen` | the one seen **fewer** times. The inverse of the usual cache intuition, and deliberate | 4 B/slot ghost |
+| `keepmoreseen` | the one seen **more** times. The conventional, LFU-shaped direction | 4 B/slot ghost |
+| `keepsighted` | the one already in the slot, if it has been re-read since it was stored — and exactly one such reprieve | no ghost; 8 B/slot in the table |
+
+On a lookup stream where no position is ever re-seen, every comparison is a tie, ties go to
+the arriving position, and all four values behave identically to `always`. So the rules
+deviate only where there is real sighting-count information to deviate on.
 
 Refusals you may hit, and what each means:
 
@@ -464,6 +562,8 @@ Refusals you may hit, and what each means:
 | `chain` with no `nnCacheMaxBytes` | refused | a chained table has no fixed capacity and is bounded only by its byte budget |
 | `chain` with `nnCacheEviction = none` | **refused, and this is new** | see below |
 | `nnCacheMaxBytes` too small to hold one entry per lock region | refused, with the arithmetic | a table that can never retain anything is broken, not slow |
+| `nnCacheReplacement` with any collision scheme other than `direct` | refused, naming both | only direct mapping poses a two-candidate choice; under the others the arriving position never loses — it takes the slot of whichever resident `nnCacheEviction` names |
+| a `nnCacheReplacement` value not in the list | refused, naming the whole list | the two `keep…seen` words name the SURVIVOR; there is no `mostseen` |
 
 **The one accepted value that was removed.** Before this branch, `chain` *required*
 `nnCacheEviction = none`. That was wrong: a chained table's byte budget is always enforced,
@@ -486,6 +586,8 @@ key entirely also gives you `lru`.
 | cmake fails at `enable_language(CUDA)` | no `nvcc` on `PATH` | a host toolchain matter, not this branch; try `-DUSE_BACKEND=TENSORRT` |
 | `"$KATAGO" version` does not mention a GPU backend | you built or are running the wrong binary | check which `build-*` directory `$KATAGO` points at |
 | capture produces a zero-byte or tiny `trace.bin` | the engine failed early | read `run1/capture-engine.log`; the engine's errors are on stderr, and this is what that file is |
+| the capture stage refuses with a reuse-rate message | the workload has no reuse in it, so no sweep of it could answer anything | **fix the capture, not the threshold**: raise `-G` (more games) or `-N` (longer games). Raising `-V` does *not* help and is what caused this the last time — a search never re-asks the cache for a position its own tree holds |
+| game generation fails before any query is written | the analysis engine refused a query, or exited | `run1/capture-gamegen.log` is that engine's own log; the driver refuses rather than writing a short query file, because a short game is a quiet way to produce a trace with no reuse |
 | the engine prints "NNCache: KATAGO_NNCACHE_TRACE is set..." and then is slow | expected | tracing serialises every cache operation through one lock. It is a capture run. Do not read timings from it |
 | stage 2 refuses with a memory message | the matrix does not fit your budget | the message contains the arithmetic; drop the largest `-p` entry, or use `-W off`, or raise `-b` |
 | stage 2 rows say `REFUSED` | a shape is not honourable at that table size | this is deliberate — the row records *which* shape and *why*, so a hole in the matrix is never mistaken for an unrun cell. The commonest is `ways` exceeding a lock region at small table sizes |
