@@ -444,11 +444,22 @@ void testCountLogRefusesWhatItCannotHonor() {
   // later reader would take for "this session hit nothing".
   {
     const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "notcounted");
+    string message;
     bool refused = false;
     try { log.appendDump(NNCacheHitLedger::notCounted()); }
-    catch(const StringError&) { refused = true; }
+    catch(const StringError& e) { refused = true; message = e.what(); }
     testAssert(refused);
     testAssert(!FileUtils::exists(log.path()));
+    // ASSERTED ON THE MESSAGE, and the reason is worth stating because a bare "did it
+    // throw" here was a proxy witness that a seen-red leg caught. Removing appendDump's own
+    // isCounted() guard leaves the call throwing anyway, because NNCacheHitLedger::entries()
+    // already refuses under NotCounted -- so "it threw" is true under both the presence and
+    // the absence of the thing being tested. What the guard actually buys is the DIAGNOSIS:
+    // an operator gets told the count log declined to persist a session's counts, not that
+    // some accessor refused. That message is operator-facing and load-bearing, which is what
+    // makes it a legitimate anchor rather than adjacent prose (ADR-0021 Rule 3).
+    testAssert(message.find("NNCacheCountLog") != string::npos);
+    testAssert(message.find("NotCounted") != string::npos);
   }
 
   // A missing file is not an error: it reads as an empty, intact log.
