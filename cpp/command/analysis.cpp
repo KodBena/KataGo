@@ -9,6 +9,7 @@
 #include "../program/playutils.h"
 #include "../program/play.h"
 #include "../command/commandline.h"
+#include "../command/analysismodels.h"
 #include "../core/test.h"
 #include "../main.h"
 
@@ -22,6 +23,13 @@ struct AnalyzeRequest {
   string id;
   int turnNumber;
   int64_t priority;
+
+  //Which hosted model analyzes this request, already resolved from the request's optional "model"
+  //field against the loaded name space. The request carries the resolved index and never the
+  //requested name: resolution happens once, at the boundary that can refuse it, so no later
+  //stage can resolve it differently or fail to resolve it at all.
+  //A request that named no model carries AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX.
+  size_t modelIdx;
 
   Board board;
   BoardHistory hist;
@@ -64,6 +72,7 @@ int MainCmds::analysis(const vector<string>& args) {
 
   ConfigParser cfg;
   string modelFile;
+  vector<string> extraModelFiles;
   string humanModelFile;
   bool numAnalysisThreadsCmdlineSpecified;
   int numAnalysisThreadsCmdline;
@@ -79,11 +88,14 @@ int MainCmds::analysis(const vector<string>& args) {
 
     TCLAP::ValueArg<int> numAnalysisThreadsArg("","analysis-threads","Analyze up to this many positions in parallel. Equivalent to numAnalysisThreads in the config.",false,0,"THREADS");
     TCLAP::SwitchArg quitWithoutWaitingArg("","quit-without-waiting","When stdin is closed, quit quickly without waiting for queued tasks");
+    TCLAP::MultiArg<string> extraModelArg("","extra-model","Also host this model, selectable by its internalName via the \"model\" field of a request. May be given more than once.",false,"FILE");
     cmd.add(numAnalysisThreadsArg);
     cmd.add(quitWithoutWaitingArg);
+    cmd.add(extraModelArg);
     cmd.parseArgs(args);
 
     modelFile = cmd.getModelFile();
+    extraModelFiles = extraModelArg.getValue();
     humanModelFile = cmd.getHumanModelFile();
     numAnalysisThreadsCmdlineSpecified = numAnalysisThreadsArg.isSet();
     numAnalysisThreadsCmdline = numAnalysisThreadsArg.getValue();
@@ -152,6 +164,9 @@ int MainCmds::analysis(const vector<string>& args) {
     cfg.contains("assumeMultipleStartingBlackMovesAreHandicap") ? cfg.getBool("assumeMultipleStartingBlackMovesAreHandicap") : true;
   const bool preventEncore = cfg.contains("preventCleanupPhase") ? cfg.getBool("preventCleanupPhase") : true;
 
+  //Every searchable model the process hosts, primary first. Without -extra-model this is exactly
+  //the one model the engine has always loaded, and nnEval below is that model, as before.
+  vector<NNEvaluator*> searchableEvals;
   NNEvaluator* nnEval = NULL;
   NNEvaluator* humanEval = NULL;
   {
@@ -166,6 +181,16 @@ int MainCmds::analysis(const vector<string>& args) {
       NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
       Setup::SETUP_FOR_ANALYSIS
     );
+    searchableEvals.push_back(nnEval);
+    for(const string& extraModelFile: extraModelFiles) {
+      searchableEvals.push_back(
+        Setup::initializeNNEvaluator(
+          extraModelFile,extraModelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
+          NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+          Setup::SETUP_FOR_ANALYSIS
+        )
+      );
+    }
     if(humanModelFile != "") {
       humanEval = Setup::initializeNNEvaluator(
         humanModelFile,humanModelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
@@ -182,9 +207,30 @@ int MainCmds::analysis(const vector<string>& args) {
     }
   }
 
+  //The name space of the loaded models, and the load-time refusal of a duplicate internal name.
+  //Built here, immediately after the last model is loaded and before anything can be served, so a
+  //name that cannot address exactly one model stops the process instead of reaching a request.
+  const AnalysisModelHosts modelHosts = [&]() {
+    vector<HostedModel> searchable;
+    for(size_t i = 0; i<searchableEvals.size(); i++) {
+      const string sourceLabel = (i == 0 ? "-model " : "-extra-model ") + searchableEvals[i]->getModelFileName();
+      searchable.push_back(
+        HostedModel{ModelAddress{searchableEvals[i]->getInternalModelName(), sourceLabel, ModelRole::Searchable}, searchableEvals[i]}
+      );
+    }
+    std::optional<HostedModel> companion;
+    if(humanEval != NULL) {
+      companion = HostedModel{
+        ModelAddress{humanEval->getInternalModelName(), "-human-model " + humanEval->getModelFileName(), ModelRole::HumanCompanion},
+        humanEval
+      };
+    }
+    return AnalysisModelHosts::create(std::move(searchable), std::move(companion));
+  }();
+
 #ifndef USE_EIGEN_BACKEND
-  {
-    int nnMaxBatchSizeTotal = nnEval->getNumGpus() * nnEval->getMaxBatchSize();
+  for(NNEvaluator* eval: searchableEvals) {
+    int nnMaxBatchSizeTotal = eval->getNumGpus() * eval->getMaxBatchSize();
     int numThreadsTotal = defaultParams.numThreads * numAnalysisThreads;
     if(nnMaxBatchSizeTotal * 1.5 <= numThreadsTotal) {
       logger.write(
@@ -217,6 +263,7 @@ int MainCmds::analysis(const vector<string>& args) {
   const std::set<std::string> expectedKeys = {
     "id",
     "action",
+    "model",
     "terminateId",
     "turnNumbers",
     "boardXSize",
@@ -341,15 +388,23 @@ int MainCmds::analysis(const vector<string>& args) {
     evalCache = std::make_shared<EvalCacheTable>(defaultParams.subtreeValueBiasTableNumShards);
   }
 
+  //One analysis thread owns one bot per hosted searchable model, indexed by model. Each bot binds
+  //its evaluator for its whole life (AsyncBot and Search take it at construction), so the model a
+  //request names is served by picking the bot already bound to it -- no evaluator is ever swapped
+  //under a live search. The thread runs one of its bots at a time, so hosting N models multiplies
+  //the idle bots, not the concurrent searches: the thread budget is unchanged.
   auto analysisLoop = [
-    &logger,&toAnalyzeQueue,&reportAnalysis,&reportNoAnalysis,&logSearchInfo,&nnEval,&openRequestsMutex,&openRequests
-  ](AsyncBot* bot, int threadIdx) {
+    &logger,&toAnalyzeQueue,&reportAnalysis,&reportNoAnalysis,&logSearchInfo,&modelHosts,&openRequestsMutex,&openRequests
+  ](vector<AsyncBot*>* botsByModel, int threadIdx) {
     while(true) {
       std::pair<std::pair<int64_t,int64_t>,AnalyzeRequest*> analysisItem;
       bool suc = toAnalyzeQueue.waitPop(analysisItem);
       if(!suc)
         break;
       AnalyzeRequest* request = analysisItem.second;
+      //The model was resolved when the request was parsed; this is where that resolution is spent.
+      testAssert(request->modelIdx < botsByModel->size());
+      AsyncBot* bot = (*botsByModel)[request->modelIdx];
       int expected = AnalyzeRequest::STATUS_IN_QUEUE;
       //If it's already terminated, then there's nothing for us to do
       if(!request->status.compare_exchange_strong(expected, AnalyzeRequest::STATUS_POPPED, std::memory_order_acq_rel)) {
@@ -393,7 +448,7 @@ int MainCmds::analysis(const vector<string>& args) {
 
         if(logSearchInfo) {
           ostringstream sout;
-          PlayUtils::printGenmoveLog(sout,bot->getSearch(),nnEval,Board::NULL_LOC,NAN,request->perspective,false);
+          PlayUtils::printGenmoveLog(sout,bot->getSearch(),modelHosts.searchableEval(request->modelIdx),Board::NULL_LOC,NAN,request->perspective,false);
           logger.write(sout.str());
         }
 
@@ -425,20 +480,24 @@ int MainCmds::analysis(const vector<string>& args) {
       delete request;
     }
   };
-  auto analysisLoopProtected = [&logger,&analysisLoop](AsyncBot* bot, int threadIdx) {
-    Logger::logThreadUncaught("analysis loop", &logger, [&](){ analysisLoop(bot, threadIdx); });
+  auto analysisLoopProtected = [&logger,&analysisLoop](vector<AsyncBot*>* botsByModel, int threadIdx) {
+    Logger::logThreadUncaught("analysis loop", &logger, [&](){ analysisLoop(botsByModel, threadIdx); });
   };
 
   vector<std::thread> threads;
   std::thread write_thread = std::thread(writeLoop);
-  vector<AsyncBot*> bots;
+  //bots[threadIdx][modelIdx]. Reserved up front so that the pointers handed to the threads below
+  //stay valid as later threads' pools are appended.
+  vector<vector<AsyncBot*>> bots(numAnalysisThreads);
   for(int threadIdx = 0; threadIdx<numAnalysisThreads; threadIdx++) {
-    string searchRandSeed = Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
-    AsyncBot* bot = new AsyncBot(defaultParams, nnEval, humanEval, &logger, searchRandSeed);
-    bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
-    bot->setExternalEvalCache(evalCache);
-    threads.emplace_back(analysisLoopProtected,bot,threadIdx);
-    bots.push_back(bot);
+    for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++) {
+      string searchRandSeed = Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
+      AsyncBot* bot = new AsyncBot(defaultParams, modelHosts.searchableEval(modelIdx), humanEval, &logger, searchRandSeed);
+      bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
+      bot->setExternalEvalCache(evalCache);
+      bots[threadIdx].push_back(bot);
+    }
+    threads.emplace_back(analysisLoopProtected,&bots[threadIdx],threadIdx);
   }
 
   logger.write("Analyzing up to " + Global::intToString(numAnalysisThreads) + " positions at a time in parallel");
@@ -466,8 +525,9 @@ int MainCmds::analysis(const vector<string>& args) {
       //We've already set the above status to terminated so when the thread terminates due to our killing it below, it will see this.
       //Or else the thread has already done so, in which case it's already properly written a result, also fine.
       int threadIdx = prevStatus;
-      //Terminate it by thread index
-      bots[threadIdx]->stopWithoutWait();
+      //Terminate it by thread index, and within that thread by the model the request resolved to:
+      //that is the one bot of that thread's pool the request can be running on.
+      bots[threadIdx][request->modelIdx]->stopWithoutWait();
     }
   };
 
@@ -506,21 +566,34 @@ int MainCmds::analysis(const vector<string>& args) {
       //Special actions
       if(input.find("action") != input.end() && input["action"].is_string()) {
         string action = input["action"].get<string>();
+        //"model" selects which model analyzes a QUERY. No action reads it, and an action that
+        //accepted it and then did the same thing regardless would be a field the receiver cannot
+        //honor -- so it is refused here rather than ignored, and refused for every action at once,
+        //which is the honest state until an action exists that means something by it.
+        if(input.find("model") != input.end()) {
+          reportErrorForId(rbase.id, "model", "The \"model\" field selects which model analyzes a query and is not supported on an action query");
+          continue;
+        }
         if(action == "query_version") {
           input["version"] = Version::getKataGoVersion();
           input["git_hash"] = Version::getGitRevision();
           pushToWrite(new string(input.dump()));
         }
         else if(action == "query_models") {
+          //Every hosted model, searchable ones first in the order they were configured, the human
+          //companion last -- so with one model and no -human-model this is the same one entry it
+          //has always been, and the "internalName" a client reads here is exactly the name the
+          //"model" field of a request takes.
           input["models"] = json::array();
-          if(nnEval != NULL) {
+          for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++) {
+            NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
             json modelInfo;
-            modelInfo["name"] = nnEval->getModelName();
-            modelInfo["internalName"] = nnEval->getInternalModelName();
-            modelInfo["maxBatchSize"] = nnEval->getMaxBatchSize();
-            modelInfo["usesHumanSLProfile"] = nnEval->requiresSGFMetadata();
-            modelInfo["version"] = nnEval->getModelVersion();
-            modelInfo["usingFP16"] = nnEval->getUsingFP16Mode().toString();
+            modelInfo["name"] = eval->getModelName();
+            modelInfo["internalName"] = eval->getInternalModelName();
+            modelInfo["maxBatchSize"] = eval->getMaxBatchSize();
+            modelInfo["usesHumanSLProfile"] = eval->requiresSGFMetadata();
+            modelInfo["version"] = eval->getModelVersion();
+            modelInfo["usingFP16"] = eval->getUsingFP16Mode().toString();
             input["models"].push_back(modelInfo);
           }
           if(humanEval != NULL) {
@@ -537,7 +610,11 @@ int MainCmds::analysis(const vector<string>& args) {
         }
         else if(action == "clear_cache") {
           //This should be thread-safe.
-          nnEval->clearCache();
+          //Every hosted model's cache: the action has always meant "drop everything cached", and a
+          //model whose cache it silently skipped would keep serving entries the client asked to be
+          //rid of. With one model this is the one clearCache it has always been.
+          for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++)
+            modelHosts.searchableEval(modelIdx)->clearCache();
           if(humanEval != NULL)
             humanEval->clearCache();
           if(evalCache != nullptr)
@@ -630,6 +707,28 @@ int MainCmds::analysis(const vector<string>& args) {
       rbase.priority = 0;
       rbase.avoidMoveUntilByLocBlack.clear();
       rbase.avoidMoveUntilByLocWhite.clear();
+      //A request that names no model is served by the primary model, which without -extra-model is
+      //the only model there is: the no-model path is the engine's prior behaviour, untouched.
+      rbase.modelIdx = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+
+      //The optional "model" field. An unrecognized key elsewhere in a request is only WARNED about,
+      //and that warning is switchable off with warnUnusedFields -- a disposition this field cannot
+      //borrow. A "model" the engine cannot honor is refused here as an error and the request is not
+      //analyzed at all, because the alternative is analyzing with a net the client did not ask for,
+      //which is precisely the outcome the field exists to prevent, and which the response carries
+      //no evidence of.
+      if(input.find("model") != input.end()) {
+        if(!input["model"].is_string()) {
+          reportErrorForId(rbase.id, "model", "Must be a string, the \"internalName\" of a loaded model as the query_models action reports it");
+          continue;
+        }
+        const ModelResolution resolution = modelHosts.resolve(input["model"].get<string>());
+        if(!resolution.searchableIdx().has_value()) {
+          reportErrorForId(rbase.id, "model", resolution.refusal().value());
+          continue;
+        }
+        rbase.modelIdx = resolution.searchableIdx().value();
+      }
 
       auto parseInteger = [&rbase,&reportErrorForId](const json& dict, const char* field, int64_t& buf, int64_t min, int64_t max, const char* errorMessage) {
         try {
@@ -1148,8 +1247,14 @@ int MainCmds::analysis(const vector<string>& args) {
           initialPlayer = BoardHistory::numHandicapStonesOnBoard(board) > 0 ? P_WHITE : P_BLACK;
       }
 
+      //Everything below that asks the net a question asks the net this request resolved to, not the
+      //primary one: rule support and history modes are properties of the model that will actually
+      //run the search, and answering them from a different model is the wrong-net service in a
+      //quieter register.
+      NNEvaluator* requestEval = modelHosts.searchableEval(rbase.modelIdx);
+
       bool rulesWereSupported;
-      Rules supportedRules = nnEval->getSupportedRules(rules,rulesWereSupported);
+      Rules supportedRules = requestEval->getSupportedRules(rules,rulesWereSupported);
       if(!rulesWereSupported) {
         ostringstream out;
         out << "Rules " << rules << " not supported by neural net, using " << supportedRules << " instead";
@@ -1161,7 +1266,7 @@ int MainCmds::analysis(const vector<string>& args) {
       //Keep this request's history consistent with the BoardHistoryModes that the search
       //for this request will resolve to. (The search would re-stamp its own copy anyway, but this keeps
       //any adjudication done during request setup/replay consistent with them.)
-      BoardHistory hist(board,nextPla,rules,0,Search::resolveHistoryModes(rbase.params, nnEval));
+      BoardHistory hist(board,nextPla,rules,0,Search::resolveHistoryModes(rbase.params, requestEval));
       hist.setAssumeMultipleStartingBlackMovesAreHandicap(assumeMultipleStartingBlackMovesAreHandicap);
 
       if(warnUnusedFields) {
@@ -1187,6 +1292,7 @@ int MainCmds::analysis(const vector<string>& args) {
           newRequest->internalId = internalIdCounter++;
           newRequest->id = rbase.id;
           newRequest->turnNumber = turnNumber;
+          newRequest->modelIdx = rbase.modelIdx;
           newRequest->board = board;
           newRequest->hist = hist;
           newRequest->nextPla = nextPla;
@@ -1266,10 +1372,12 @@ int MainCmds::analysis(const vector<string>& args) {
     //Making this readOnly should signal the analysis loop threads to terminate once they have nothing left.
     toAnalyzeQueue.setReadOnly();
     //Interrupt any searches going on to help the analysis threads realize to terminate faster.
-    for(int i = 0; i<bots.size(); i++)
-      bots[i]->stopWithoutWait();
-    for(int i = 0; i<bots.size(); i++)
-      bots[i]->setKilled();
+    for(size_t i = 0; i<bots.size(); i++)
+      for(AsyncBot* bot: bots[i])
+        bot->stopWithoutWait();
+    for(size_t i = 0; i<bots.size(); i++)
+      for(AsyncBot* bot: bots[i])
+        bot->setKilled();
     for(int i = 0; i<threads.size(); i++)
       threads[i].join();
     write_thread.join();
@@ -1285,20 +1393,26 @@ int MainCmds::analysis(const vector<string>& args) {
     write_thread.join();
   }
 
-  for(int i = 0; i<bots.size(); i++)
-    delete bots[i];
+  for(size_t i = 0; i<bots.size(); i++)
+    for(AsyncBot* bot: bots[i])
+      delete bot;
 
-  logger.write(nnEval->getModelFileName());
-  logger.write("NN rows: " + Global::int64ToString(nnEval->numRowsProcessed()));
-  logger.write("NN batches: " + Global::int64ToString(nnEval->numBatchesProcessed()));
-  logger.write("NN avg batch size: " + Global::doubleToString(nnEval->averageProcessedBatchSize()));
+  //Per hosted model, so a session that ran two nets can be read for how much work each one did.
+  for(size_t modelIdx = 0; modelIdx<modelHosts.numSearchable(); modelIdx++) {
+    NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
+    logger.write(eval->getModelFileName());
+    logger.write("NN rows: " + Global::int64ToString(eval->numRowsProcessed()));
+    logger.write("NN batches: " + Global::int64ToString(eval->numBatchesProcessed()));
+    logger.write("NN avg batch size: " + Global::doubleToString(eval->averageProcessedBatchSize()));
+  }
   if(humanEval != NULL) {
     logger.write(humanEval->getModelFileName());
     logger.write("NN rows: " + Global::int64ToString(humanEval->numRowsProcessed()));
     logger.write("NN batches: " + Global::int64ToString(humanEval->numBatchesProcessed()));
     logger.write("NN avg batch size: " + Global::doubleToString(humanEval->averageProcessedBatchSize()));
   }
-  delete nnEval;
+  for(NNEvaluator* eval: searchableEvals)
+    delete eval;
   delete humanEval;
   NeuralNet::globalCleanup();
   ScoreValue::freeTables();

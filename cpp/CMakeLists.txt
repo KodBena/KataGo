@@ -1028,6 +1028,7 @@ add_executable(katago
   tests/testnncachefrozen.cpp
   tests/testnncachefrozenbench.cpp
   tests/testnncachecountlog.cpp
+  tests/testanalysismodels.cpp
   tests/testnncachecountlogbench.cpp
   tests/testnncachebench.cpp
   tests/testnnevalcanary.cpp
@@ -1057,6 +1058,7 @@ add_executable(katago
   distributed/client.cpp
   command/commandline.cpp
   command/analysis.cpp
+  command/analysismodels.cpp
   command/benchmark.cpp
   command/benchnncachepolicy.cpp
   command/chdvectordriver.cpp
