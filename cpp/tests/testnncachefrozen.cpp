@@ -105,6 +105,56 @@ uint32_t hitsForKeyIn(const NNCacheHitLedger& ledger, Hash128 key) {
   return total;
 }
 
+// THE EVALUATION TRIPWIRE, and why the test below is built around one rather than around
+// an inspection of the answer it got.
+//
+// The claim under test is a NEGATIVE one -- "serving this query performed no neural net
+// evaluation" -- and absence cannot be watched. So the probe is planted at the exact site
+// an evaluation would occur, and its FIRING is the observation (ADR-0021 Rule 2). A test
+// that instead inspected the returned NNOutput for an ownership map would pass just as
+// happily if the engine had recomputed the position from scratch, which is precisely the
+// failure being tested for.
+//
+// A count of zero means nothing on its own -- a probe that can never fire is silent for
+// the wrong reason. The complementary case in the same test drives the tripwire to fire
+// exactly once, which is what makes the zero above evidence rather than an accident
+// (ADR-0021 Rule 4: both polarities, each for the right reason).
+struct EvaluationTripwire {
+  int fired;
+  EvaluationTripwire() : fired(0) {}
+  shared_ptr<NNOutput> evaluate(Hash128 key) {
+    fired += 1;
+    // A real evaluation asked for with includeOwnerMap always comes back carrying one.
+    return outputFor(key, true);
+  }
+};
+
+// The cache stanza of NNEvaluator::evaluate -- nneval.cpp:924-936 for the get and the
+// ownership-map fall-through, nneval.cpp:1282-1283 for the set -- driven against a table
+// here, and returning the evaluation the caller would receive.
+//
+// This is a RESTATEMENT of that control flow, not an observation of it: runtests builds no
+// NNEvaluator and loads no model, so the engine's own copy of this predicate cannot be
+// executed from here. The predicate is two terms and is transcribed verbatim; a future
+// change to nneval.cpp's shape would not be caught by this test, and that limit is stated
+// rather than papered over (ADR-0021 Rule 1).
+shared_ptr<NNOutput> evaluateLikeNNEvaluator(
+  NNCacheTable& table, Hash128 key, bool includeOwnerMap, EvaluationTripwire& tripwire
+) {
+  shared_ptr<NNOutput> result;
+  if(table.get(key, result)) {
+    // nneval.cpp:925 -- a hit that satisfies the request RETURNS, and nothing below runs.
+    if(!(includeOwnerMap && result->whiteOwnerMap == NULL))
+      return result;
+    // A hit that lacks a requested ownership map does not return: nneval stashes it,
+    // clears the buffer, and falls through to a real evaluation.
+    result = nullptr;
+  }
+  const shared_ptr<NNOutput> fresh = tripwire.evaluate(key);
+  table.set(fresh);
+  return fresh;
+}
+
 //-------------------------------------------------------------------------------------
 // The index: resolution, and the absent-key contract
 //-------------------------------------------------------------------------------------
@@ -323,6 +373,90 @@ void testOwnerMapFallThroughUpholdsTheOneOwnerInvariant() {
   testAssert(after->whiteOwnerMap != NULL);
 }
 
+// THE DIRECTION LEVEL 0'S SURVIVAL DEPENDS ON, asserted here beside its complement so the
+// two read as one contract rather than as one half of one.
+//
+// A level-0 entry may carry an ownership map -- nothing in the frozen path is
+// ownermap-aware, so build() stores whatever NNOutput it is handed. What was never
+// asserted is that such an entry SATISFIES an ownership-requesting query, i.e. that the
+// query is answered from level 0 and stops there. That matters because ownership is on for
+// essentially every analysis query (analysis.cpp turns alwaysIncludeOwnerMap on from any
+// of four request flags, and searchnnhelpers.cpp applies it to every node, not just the
+// root). If an ownermap-bearing level-0 entry did NOT satisfy such a query, every one of
+// them would shadow, and level 0 would bleed out entirely under an ordinary workload while
+// still appearing to work.
+//
+// WHAT IS OBSERVED, per leg:
+//  * the evaluation tripwire's count, exactly -- zero on the satisfying leg, one on the
+//    falling-through leg. Not a tolerance: whether an evaluation ran is a logic invariant
+//    (ADR-0009, Calibration), and the second leg is what proves the probe of the first can
+//    fire at all.
+//  * level-0 residency, through contains()/isShadowedAt(), which the frozen cache already
+//    exposes -- no accessor was added to see this.
+//  * POINTER IDENTITY of the served evaluation against level 0's own payload, so "the
+//    caller got level 0's entry" is observed rather than inferred from the entry merely
+//    looking right.
+void testLevelZeroServesAnOwnershipQueryFromAnOwnerMapBearingEntry() {
+  const Hash128 withOwnerMap = nthKey(0);
+  const Hash128 withoutOwnerMap = nthKey(1);
+  vector<unique_ptr<NNOutput>> zeroOutputs;
+  zeroOutputs.push_back(ownedOutputFor(withOwnerMap, true));     // entry 0
+  zeroOutputs.push_back(ownedOutputFor(withoutOwnerMap, false)); // entry 1
+  unique_ptr<NNCacheFrozen> frozenOwned = NNCacheFrozen::build(std::move(zeroOutputs));
+  NNCacheFrozen* frozen = frozenOwned.get();
+  // Level 0 owns these for the table's whole lifetime, so the raw pointers stay valid and
+  // an identity comparison against them is meaningful.
+  const NNOutput* levelZeroEntry0 = frozen->evaluationAt(0).get();
+  const NNOutput* levelZeroEntry1 = frozen->evaluationAt(1).get();
+  testAssert(levelZeroEntry0->whiteOwnerMap != NULL);
+  testAssert(levelZeroEntry1->whiteOwnerMap == NULL);
+  unique_ptr<NNCacheTable> table =
+    makeTwoLevelNNCacheTable(std::move(frozenOwned), defaultLevelOne(8), 8);
+
+  EvaluationTripwire tripwire;
+
+  // LEG ONE: ownership requested, level 0 holds an entry that carries one. The query must
+  // be satisfied where it lands.
+  const int firedBeforeSatisfied = tripwire.fired;
+  const shared_ptr<NNOutput> served =
+    evaluateLikeNNEvaluator(*table, withOwnerMap, true, tripwire);
+  // No evaluation happened. Exact, no tolerance.
+  testAssert(tripwire.fired == firedBeforeSatisfied);
+  // The entry was not shadowed: it is still level 0's, and level 0 did not bleed.
+  testAssert(frozen->contains(withOwnerMap));
+  testAssert(!frozen->isShadowedAt(0));
+  // And what came back is LEVEL 0'S OWN evaluation, ownership map intact.
+  testAssert(served.get() == levelZeroEntry0);
+  testAssert(served->whiteOwnerMap != NULL);
+  testAssert(frozen->hitCountAt(0) == 1);
+
+  // LEG TWO, the complement -- and the proof that the tripwire above can fire. Ownership
+  // requested, level 0's entry lacks one: the query must fall through, evaluate, and
+  // shadow.
+  const int firedBeforeFallThrough = tripwire.fired;
+  const shared_ptr<NNOutput> upgraded =
+    evaluateLikeNNEvaluator(*table, withoutOwnerMap, true, tripwire);
+  // Exactly one evaluation, at the site. Exact, no tolerance.
+  testAssert(tripwire.fired == firedBeforeFallThrough + 1);
+  // Ownership of the key moved to level 1.
+  testAssert(!frozen->contains(withoutOwnerMap));
+  testAssert(frozen->isShadowedAt(1));
+  // What came back is the freshly evaluated entry, NOT level 0's.
+  testAssert(upgraded.get() != levelZeroEntry1);
+  testAssert(upgraded->whiteOwnerMap != NULL);
+
+  // The ownermap-bearing entry is untouched by its neighbour's departure, and a second
+  // ownership query is still served from level 0 with no evaluation.
+  const int firedBeforeSecond = tripwire.fired;
+  const shared_ptr<NNOutput> servedAgain =
+    evaluateLikeNNEvaluator(*table, withOwnerMap, true, tripwire);
+  testAssert(tripwire.fired == firedBeforeSecond);
+  testAssert(servedAgain.get() == levelZeroEntry0);
+  testAssert(frozen->contains(withOwnerMap));
+  testAssert(!frozen->isShadowedAt(0));
+  testAssert(frozen->hitCountAt(0) == 2);
+}
+
 // The count follows the key across the transfer, so the unified surface still shows one
 // row per key carrying the session's whole total.
 void testHitCountsSurviveTheTransferBetweenLevels() {
@@ -446,6 +580,7 @@ void Tests::runNNCacheFrozenTests() {
   testLevelZeroAnswersFirstAndLevelOneCatchesTheRest();
   testSkipCachePathUpholdsTheOneOwnerInvariant();
   testOwnerMapFallThroughUpholdsTheOneOwnerInvariant();
+  testLevelZeroServesAnOwnershipQueryFromAnOwnerMapBearingEntry();
   testHitCountsSurviveTheTransferBetweenLevels();
   testASingleLevelTableReportsNotCountedRatherThanEmpty();
   testTwoLevelStatsSumBothLevels();
