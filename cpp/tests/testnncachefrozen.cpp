@@ -3,6 +3,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -387,6 +388,41 @@ void testFrozenFootprintIsUnderTheBudget() {
   cout << "two-level hit ledger: " << twoLevelHitLedgerBytes(20) << " B at 2^20 rows" << endl;
 }
 
+// stats() must report BOTH levels, so an operator reading it sees the whole cost rather
+// than level 1's share of it -- and a shadowed entry's evaluation, which is real memory the
+// table holds and can no longer hand out, must move from the resident payload to the fixed
+// structure rather than simply vanishing from the accounting.
+void testTwoLevelStatsSumBothLevels() {
+  const Hash128 a = nthKey(0);
+  const Hash128 b = nthKey(1);
+  unique_ptr<NNCacheFrozen> frozenOwned = NNCacheFrozen::build(outputsFor({a, b}));
+  NNCacheFrozen* frozen = frozenOwned.get();
+  const int64_t levelZeroStructure = (int64_t)frozen->structureBytes();
+  const int64_t levelZeroPayload = frozen->reachablePayloadBytes();
+
+  unique_ptr<NNCacheTable> levelOneAlone = defaultLevelOne(8);
+  const NNCacheStats bare = levelOneAlone->stats();
+  levelOneAlone.reset();
+
+  unique_ptr<NNCacheTable> table =
+    makeTwoLevelNNCacheTable(std::move(frozenOwned), defaultLevelOne(8), 8);
+  const NNCacheStats both = table->stats();
+  testAssert(both.residentEntries == bare.residentEntries + 2);
+  testAssert(both.residentPayloadBytes == bare.residentPayloadBytes + levelZeroPayload);
+  testAssert(both.fixedStructureBytes ==
+             bare.fixedStructureBytes + levelZeroStructure + (int64_t)twoLevelHitLedgerBytes(8) +
+             ((int64_t)(((size_t)1) << 8) * (int64_t)sizeof(std::mutex)));
+  testAssert(both.capacitySlots == bare.capacitySlots + 2);
+
+  // Shadow one entry. It leaves the resident count and the resident payload, and its
+  // evaluation's bytes reappear as fixed structure the table can no longer hand out.
+  table->set(outputFor(a, false));
+  const NNCacheStats after = table->stats();
+  testAssert(after.residentEntries == both.residentEntries);  // one left level 0, one entered level 1
+  testAssert(frozen->shadowedPayloadBytes() > 0);
+  testAssert(after.fixedStructureBytes == both.fixedStructureBytes + frozen->shadowedPayloadBytes());
+}
+
 }  // namespace
 
 void Tests::runNNCacheFrozenTests() {
@@ -401,6 +437,7 @@ void Tests::runNNCacheFrozenTests() {
   testOwnerMapFallThroughUpholdsTheOneOwnerInvariant();
   testHitCountsSurviveTheTransferBetweenLevels();
   testASingleLevelTableReportsNotCountedRatherThanEmpty();
+  testTwoLevelStatsSumBothLevels();
   testFrozenFootprintIsUnderTheBudget();
   cout << "Done" << endl;
 }
