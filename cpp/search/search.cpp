@@ -9,6 +9,7 @@
 #include <numeric>
 
 #include "../core/fancymath.h"
+#include "../core/sha2.h"
 #include "../core/test.h"
 #include "../core/timer.h"
 #include "../game/graphhash.h"
@@ -316,6 +317,24 @@ void Search::setExternalEvalCache(const std::shared_ptr<EvalCacheTable>& cache) 
     return;
   clearSearch();
   evalCache = cache;
+}
+
+Hash128 Search::getEvalCacheModelHash(
+  const string& modelInternalName,
+  const std::optional<string>& humanModelInternalName
+) {
+  //Length-prefixed composition, so that no two distinct pairs of names can produce the same string, and so that
+  //an absent human model is distinct from a present one whatever that one is named.
+  //Hashed with the same idiom as SearchParams::getHash, whose value this one sits beside in the eval cache key.
+  string dumped = Global::uint64ToString((uint64_t)modelInternalName.size()) + ":" + modelInternalName;
+  if(humanModelInternalName.has_value())
+    dumped += "+" + Global::uint64ToString((uint64_t)humanModelInternalName->size()) + ":" + *humanModelInternalName;
+  else
+    dumped += "-";
+
+  uint64_t hash[4];
+  SHA2::get256(dumped.c_str(), hash);
+  return Hash128(hash[0], hash[1]);
 }
 
 void Search::setNNEval(NNEvaluator* nnEval) {
@@ -760,12 +779,20 @@ void Search::beginSearch(bool pondering) {
   else
     rootGraphHash = Hash128();
 
-  //Precompute the params hash once per search (params are constant during a search) so it can be cheaply
-  //folded into every eval cache lookup, keeping cached search results from leaking across different params.
-  if(searchParams.useEvalCache && searchParams.useGraphSearch)
+  //Precompute the params hash and the model hash once per search (both are constant during a search, since
+  //setParams and setNNEval clear the search) so they can be cheaply folded into every eval cache lookup,
+  //keeping cached search results from leaking across different params or across different models.
+  if(searchParams.useEvalCache && searchParams.useGraphSearch) {
     evalCacheParamsHash = searchParams.getHash();
-  else
+    evalCacheModelHash = getEvalCacheModelHash(
+      nnEvaluator->getInternalModelName(),
+      humanEvaluator != NULL ? std::optional<string>(humanEvaluator->getInternalModelName()) : std::nullopt
+    );
+  }
+  else {
     evalCacheParamsHash = Hash128();
+    evalCacheModelHash = Hash128();
+  }
 
   if(rootNode == NULL) {
     //Avoid storing the root node in the nodeTable, guarantee that it never is part of a cycle, allocate it directly.

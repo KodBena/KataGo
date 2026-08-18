@@ -2582,8 +2582,10 @@ x.x.x
     search->runWholeSearch(nextPla);
     testAssert(search->evalCache != nullptr);
     const Hash128 rootGraphHash = search->rootGraphHash;
-    const Hash128 keyA = rootGraphHash ^ paramsA.getHash();
-    const Hash128 keyB = rootGraphHash ^ paramsB.getHash();
+    //Compose keys through the key's own single home rather than restating its formula here.
+    const Hash128 modelHash = search->evalCacheModelHash;
+    const Hash128 keyA = Search::getEvalCacheKey(rootGraphHash, paramsA.getHash(), modelHash);
+    const Hash128 keyB = Search::getEvalCacheKey(rootGraphHash, paramsB.getHash(), modelHash);
     std::shared_ptr<EvalCacheEntry> entryA = search->evalCache->find(keyA);
     testAssert(entryA != nullptr);
     testAssert(search->evalCache->find(keyB) == nullptr);
@@ -2608,13 +2610,124 @@ x.x.x
     search->setPosition(nextPla,board,hist);
     search->runWholeSearch(nextPla);
     testAssert(search->rootGraphHash == rootGraphHash);
-    const Hash128 keyA2 = rootGraphHash ^ paramsA2.getHash();
+    const Hash128 keyA2 = Search::getEvalCacheKey(rootGraphHash, paramsA2.getHash(), modelHash);
     testAssert(keyA2 == keyA);
     testAssert(search->evalCache->find(keyA2) != nullptr);
     cout << "After search A2 (identical to A): reuses A's slot: "
          << (keyA2 == keyA && search->evalCache->find(keyA2) != nullptr) << endl;
 
     delete search;
+    delete nnEval;
+    cout << endl;
+  }
+
+  {
+    cout << "===================================================================" << endl;
+    cout << "Eval cache keys depend on the models" << endl;
+    cout << "===================================================================" << endl;
+
+    //Two evaluators of distinct identity, and one eval cache table shared between searches that bind
+    //different sets of them - the shape the analysis engine builds, where one table serves every bot.
+    NNEvaluator* nnEval = startNNEval(modelFile,logger,"evalcachemodel",7,7,0,true,false,false,true,false);
+    NNEvaluator* humanEval = startNNEval(modelFile,logger,"evalcachemodelhuman",7,7,0,true,false,false,true,false);
+
+    SearchParams params = SearchParams::forTestsV2(); //useGraphSearch = true
+    params.useEvalCache = true;
+    params.evalCacheMinVisits = 5;
+    params.maxVisits = 60;
+
+    std::shared_ptr<EvalCacheTable> sharedEvalCache =
+      std::make_shared<EvalCacheTable>(params.subtreeValueBiasTableNumShards);
+
+    Search* searchOneModel = new Search(params, nnEval, &logger, "evalcachemodelseed");
+    Search* searchTwoModels = new Search(params, nnEval, humanEval, &logger, "evalcachemodelseed");
+    searchOneModel->setExternalEvalCache(sharedEvalCache);
+    searchTwoModels->setExternalEvalCache(sharedEvalCache);
+
+    Rules rules = Rules::parseRules("chinese");
+    Board board = Board::parseBoard(7,7,R"%%(
+.......
+..x.o..
+.......
+..o.x..
+.......
+.......
+.......
+)%%");
+    Player nextPla = P_BLACK;
+    BoardHistory hist(board,nextPla,rules,0,BoardHistoryModes(false,false));
+
+    // Search 1: one model.
+    searchOneModel->setPosition(nextPla,board,hist);
+    searchOneModel->runWholeSearch(nextPla);
+    const Hash128 rootGraphHash = searchOneModel->rootGraphHash;
+    const Hash128 keyOneModel = Search::getEvalCacheKey(
+      rootGraphHash, searchOneModel->evalCacheParamsHash, searchOneModel->evalCacheModelHash);
+    std::shared_ptr<EvalCacheEntry> entryOneModel = sharedEvalCache->find(keyOneModel);
+    testAssert(entryOneModel != nullptr);
+    //The model term is live, and it is what makes this key differ from the position-and-params-only one.
+    testAssert(searchOneModel->evalCacheModelHash != Hash128());
+    testAssert(sharedEvalCache->find(rootGraphHash ^ searchOneModel->evalCacheParamsHash) == nullptr);
+    cout << "After search with one model: its own slot populated, the modelless slot empty: "
+         << (entryOneModel != nullptr
+             && sharedEvalCache->find(rootGraphHash ^ searchOneModel->evalCacheParamsHash) == nullptr) << endl;
+
+    // Search 2: same position, same params, a different set of models.
+    searchTwoModels->setPosition(nextPla,board,hist);
+    searchTwoModels->runWholeSearch(nextPla);
+    testAssert(searchTwoModels->rootGraphHash == rootGraphHash);
+    testAssert(searchTwoModels->evalCacheParamsHash == searchOneModel->evalCacheParamsHash);
+    testAssert(searchTwoModels->evalCacheModelHash != searchOneModel->evalCacheModelHash);
+    const Hash128 keyTwoModels = Search::getEvalCacheKey(
+      rootGraphHash, searchTwoModels->evalCacheParamsHash, searchTwoModels->evalCacheModelHash);
+    testAssert(keyTwoModels != keyOneModel);
+    testAssert(sharedEvalCache->find(keyTwoModels) != nullptr);
+    testAssert(sharedEvalCache->find(keyTwoModels) != entryOneModel);
+    cout << "After search with a second model: distinct key, distinct entry, same position and params: "
+         << (keyTwoModels != keyOneModel
+             && sharedEvalCache->find(keyTwoModels) != nullptr
+             && sharedEvalCache->find(keyTwoModels) != entryOneModel) << endl;
+
+    //Partitioning, not invalidation: the other models' entry is untouched and still served.
+    testAssert(sharedEvalCache->find(keyOneModel) == entryOneModel);
+    cout << "The first model's entry survives the second model's search: "
+         << (sharedEvalCache->find(keyOneModel) == entryOneModel) << endl;
+
+    //The key composition itself, over model identities the model-free test suite cannot instantiate as
+    //evaluators: distinct internal model names give distinct keys for the same position and same params.
+    const Hash128 paramsHash = searchOneModel->evalCacheParamsHash;
+    const Hash128 modelHashOne = Search::getEvalCacheModelHash("modelOne", std::nullopt);
+    const Hash128 modelHashTwo = Search::getEvalCacheModelHash("modelTwo", std::nullopt);
+    const Hash128 modelHashOneAgain = Search::getEvalCacheModelHash("modelOne", std::nullopt);
+    testAssert(Search::getEvalCacheKey(rootGraphHash, paramsHash, modelHashOne)
+               != Search::getEvalCacheKey(rootGraphHash, paramsHash, modelHashTwo));
+    testAssert(Search::getEvalCacheKey(rootGraphHash, paramsHash, modelHashOne)
+               == Search::getEvalCacheKey(rootGraphHash, paramsHash, modelHashOneAgain));
+    cout << "Distinct model names give distinct keys, equal model names give equal keys: "
+         << (Search::getEvalCacheKey(rootGraphHash, paramsHash, modelHashOne)
+             != Search::getEvalCacheKey(rootGraphHash, paramsHash, modelHashTwo)
+             && Search::getEvalCacheKey(rootGraphHash, paramsHash, modelHashOne)
+             == Search::getEvalCacheKey(rootGraphHash, paramsHash, modelHashOneAgain)) << endl;
+
+    //A human model is part of the identity, an absent one is distinct from any present one, and no two
+    //distinct pairs of names collide.
+    testAssert(Search::getEvalCacheModelHash("model", std::optional<string>("human"))
+               != Search::getEvalCacheModelHash("model", std::nullopt));
+    testAssert(Search::getEvalCacheModelHash("model", std::optional<string>(""))
+               != Search::getEvalCacheModelHash("model", std::nullopt));
+    testAssert(Search::getEvalCacheModelHash("ab", std::optional<string>("c"))
+               != Search::getEvalCacheModelHash("a", std::optional<string>("bc")));
+    cout << "Human model identity participates, absence is distinct from presence, name pairs do not collide: "
+         << (Search::getEvalCacheModelHash("model", std::optional<string>("human"))
+             != Search::getEvalCacheModelHash("model", std::nullopt)
+             && Search::getEvalCacheModelHash("model", std::optional<string>(""))
+             != Search::getEvalCacheModelHash("model", std::nullopt)
+             && Search::getEvalCacheModelHash("ab", std::optional<string>("c"))
+             != Search::getEvalCacheModelHash("a", std::optional<string>("bc"))) << endl;
+
+    delete searchTwoModels;
+    delete searchOneModel;
+    delete humanEval;
     delete nnEval;
     cout << endl;
   }
