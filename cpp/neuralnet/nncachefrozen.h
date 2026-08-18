@@ -78,9 +78,32 @@ class NNCacheFrozenIndex {
   // a scan (SPEC.md 2.4).
   [[nodiscard]] std::optional<uint32_t> find(Hash128 key) const;
 
-  uint32_t numEntries() const { return (uint32_t)keys_.size(); }
+  uint32_t numEntries() const { return (uint32_t)records_.size(); }
   // Entry i's key. Entries are enumerable in index order 0..n-1 through this (SPEC.md 3.4).
-  Hash128 keyAt(uint32_t i) const { return keys_[i]; }
+  Hash128 keyAt(uint32_t i) const { return records_[i].key; }
+
+  // Entry i's auxiliary 32-bit state word, which this class stores and does NOT interpret.
+  //
+  // It lives here, in the SAME record as the key, for a measured reason rather than a
+  // tidiness one: whoever owns an entry's mutable state has to touch it on every
+  // retrieval, and an atomic read-modify-write on a line that is not already resident
+  // costs a full miss AND exclusive ownership, so it does not overlap the way a plain load
+  // does. With the state word in a separate array, a retrieval at n = 262,144 measured
+  // 113.1 ns against 39.6 ns for the same resolution without it -- the retrieval half
+  // alone cost more than the whole lookup the performance floor allows. Placed beside the
+  // key, the increment lands on the line the key comparison just brought in.
+  //
+  // Non-const on a const index because the word is logically mutable state about an entry,
+  // not part of the frozen mapping: nothing this class does depends on its value.
+  std::atomic<uint32_t>& stateAt(uint32_t i) const { return records_[i].state; }
+
+  // Entry i's caller-owned payload pointer, stored here for the same measured reason as
+  // the state word: with it in a separate array a retrieval fetched a THIRD cache line and
+  // cost 99.6 ns at n = 291,129 against 38.2 for the same resolution without it. In the
+  // record, key, state and payload arrive together in one 32-byte record, two to a cache
+  // line. This class never dereferences it and does not own it.
+  NNOutput* payloadAt(uint32_t i) const { return records_[i].payload; }
+  void setPayloadAt(uint32_t i, NNOutput* payload) { records_[i].payload = payload; }
 
   // Every byte this index holds resident, including the key array -- not just the
   // displacement machinery. SPEC.md 6 warns specifically about a self-reported footprint
@@ -98,7 +121,20 @@ class NNCacheFrozenIndex {
  private:
   NNCacheFrozenIndex();
 
-  std::vector<Hash128> keys_;      // entry order: keys_[i] is entry i's key
+  // One record per entry, in entry order: 16 bytes of key, a 4-byte caller state word, 4
+  // reserved, and an 8-byte caller payload pointer. 32 bytes, two to a cache line, so a
+  // resolved lookup gets the key it must compare, the counter it must bump and the payload
+  // it must hand back in ONE access rather than three. That layout is the whole difference
+  // between meeting and missing SPEC.md 8's floor; see stateAt and payloadAt.
+  struct Record {
+    Hash128 key;
+    mutable std::atomic<uint32_t> state;
+    uint32_t reserved;
+    NNOutput* payload;
+    Record() : key(), state(0), reserved(0), payload(nullptr) {}
+  };
+
+  std::vector<Record> records_;    // entry order: records_[i] is entry i
   std::vector<uint32_t> posTable_; // slot -> entry index, or EMPTY_SLOT
   std::vector<uint16_t> disp_;     // bucket -> the displacement its keys are placed under
   uint32_t numBuckets_;
@@ -141,7 +177,7 @@ class NNCacheFrozen {
   //
   // Throws StringError, yielding no structure, for everything NNCacheFrozenIndex::build
   // refuses and additionally for a null evaluation, which carries no key to index by.
-  static std::unique_ptr<NNCacheFrozen> build(std::vector<std::shared_ptr<NNOutput>> evaluations);
+  static std::unique_ptr<NNCacheFrozen> build(std::vector<std::unique_ptr<NNOutput>> evaluations);
 
   NNCacheFrozen(const NNCacheFrozen& other) = delete;
   NNCacheFrozen& operator=(const NNCacheFrozen& other) = delete;
@@ -193,7 +229,7 @@ class NNCacheFrozen {
   int64_t numReachableEntries() const;
 
  private:
-  NNCacheFrozen(NNCacheFrozenIndex&& index, std::vector<std::shared_ptr<NNOutput>>&& evaluations);
+  NNCacheFrozen(NNCacheFrozenIndex&& index, std::vector<std::unique_ptr<NNOutput>>&& evaluations);
 
   static const uint32_t SHADOW_BIT = 0x80000000u;
   static const uint32_t COUNT_MASK = 0x7FFFFFFFu;
@@ -202,14 +238,33 @@ class NNCacheFrozen {
   // The caller's evaluation vector, MOVED in rather than copied -- so no moment of
   // construction holds two sets of handles, and SPEC.md 6's transient-peak ceiling is met
   // with the same margin as its resident one.
-  std::vector<std::shared_ptr<NNOutput>> evaluations_;
-  // One entry's mutable state, kept separate from the handles for the reason above. The
-  // count and the shadow flag share a single 32-bit word so that shadowing and reading out
-  // the accrued count are ONE atomic exchange: a count cannot be transferred twice and
-  // cannot be split across the transfer. The top bit is the shadow flag and the low 31 bits
-  // are the count, which is ample -- the largest lifetime reference count in the operator's
-  // whole database is 11,997 (SPEC.md 3.2).
-  std::vector<std::atomic<uint32_t>> states_;
+  //
+  // ONE SHARED REFERENCE COUNT OVER THE WHOLE SET, and this is a performance contract
+  // rather than a detail. A get hands out its result through shared_ptr's ALIASING
+  // constructor against this single owner, so the atomic increment every lookup performs
+  // lands on ONE always-hot control block instead of on a per-entry control block
+  // scattered through hundreds of megabytes of payload. The first version of this class
+  // gave every entry its own shared_ptr and paid a DRAM miss plus two atomic
+  // read-modify-writes on a cold line per lookup, which put it 2 to 2.5 times over
+  // SPEC.md 8's floor. SPEC.md 3.3 records the prototype making exactly this choice and
+  // says why -- "one always-hot cache line instead of a scattered refcount per entry" --
+  // and marks it INCIDENTAL, which it is as behaviour and is not as speed.
+  //
+  // Two consequences, both the prototype's too. A caller holding one returned evaluation
+  // keeps the WHOLE level-0 payload alive -- which costs nothing, because level 0 is built
+  // for a session and lives for it. And level 0 OWNS its evaluations: build() takes
+  // unique_ptr, so a caller cannot retain its own handle to one. Nothing in the engine
+  // wants to, because level 0 is built once from a supplied set and is never set into.
+  //
+  // This vector is never touched on the lookup path -- the record carries the pointer.
+  std::shared_ptr<std::vector<std::unique_ptr<NNOutput>>> evaluations_;
+  // The per-entry count and shadow flag live in the index's own record, beside the key --
+  // see NNCacheFrozenIndex::stateAt for the measurement that put them there. They share a
+  // single 32-bit word so that shadowing and reading out the accrued count are ONE atomic
+  // exchange: a count cannot be transferred twice and cannot be split across the transfer.
+  // The top bit is the shadow flag and the low 31 bits are the count, which is ample -- the
+  // largest lifetime reference count in the operator's whole database is 11,997
+  // (SPEC.md 3.2).
 };
 
 //-------------------------------------------------------------------------------------

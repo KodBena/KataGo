@@ -115,7 +115,7 @@ uint32_t NNCacheFrozenIndex::maxEntries() {
 }
 
 NNCacheFrozenIndex::NNCacheFrozenIndex()
-  :keys_(), posTable_(), disp_(), numBuckets_(0), tableSize_(0)
+  :records_(), posTable_(), disp_(), numBuckets_(0), tableSize_(0)
 {}
 
 std::optional<uint32_t> NNCacheFrozenIndex::find(Hash128 key) const {
@@ -136,33 +136,40 @@ std::optional<uint32_t> NNCacheFrozenIndex::find(Hash128 key) const {
   // it. Roughly nine in ten never-inserted keys reach this line with a real entry's index
   // in hand; without the comparison every one of them would be answered with another
   // position's evaluation.
-  if(!(keys_[idx] == key))
+  if(!(records_[idx].key == key))
     return std::nullopt;
   return idx;
 }
 
 size_t NNCacheFrozenIndex::structureBytes() const {
   return
-    keys_.size() * sizeof(Hash128) +
+    records_.size() * sizeof(Record) +
     posTable_.size() * sizeof(uint32_t) +
     disp_.size() * sizeof(uint16_t);
 }
 
 NNCacheFrozenIndex NNCacheFrozenIndex::build(std::vector<Hash128> keysIn) {
   NNCacheFrozenIndex index;
-  // Moved, not copied: no moment of construction holds two key arrays (SPEC.md 6's
-  // transient-peak ceiling).
-  index.keys_ = std::move(keysIn);
-  const std::vector<Hash128>& keys = index.keys_;
 
-  if(index.keys_.size() > (size_t)maxEntries())
+  if(keysIn.size() > (size_t)maxEntries())
     throw StringError(
-      "NNCacheFrozenIndex: key count " + Global::uint64ToString((uint64_t)index.keys_.size()) +
+      "NNCacheFrozenIndex: key count " + Global::uint64ToString((uint64_t)keysIn.size()) +
       " exceeds what this implementation's 32-bit slot arithmetic supports (max " +
       Global::uint64ToString((uint64_t)maxEntries()) + ")."
     );
 
-  const uint32_t n = (uint32_t)keys.size();
+  const uint32_t n = (uint32_t)keysIn.size();
+  // The records carry the keys from here on, and the caller's vector is released
+  // immediately rather than held alongside them (SPEC.md 6's transient-peak ceiling).
+  // A vector of atomics can be constructed but not resized, so this is a construct-and-
+  // move-assign rather than a resize.
+  index.records_ = std::vector<Record>(n);
+  for(uint32_t i = 0; i < n; i++)
+    index.records_[i].key = keysIn[i];
+  keysIn.clear();
+  keysIn.shrink_to_fit();
+  const std::vector<Record>& records = index.records_;
+
   if(n == 0) {
     index.numBuckets_ = 0;
     index.tableSize_ = 0;
@@ -174,22 +181,25 @@ NNCacheFrozenIndex NNCacheFrozenIndex::build(std::vector<Hash128> keysIn) {
   index.tableSize_ = n + n / 10 + 1;
   index.posTable_.assign(index.tableSize_, EMPTY_SLOT);
   index.disp_.assign(index.numBuckets_, 0);
+  std::vector<uint32_t> members;
 
   // Group the keys by bucket with a counting sort: bucketOf, then offsets, then the
   // membership array. All three are transient and freed before build() returns.
-  std::vector<uint64_t> baseOf(n);
-  std::vector<uint32_t> bucketOf(n);
+  // The key mix is NOT cached per key here. Caching it would cost 8 bytes per entry of
+  // transient peak, and the placement loop below recomputes it about 39 times per key at
+  // the measured mean attempt count -- five multiplies each, which the SPEC.md 1.6 build
+  // budget has ample room for and the SPEC.md 6 transient ceiling does not.
   std::vector<uint32_t> bucketStart(index.numBuckets_ + 1, 0);
-  for(uint32_t i = 0; i < n; i++) {
-    baseOf[i] = mixKey(keys[i]);
-    const uint32_t b = reduceToRange(baseOf[i], index.numBuckets_);
-    bucketOf[i] = b;
-    bucketStart[b + 1] += 1;
-  }
-  for(uint32_t b = 0; b < index.numBuckets_; b++)
-    bucketStart[b + 1] += bucketStart[b];
-  std::vector<uint32_t> members(n);
   {
+    std::vector<uint32_t> bucketOf(n);
+    for(uint32_t i = 0; i < n; i++) {
+      const uint32_t b = reduceToRange(mixKey(records[i].key), index.numBuckets_);
+      bucketOf[i] = b;
+      bucketStart[b + 1] += 1;
+    }
+    for(uint32_t b = 0; b < index.numBuckets_; b++)
+      bucketStart[b + 1] += bucketStart[b];
+    members.resize(n);
     std::vector<uint32_t> fill(bucketStart.begin(), bucketStart.end() - 1);
     for(uint32_t i = 0; i < n; i++)
       members[fill[bucketOf[i]]++] = i;
@@ -205,17 +215,17 @@ NNCacheFrozenIndex NNCacheFrozenIndex::build(std::vector<Hash128> keysIn) {
     const uint32_t hi = bucketStart[b + 1];
     if(hi - lo < 2)
       continue;
-    std::sort(members.begin() + lo, members.begin() + hi, [&keys](uint32_t x, uint32_t y) {
-      if(keys[x] != keys[y])
-        return keys[x] < keys[y];
+    std::sort(members.begin() + lo, members.begin() + hi, [&records](uint32_t x, uint32_t y) {
+      if(records[x].key != records[y].key)
+        return records[x].key < records[y].key;
       return x < y;
     });
     for(uint32_t j = lo + 1; j < hi; j++) {
-      if(keys[members[j]] == keys[members[j - 1]]) {
+      if(records[members[j]].key == records[members[j - 1]].key) {
         const uint32_t first = std::min(members[j], members[j - 1]);
         const uint32_t second = std::max(members[j], members[j - 1]);
         throw StringError(
-          "NNCacheFrozenIndex: duplicate key " + keyToString(keys[first]) +
+          "NNCacheFrozenIndex: duplicate key " + keyToString(records[first].key) +
           " at key set positions " + Global::intToString((int)first) + " and " +
           Global::intToString((int)second) +
           "; duplicate keys are not constructible because the caller's index alignment "
@@ -253,7 +263,7 @@ NNCacheFrozenIndex NNCacheFrozenIndex::build(std::vector<Hash128> keysIn) {
       trial.clear();
       bool ok = true;
       for(uint32_t j = lo; j < hi && ok; j++) {
-        const uint32_t slot = reduceToRange(slotHash(baseOf[members[j]], d), index.tableSize_);
+        const uint32_t slot = reduceToRange(slotHash(mixKey(records[members[j]].key), d), index.tableSize_);
         if(index.posTable_[slot] != EMPTY_SLOT) {
           ok = false;
           break;
@@ -292,11 +302,11 @@ NNCacheFrozenIndex NNCacheFrozenIndex::build(std::vector<Hash128> keysIn) {
   // to its own entry. This is the check that makes a construction bug loud instead of
   // silent, and silence is this subsystem's worst failure mode.
   for(uint32_t i = 0; i < n; i++) {
-    const std::optional<uint32_t> got = index.find(keys[i]);
+    const std::optional<uint32_t> got = index.find(records[i].key);
     if(!got.has_value() || got.value() != i)
       throw StringError(
         "NNCacheFrozenIndex: self-verification failed -- the key at key set position " +
-        Global::intToString((int)i) + " (" + keyToString(keys[i]) + ") resolves to " +
+        Global::intToString((int)i) + " (" + keyToString(records[i].key) + ") resolves to " +
         (got.has_value() ? Global::intToString((int)got.value()) : std::string("absent")) +
         "; no structure was produced."
       );
@@ -309,11 +319,17 @@ NNCacheFrozenIndex NNCacheFrozenIndex::build(std::vector<Hash128> keysIn) {
 // NNCacheFrozen
 //-------------------------------------------------------------------------------------
 
-NNCacheFrozen::NNCacheFrozen(NNCacheFrozenIndex&& index, std::vector<std::shared_ptr<NNOutput>>&& evaluations)
-  :index_(std::move(index)), evaluations_(std::move(evaluations)), states_(evaluations_.size())
-{}
+NNCacheFrozen::NNCacheFrozen(NNCacheFrozenIndex&& index, std::vector<std::unique_ptr<NNOutput>>&& evaluations)
+  :index_(std::move(index)),
+   evaluations_(std::make_shared<std::vector<std::unique_ptr<NNOutput>>>(std::move(evaluations)))
+{
+  // The record carries the payload pointer so that a resolved lookup reads key, counter
+  // and payload in one access. Ownership stays with evaluations_.
+  for(size_t i = 0; i < evaluations_->size(); i++)
+    index_.setPayloadAt((uint32_t)i, (*evaluations_)[i].get());
+}
 
-std::unique_ptr<NNCacheFrozen> NNCacheFrozen::build(std::vector<std::shared_ptr<NNOutput>> evaluations) {
+std::unique_ptr<NNCacheFrozen> NNCacheFrozen::build(std::vector<std::unique_ptr<NNOutput>> evaluations) {
   // The key set is DERIVED from the evaluations rather than supplied beside them, so entry
   // i's key and entry i's evaluation cannot disagree (SPEC.md 3.4) and there is no pair of
   // lengths to check (SPEC.md 1.1).
@@ -337,7 +353,7 @@ bool NNCacheFrozen::get(Hash128 key, std::shared_ptr<NNOutput>& ret) {
   const std::optional<uint32_t> idx = index_.find(key);
   if(!idx.has_value())
     return false;
-  std::atomic<uint32_t>& state = states_[idx.value()];
+  std::atomic<uint32_t>& state = index_.stateAt(idx.value());
   // Count the retrieval, and refuse to serve a shadowed entry in the same operation. A
   // relaxed increment is all SPEC.md 3.2/3.3 ask for: the counters need no ordering, only
   // not to be lost or torn.
@@ -347,7 +363,9 @@ bool NNCacheFrozen::get(Hash128 key, std::shared_ptr<NNOutput>& ret) {
     state.fetch_sub(1, std::memory_order_relaxed);
     return false;
   }
-  ret = evaluations_[idx.value()];
+  // The aliasing constructor: the returned pointer refers to the evaluation, but the
+  // reference count it increments is evaluations_'s single always-hot one.
+  ret = std::shared_ptr<NNOutput>(evaluations_, index_.payloadAt(idx.value()));
   return true;
 }
 
@@ -355,14 +373,14 @@ bool NNCacheFrozen::contains(Hash128 key) const {
   const std::optional<uint32_t> idx = index_.find(key);
   if(!idx.has_value())
     return false;
-  return (states_[idx.value()].load(std::memory_order_relaxed) & SHADOW_BIT) == 0;
+  return (index_.stateAt(idx.value()).load(std::memory_order_relaxed) & SHADOW_BIT) == 0;
 }
 
 std::optional<uint32_t> NNCacheFrozen::shadow(Hash128 key) {
   const std::optional<uint32_t> idx = index_.find(key);
   if(!idx.has_value())
     return std::nullopt;
-  std::atomic<uint32_t>& state = states_[idx.value()];
+  std::atomic<uint32_t>& state = index_.stateAt(idx.value());
   // One atomic exchange both retires the entry and reads out everything it accrued, so the
   // count can be neither split across the transfer nor transferred twice: a racing second
   // caller sees SHADOW_BIT already set and hands out nothing.
@@ -376,7 +394,7 @@ bool NNCacheFrozen::addHits(Hash128 key, uint32_t amount) {
   const std::optional<uint32_t> idx = index_.find(key);
   if(!idx.has_value())
     return false;
-  std::atomic<uint32_t>& state = states_[idx.value()];
+  std::atomic<uint32_t>& state = index_.stateAt(idx.value());
   uint32_t cur = state.load(std::memory_order_relaxed);
   while(true) {
     if((cur & SHADOW_BIT) != 0)
@@ -388,20 +406,20 @@ bool NNCacheFrozen::addHits(Hash128 key, uint32_t amount) {
 }
 
 uint32_t NNCacheFrozen::hitCountAt(uint32_t i) const {
-  const uint32_t state = states_[i].load(std::memory_order_relaxed);
+  const uint32_t state = index_.stateAt(i).load(std::memory_order_relaxed);
   if((state & SHADOW_BIT) != 0)
     return 0;
   return state & COUNT_MASK;
 }
 
 bool NNCacheFrozen::isShadowedAt(uint32_t i) const {
-  return (states_[i].load(std::memory_order_relaxed) & SHADOW_BIT) != 0;
+  return (index_.stateAt(i).load(std::memory_order_relaxed) & SHADOW_BIT) != 0;
 }
 
 std::shared_ptr<NNOutput> NNCacheFrozen::evaluationAt(uint32_t i) const {
   if(isShadowedAt(i))
     return nullptr;
-  return evaluations_[i];
+  return std::shared_ptr<NNOutput>(evaluations_, index_.payloadAt(i));
 }
 
 std::vector<NNCacheHitCount> NNCacheFrozen::harvest() const {
@@ -409,7 +427,7 @@ std::vector<NNCacheHitCount> NNCacheFrozen::harvest() const {
   const uint32_t n = index_.numEntries();
   out.reserve(n);
   for(uint32_t i = 0; i < n; i++) {
-    const uint32_t state = states_[i].load(std::memory_order_relaxed);
+    const uint32_t state = index_.stateAt(i).load(std::memory_order_relaxed);
     if((state & SHADOW_BIT) != 0)
       continue;
     NNCacheHitCount row;
@@ -423,36 +441,35 @@ std::vector<NNCacheHitCount> NNCacheFrozen::harvest() const {
 size_t NNCacheFrozen::structureBytes() const {
   return
     index_.structureBytes() +
-    evaluations_.size() * sizeof(std::shared_ptr<NNOutput>) +
-    states_.size() * sizeof(uint32_t);
+    evaluations_->size() * sizeof(std::unique_ptr<NNOutput>);
 }
 
 int64_t NNCacheFrozen::reachablePayloadBytes() const {
   int64_t bytes = 0;
-  for(size_t i = 0; i < evaluations_.size(); i++) {
-    if((states_[i].load(std::memory_order_relaxed) & SHADOW_BIT) != 0)
+  for(size_t i = 0; i < evaluations_->size(); i++) {
+    if((index_.stateAt((uint32_t)i).load(std::memory_order_relaxed) & SHADOW_BIT) != 0)
       continue;
-    if(evaluations_[i] != nullptr)
-      bytes += (int64_t)nnOutputFootprintBytes(*evaluations_[i]);
+    if((*evaluations_)[i] != nullptr)
+      bytes += (int64_t)nnOutputFootprintBytes(*(*evaluations_)[i]);
   }
   return bytes;
 }
 
 int64_t NNCacheFrozen::shadowedPayloadBytes() const {
   int64_t bytes = 0;
-  for(size_t i = 0; i < evaluations_.size(); i++) {
-    if((states_[i].load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
+  for(size_t i = 0; i < evaluations_->size(); i++) {
+    if((index_.stateAt((uint32_t)i).load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
       continue;
-    if(evaluations_[i] != nullptr)
-      bytes += (int64_t)nnOutputFootprintBytes(*evaluations_[i]);
+    if((*evaluations_)[i] != nullptr)
+      bytes += (int64_t)nnOutputFootprintBytes(*(*evaluations_)[i]);
   }
   return bytes;
 }
 
 int64_t NNCacheFrozen::numReachableEntries() const {
   int64_t count = 0;
-  for(size_t i = 0; i < states_.size(); i++) {
-    if((states_[i].load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
+  for(size_t i = 0; i < (size_t)index_.numEntries(); i++) {
+    if((index_.stateAt((uint32_t)i).load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
       count += 1;
   }
   return count;

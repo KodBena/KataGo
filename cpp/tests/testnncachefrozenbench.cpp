@@ -58,8 +58,8 @@ Hash128 foreignKey(int64_t serial) {
 
 // A real NNOutput with no ownership map: 1528 bytes with the key at offset 0, which is the
 // same size and offset SPEC.md 8.2 says the published floor was measured with.
-shared_ptr<NNOutput> outputFor(Hash128 hash) {
-  shared_ptr<NNOutput> p = make_shared<NNOutput>();
+unique_ptr<NNOutput> outputFor(Hash128 hash) {
+  unique_ptr<NNOutput> p(new NNOutput());
   p->nnHash = hash;
   p->nnXLen = 19;
   p->nnYLen = 19;
@@ -113,7 +113,7 @@ void Tests::runNNCacheFrozenBench() {
 
   for(int si = 0; si < 6; si++) {
     const int n = CORPUS_SIZES[si];
-    vector<shared_ptr<NNOutput>> outputs;
+    vector<unique_ptr<NNOutput>> outputs;
     outputs.reserve((size_t)n);
     for(int i = 0; i < n; i++)
       outputs.push_back(outputFor(residentKey(i)));
@@ -128,19 +128,32 @@ void Tests::runNNCacheFrozenBench() {
          << (buildSeconds * 1.0e9 / (double)n) << " ns/key); structure "
          << ((double)frozen->structureBytes() / (double)n) << " B/entry" << endl;
 
+    // Query keys are built OUTSIDE the timed window. Constructing one costs two splitmix
+    // rounds, which is real work of the same order as the lookup it feeds, and the
+    // published figures this is compared against timed the lookup alone. An earlier
+    // version of this file built them inside the loop and was therefore measuring the
+    // key generator as well.
+    vector<Hash128> hitQueries((size_t)LOOKUPS_PER_REP);
+    vector<Hash128> missQueries((size_t)LOOKUPS_PER_REP);
+    for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
+      const int64_t which = (int64_t)(splitmix((uint64_t)i) % (uint64_t)n);
+      hitQueries[(size_t)i] = residentKey(which);
+      missQueries[(size_t)i] = foreignKey(which);
+    }
+
     vector<double> hitNs;
     vector<double> missNs;
+    vector<double> memberNs;
     shared_ptr<NNOutput> got;
     for(int rep = 0; rep < REPS; rep++) {
-      // Hit path. The index is scattered rather than swept, so the stream is not
+      // Hit path. The query order is scattered rather than swept, so the stream is not
       // prefetchable and the measurement is of a random-access lookup, which is what a
       // search does.
       {
         int64_t found = 0;
         ClockTimer timer;
         for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
-          const int64_t which = (int64_t)(splitmix((uint64_t)(rep * LOOKUPS_PER_REP + i)) % (uint64_t)n);
-          if(frozen->get(residentKey(which), got))
+          if(frozen->get(hitQueries[(size_t)i], got))
             found += 1;
         }
         const double seconds = timer.getSeconds();
@@ -149,14 +162,30 @@ void Tests::runNNCacheFrozenBench() {
         testAssert(found == LOOKUPS_PER_REP);
         hitNs.push_back(seconds * 1.0e9 / (double)LOOKUPS_PER_REP);
       }
+      // Membership-only (SPEC.md 3.1): the same resolution, without retrieving the
+      // evaluation and without touching any counter. It therefore reads the position
+      // table and the key array and NOTHING ELSE -- two cache lines against the four a
+      // retrieval reads, because the state word and the evaluation handle live in two
+      // further arrays. It is here as a CONTRACT operation in its own right and as the
+      // discriminating measurement for why the retrieval path costs what it does.
+      {
+        int64_t found = 0;
+        ClockTimer timer;
+        for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
+          if(frozen->contains(hitQueries[(size_t)i]))
+            found += 1;
+        }
+        const double seconds = timer.getSeconds();
+        testAssert(found == LOOKUPS_PER_REP);
+        memberNs.push_back(seconds * 1.0e9 / (double)LOOKUPS_PER_REP);
+      }
       // Absent path (SPEC.md 2.4, 8.3). Not part of the floor, but a pathological miss
       // path is a defect the hit numbers would hide.
       {
         int64_t found = 0;
         ClockTimer timer;
         for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
-          const int64_t which = (int64_t)(splitmix((uint64_t)(rep * LOOKUPS_PER_REP + i)) % (uint64_t)n);
-          if(frozen->get(foreignKey(which), got))
+          if(frozen->get(missQueries[(size_t)i], got))
             found += 1;
         }
         const double seconds = timer.getSeconds();
@@ -164,8 +193,9 @@ void Tests::runNNCacheFrozenBench() {
         missNs.push_back(seconds * 1.0e9 / (double)LOOKUPS_PER_REP);
       }
     }
-    report("hit ", n, summarize(hitNs));
-    report("miss", n, summarize(missNs));
+    report("hit    ", n, summarize(hitNs));
+    report("member ", n, summarize(memberNs));
+    report("miss   ", n, summarize(missNs));
     cout << flush;
   }
   cout << "Done" << endl;

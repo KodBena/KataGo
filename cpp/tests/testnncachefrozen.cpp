@@ -46,10 +46,21 @@ shared_ptr<NNOutput> outputFor(Hash128 hash, bool withOwnerMap) {
   return p;
 }
 
-vector<shared_ptr<NNOutput>> outputsFor(const vector<Hash128>& keys) {
-  vector<shared_ptr<NNOutput>> out;
+// Level 0 TAKES OWNERSHIP of what it is built from, so its own inputs are unique_ptr.
+unique_ptr<NNOutput> ownedOutputFor(Hash128 hash, bool withOwnerMap) {
+  unique_ptr<NNOutput> p(new NNOutput());
+  p->nnHash = hash;
+  p->nnXLen = 19;
+  p->nnYLen = 19;
+  if(withOwnerMap)
+    p->whiteOwnerMap = new float[19 * 19];
+  return p;
+}
+
+vector<unique_ptr<NNOutput>> outputsFor(const vector<Hash128>& keys) {
+  vector<unique_ptr<NNOutput>> out;
   for(size_t i = 0; i < keys.size(); i++)
-    out.push_back(outputFor(keys[i], false));
+    out.push_back(ownedOutputFor(keys[i], false));
   return out;
 }
 
@@ -161,9 +172,9 @@ void testConstructionRefusals() {
   }
   // A null evaluation carries no key to index it by.
   {
-    vector<shared_ptr<NNOutput>> outs = outputsFor({nthKey(0), nthKey(1)});
+    vector<unique_ptr<NNOutput>> outs = outputsFor({nthKey(0), nthKey(1)});
     outs[1] = nullptr;
-    testAssert(refused([&]() { NNCacheFrozen::build(outs); }, "null"));
+    testAssert(refused([&]() { NNCacheFrozen::build(std::move(outs)); }, "null"));
   }
   // The bound on the displacement search exists and the refusal names it (SPEC.md 5.1).
   testAssert(NNCacheFrozenIndex::searchBound() > 0);
@@ -287,8 +298,8 @@ void testSkipCachePathUpholdsTheOneOwnerInvariant() {
 // entry it has already rejected.
 void testOwnerMapFallThroughUpholdsTheOneOwnerInvariant() {
   const Hash128 key = nthKey(0);
-  vector<shared_ptr<NNOutput>> zeroOutputs;
-  zeroOutputs.push_back(outputFor(key, false));  // no ownership map
+  vector<unique_ptr<NNOutput>> zeroOutputs;
+  zeroOutputs.push_back(ownedOutputFor(key, false));  // no ownership map
   unique_ptr<NNCacheFrozen> frozenOwned = NNCacheFrozen::build(std::move(zeroOutputs));
   NNCacheFrozen* frozen = frozenOwned.get();
   unique_ptr<NNCacheTable> table =
