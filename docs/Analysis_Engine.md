@@ -15,6 +15,39 @@ An example config file is provided in `cpp/configs/analysis_example.cfg`. Adjust
 
 See the [example analysis config](https://github.com/lightvector/KataGo/blob/master/cpp/configs/analysis_example.cfg#L60) for a fairly detailed discussion of how to tune these parameters.
 
+## Hosting more than one model
+
+The engine can load more than one neural net at once, and a query can say which one should analyze it:
+
+```./katago analysis -config CONFIG_FILE -model MODEL_FILE -extra-model OTHER_MODEL_FILE```
+
+`-extra-model` may be repeated for as many models as you want to host. Each hosted model gets its own
+NN cache and its own pool of search bots, one per analysis thread, so a query is analyzed by a bot that
+was built around that model rather than by swapping a net into a shared bot. Hosting N models therefore
+costs roughly N times the NN cache and bot memory; it does not change how many positions are analyzed at
+once, which is still `numAnalysisThreads`.
+
+A query selects its model with the `model` field, whose value is the model's `internalName` exactly as
+the `query_models` action reports it (`query_models` lists every hosted model). This is the model file's
+own self-declared name; the engine does not invent an alias for it.
+
+Two rules keep that name honest, and both refuse rather than guess:
+
+  * **A query naming a model that is not loaded is an error, and is not analyzed.** The error message
+    lists the names that are loaded. The engine will not fall back to the default model, because a
+    response carries no record of which net produced it, so a silent fallback would be indistinguishable
+    from the analysis you asked for.
+  * **Two models that declare the same `internalName` are refused at startup**, with a message naming the
+    name and both model files. This happens if you pass the same file twice, or two files that were built
+    with the same name. There is no unambiguous answer to a query naming a name two models share, so the
+    engine does not start rather than pick one.
+
+A query with no `model` field behaves exactly as it always has.
+
+`model` selects which model analyzes a *query*; no action query reads it, so including `model` on an
+action query (`query_models`, `clear_cache`, `terminate`, `terminate_all`, `query_version`) is an
+error rather than being ignored.
+
 ## Example Code
 
 For example code demonstrating how to invoke the analysis engine from Python, see [here](https://github.com/lightvector/KataGo/blob/master/python/query_analysis_engine_example.py)!
@@ -85,6 +118,7 @@ Explanation of fields (including some optional fields not present in the above q
    * `boardYSize (integer)`: Required. The height of the board. Sizes > 19 are NOT supported unless KataGo has been compiled to support them (cpp/game/board.h, MAX_LEN = 19). KataGo's official neural nets have also not been trained for larger boards, but should work fine for mildly larger sizes (21,23,25).
    * `analyzeTurns (list of integers)`: Optional. Which turns of the game to analyze. 0 is the initial position, 1 is the position after `moves[0]`, 2 is the position after `moves[1]`, etc. If this field is not specified, defaults to analyzing only the last turn, which is the position after all specified `moves` are made.
    * `maxVisits (integer)`: Optional. The maximum number of visits to use. If not specified, defaults to the value in the analysis config file. If specified, overrides it.
+   * `model (string)`: Optional. Which of the loaded models should analyze this query, given as the `internalName` that the `query_models` action reports for it. If not specified, the query is analyzed by the model given by `-model` on the command line, which is what the engine has always done and is the only model loaded unless `-extra-model` was also given. A name that is not a loaded model, or that names the human SL model (which participates in searches but is not independently searchable), is an ERROR for that query and nothing is analyzed - the engine will not quietly substitute a different net. See "Hosting more than one model" below.
    * `rootPolicyTemperature (float)`: Optional. Set this to a value > 1 to make KataGo do a wider search.
    * `rootFpuReductionMax (float)`: Optional. Set this to 0 to make KataGo more willing to try a variety of moves.
    * `analysisPVLen (integer)`: Optional. The maximum length of the PV to send for each move (not including the first move).
@@ -319,7 +353,7 @@ Example:
 ```
 {"id":"foo","action":"clear_cache"}
 ```
-The response to this query is to simply echo back a json object with exactly the same data and fields of the query. This response is sent after the cache is successfully cleared. If there are also any ongoing analysis queries at the time, those queries will of course be concurrently refilling the cache even as the response is being sent.
+The response to this query is to simply echo back a json object with exactly the same data and fields of the query. This response is sent after the cache is successfully cleared. If more than one model is hosted (see "Hosting more than one model"), every hosted model's cache is cleared, since the action means "drop everything cached" and a model whose cache it skipped would keep serving entries you asked to be rid of. If there are also any ongoing analysis queries at the time, those queries will of course be concurrently refilling the cache even as the response is being sent.
 
 Explanation: KataGo uses a cache of neural net query results to skip querying the neural net when it encounters within its search tree a position whose stone configuration, player to move, ko status, komi, rules, and other relevant options are all identical a position it has seen before. For example, this may happen if the search trees for some queries overlap due to being on nearby moves of the same game, or it may happen even within a single analysis query if the search explores differing orders of moves that lead to the same positions (often, about 20% of search tree nodes hit the cache due transposing to order of moves, although it may be vastly higher or lower depending on the position and search depth). Reasons for wanting to clear the cache may include:
 

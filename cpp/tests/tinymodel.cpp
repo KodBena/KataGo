@@ -44,6 +44,54 @@ static void decodeBase64(const string& input, string& output) {
     throw StringError("decodeBase64 got leftover bits");
 }
 
+// Decoding an embedded model, writing it out and loading it has exactly one home, here, because
+// three sites in this file and one in testanalysismodels.cpp all need it, and a second copy is a
+// second thing that has to be kept in step with the load path the engine actually uses.
+TinyModelTest::LoadedTinyModel TinyModelTest::loadEmbeddedModel(
+  EmbeddedModel which, const string& baseDir, Logger& logger, ConfigParser& cfg, bool randFileName
+) {
+  string base64Data;
+  string fileStem;
+  if(which == EmbeddedModel::Rect15B2C16) {
+    base64Data += TinyModelTest::tinyModelBase64Part0;
+    base64Data += TinyModelTest::tinyModelBase64Part1;
+    base64Data += TinyModelTest::tinyModelBase64Part2;
+    base64Data += TinyModelTest::tinyModelBase64Part3;
+    base64Data += TinyModelTest::tinyModelBase64Part4;
+    base64Data += TinyModelTest::tinyModelBase64Part5;
+    base64Data += TinyModelTest::tinyModelBase64Part6;
+    fileStem = "tmpTinyModel";
+  }
+  else {
+    base64Data += TinyModelTest::tinyMishModelBase64;
+    fileStem = "tmpTinyMishModel";
+  }
+  string binaryData;
+  decodeBase64(base64Data, binaryData);
+
+  Rand rand;
+  const string tmpModelFile =
+    randFileName ?
+    (baseDir + "/" + fileStem + "_" + Global::uint64ToHexString(rand.nextUInt64()) + ".bin.gz") :
+    (baseDir + "/" + fileStem + ".bin.gz");
+  ofstream outModel;
+  FileUtils::open(outModel,tmpModelFile.c_str(),ios::binary);
+  outModel << binaryData;
+  outModel.close();
+
+  const int expectedConcurrentEvals = 1;
+  const int maxBatchSize = 8;
+  const bool requireExactNNLen = false;
+  const bool disableFP16 = false;
+  const string expectedSha256 = "";
+  NNEvaluator* nnEval = Setup::initializeNNEvaluator(
+    "tinyModel",tmpModelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
+    NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,maxBatchSize,requireExactNNLen,disableFP16,
+    Setup::SETUP_FOR_DISTRIBUTED
+  );
+  return LoadedTinyModel{nnEval, tmpModelFile};
+}
+
 static void requireApproxEqual(double x, double expected, double scale, const NNResultBuf& buf, const Board& board, const char *file, int line) {
   if(!std::isfinite(x) || !std::isfinite(expected) || std::fabs(x-expected) > scale) {
     buf.result->debugPrint(cout,board);
@@ -59,37 +107,9 @@ NNEvaluator* TinyModelTest::runTinyModelTest(const string& baseDir, Logger& logg
 
   NNEvaluator* nnEvalRet;
   {
-    string base64Data;
-    base64Data += TinyModelTest::tinyModelBase64Part0;
-    base64Data += TinyModelTest::tinyModelBase64Part1;
-    base64Data += TinyModelTest::tinyModelBase64Part2;
-    base64Data += TinyModelTest::tinyModelBase64Part3;
-    base64Data += TinyModelTest::tinyModelBase64Part4;
-    base64Data += TinyModelTest::tinyModelBase64Part5;
-    base64Data += TinyModelTest::tinyModelBase64Part6;
-    string binaryData;
-    decodeBase64(base64Data, binaryData);
-
-    Rand rand;
-    const string tmpModelFile =
-      randFileName ?
-      (baseDir + "/" + "tmpTinyModel_" + Global::uint64ToHexString(rand.nextUInt64()) + ".bin.gz") :
-      (baseDir + "/" + "tmpTinyModel.bin.gz");
-    ofstream outModel;
-    FileUtils::open(outModel,tmpModelFile.c_str(),ios::binary);
-    outModel << binaryData;
-    outModel.close();
-
-    const int expectedConcurrentEvals = 1;
-    const int maxBatchSize = 8;
-    const bool requireExactNNLen = false;
-    const bool disableFP16 = false;
-    const string expectedSha256 = "";
-    NNEvaluator* nnEval = Setup::initializeNNEvaluator(
-      "tinyModel",tmpModelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
-      NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,maxBatchSize,requireExactNNLen,disableFP16,
-      Setup::SETUP_FOR_DISTRIBUTED
-    );
+    const LoadedTinyModel loaded = loadEmbeddedModel(EmbeddedModel::Rect15B2C16, baseDir, logger, cfg, randFileName);
+    NNEvaluator* nnEval = loaded.eval;
+    const string& tmpModelFile = loaded.modelFile;
     nnEval->setDoRandomize(false);
     nnEval->setDefaultSymmetry(6);
 
@@ -226,31 +246,9 @@ NNEvaluator* TinyModelTest::runTinyModelTest(const string& baseDir, Logger& logg
   }
 
   {
-    string base64Data;
-    base64Data += TinyModelTest::tinyMishModelBase64;
-    string binaryData;
-    decodeBase64(base64Data, binaryData);
-
-    Rand rand;
-    const string tmpModelFile =
-      randFileName ?
-      (baseDir + "/" + "tmpTinyMishModel_" + Global::uint64ToHexString(rand.nextUInt64()) + ".bin.gz") :
-      (baseDir + "/" + "tmpTinyMishModel.bin.gz");
-    ofstream outModel;
-    FileUtils::open(outModel,tmpModelFile.c_str(),ios::binary);
-    outModel << binaryData;
-    outModel.close();
-
-    const int expectedConcurrentEvals = 1;
-    const int maxBatchSize = 8;
-    const bool requireExactNNLen = false;
-    const bool disableFP16 = false;
-    const string expectedSha256 = "";
-    NNEvaluator* nnEval = Setup::initializeNNEvaluator(
-      "tinyModel",tmpModelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
-      NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,maxBatchSize,requireExactNNLen,disableFP16,
-      Setup::SETUP_FOR_DISTRIBUTED
-    );
+    const LoadedTinyModel loaded = loadEmbeddedModel(EmbeddedModel::B1C6Nbt, baseDir, logger, cfg, randFileName);
+    NNEvaluator* nnEval = loaded.eval;
+    const string& tmpModelFile = loaded.modelFile;
     nnEval->setDoRandomize(false);
     nnEval->setDefaultSymmetry(7);
 
@@ -387,31 +385,9 @@ NNEvaluator* TinyModelTest::runTinyModelTest(const string& baseDir, Logger& logg
   }
 
   {
-    string base64Data;
-    base64Data += TinyModelTest::tinyMishModelBase64;
-    string binaryData;
-    decodeBase64(base64Data, binaryData);
-
-    Rand rand;
-    const string tmpModelFile =
-      randFileName ?
-      (baseDir + "/" + "tmpTinyMishModel_" + Global::uint64ToHexString(rand.nextUInt64()) + ".bin.gz") :
-      (baseDir + "/" + "tmpTinyMishModel.bin.gz");
-    ofstream outModel;
-    FileUtils::open(outModel,tmpModelFile.c_str(),ios::binary);
-    outModel << binaryData;
-    outModel.close();
-
-    const int expectedConcurrentEvals = 1;
-    const int maxBatchSize = 8;
-    const bool requireExactNNLen = false;
-    const bool disableFP16 = false;
-    const string expectedSha256 = "";
-    NNEvaluator* nnEval = Setup::initializeNNEvaluator(
-      "tinyModel",tmpModelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
-      NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,maxBatchSize,requireExactNNLen,disableFP16,
-      Setup::SETUP_FOR_DISTRIBUTED
-    );
+    const LoadedTinyModel loaded = loadEmbeddedModel(EmbeddedModel::B1C6Nbt, baseDir, logger, cfg, randFileName);
+    NNEvaluator* nnEval = loaded.eval;
+    const string& tmpModelFile = loaded.modelFile;
     nnEval->setDoRandomize(false);
     nnEval->setDefaultSymmetry(1);
 

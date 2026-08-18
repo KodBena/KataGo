@@ -65,6 +65,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runNNCacheFrozenTests();
   Tests::runNNCacheCountLogTests();
   Tests::runNNEvalContainerTests();
+  Tests::runAnalysisModelNameSpaceTests();
 
   // Pick an arbitrary file that the test uses
   if(FileUtils::exists("tests/data/configs/folded/test-parent.cfg"))

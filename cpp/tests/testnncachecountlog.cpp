@@ -80,26 +80,10 @@ bool hasRowFor(const NNCacheCountLogContents& contents, int serial) {
   return false;
 }
 
-// A directory that removes itself, so a failed assertion in the middle of a test does not
-// leave litter behind for the next run to trip over.
-class ScopedTempDir {
- public:
-  ScopedTempDir() {
-    Rand rand;
-    path_ = "tmpnncachecountlog_" + Global::uint64ToHexString(rand.nextUInt64());
-    gfs::create_directory(gfs::u8path(path_));
-  }
-  ~ScopedTempDir() {
-    std::error_code ec;
-    gfs::remove_all(gfs::u8path(path_), ec);
-  }
-  ScopedTempDir(const ScopedTempDir&) = delete;
-  ScopedTempDir& operator=(const ScopedTempDir&) = delete;
-  const string& path() const { return path_; }
-
- private:
-  string path_;
-};
+// The self-removing directory these tests write their logs into is TestCommon::ScopedTempDir,
+// which moved there when a second test in this suite needed one. This is the one home of the
+// name its directories carry.
+const char* const TMP_DIR_PREFIX = "tmpnncachecountlog";
 
 // True if load() refused this file. A named helper rather than a bare call in a try, so
 // the [[nodiscard]] on load() stays honest instead of being waived at each site.
@@ -139,7 +123,7 @@ void overwriteBytesAt(const string& path, int64_t offset, const vector<uint8_t>&
 // Counts written are counts read back. Exactly -- this is a logic invariant, so there is no
 // tolerance and no approximate comparison anywhere in it.
 void testCountLogRoundTripsCountsExactly() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "roundtrip");
 
   const NNCacheCountLogAppendResult appended = log.appendDump(ledgerOf({{1, 7}, {2, 0}, {3, 4000000000u}}, 0));
@@ -172,7 +156,7 @@ void testCountLogRoundTripsCountsExactly() {
 
 // Merging is addition, and sessions counts the dumps a key appeared in.
 void testCountLogAccumulatesAcrossDumps() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "accumulate");
 
   log.appendDump(ledgerOf({{1, 3}, {2, 5}}, 0));
@@ -194,7 +178,7 @@ void testCountLogAccumulatesAcrossDumps() {
 // THE LOAD-BEARING TEST. A crash mid-dump leaves a partial block. Exactly the dumps that
 // completed must survive, and the partial one must not.
 void testCountLogTornTailIsDiscardedAndThePrefixSurvives() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "torn");
 
   log.appendDump(ledgerOf({{1, 10}, {2, 20}}, 0));
@@ -255,7 +239,7 @@ void testCountLogTornTailIsDiscardedAndThePrefixSurvives() {
 // A block that is the RIGHT LENGTH but wrong in its bytes -- the shape a lost page leaves,
 // which a length-only framing cannot see at all.
 void testCountLogAWholeButCorruptBlockIsRejectedByItsChecksum() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "corrupt");
 
   log.appendDump(ledgerOf({{1, 11}}, 0));
@@ -278,7 +262,7 @@ void testCountLogAWholeButCorruptBlockIsRejectedByItsChecksum() {
 // A corrupt block HEADER must be caught by the header's own checksum before its record
 // count is believed, so a length a crash chose never reaches an allocation.
 void testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "badlen");
 
   log.appendDump(ledgerOf({{1, 11}}, 0));
@@ -320,7 +304,7 @@ void testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved() {
 // A torn tail must be repaired by the WRITER before it appends, or every later dump lands
 // at an offset no loader reaches and is silently lost while every call reports success.
 void testCountLogTornTailIsRepairedBeforeTheNextAppend() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "repair");
 
   log.appendDump(ledgerOf({{1, 10}, {2, 20}}, 0));
@@ -348,7 +332,7 @@ void testCountLogTornTailIsRepairedBeforeTheNextAppend() {
 // Compaction preserves every total and shrinks the file; a crash mid-compaction leaves the
 // original intact.
 void testCountLogCompactionPreservesTotalsAndSurvivesACrash() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "compact");
 
   for(int i = 0; i < 10; i++)
@@ -398,7 +382,7 @@ void testCountLogCompactionPreservesTotalsAndSurvivesACrash() {
 
 // Ordering is by lookups. Nothing here ranks by sessions.
 void testCountLogOrdersByLookupsAndNotBySessions() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "ordering");
 
   // Key 1: one dump, many lookups. Key 2: many dumps, few lookups each. The two orderings
@@ -419,7 +403,7 @@ void testCountLogOrdersByLookupsAndNotBySessions() {
 
 // The boundary refuses what it cannot honor and never coerces it into something plausible.
 void testCountLogRefusesWhatItCannotHonor() {
-  ScopedTempDir dir;
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
 
   // A context name becomes a path component, so it is validated to a closed alphabet.
   const char* badContexts[] = {"", ".", "..", "../escape", "a/b", "a\\b", "with space", "semi;colon"};

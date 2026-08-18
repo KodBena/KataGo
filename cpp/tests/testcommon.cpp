@@ -1,6 +1,25 @@
 #include "../tests/tests.h"
 
+#include <ghc/filesystem.hpp>
+
 using namespace std;
+
+namespace gfs = ghc::filesystem;
+
+TestCommon::ScopedTempDir::ScopedTempDir(const string& namePrefix) {
+  Rand rand;
+  path_ = namePrefix + "_" + Global::uint64ToHexString(rand.nextUInt64());
+  gfs::create_directory(gfs::u8path(path_));
+}
+
+TestCommon::ScopedTempDir::~ScopedTempDir() {
+  std::error_code ec;
+  gfs::remove_all(gfs::u8path(path_), ec);
+}
+
+const string& TestCommon::ScopedTempDir::path() const {
+  return path_;
+}
 
 bool TestCommon::boardsSeemEqual(const Board& b1, const Board& b2) {
   for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
