@@ -70,11 +70,36 @@ using namespace std;
 // nnCacheSizePowerOfTwo -- which is what it did in the first version of this file, and
 // what it still does when the key is left unset -- its load factor IS the table's load
 // factor. So in exactly the regime a replacement rule exists for, where the table cannot
-// hold the working set, the ghost cannot hold the counts either. Worse, the resulting
-// distortion is NOT symmetric between the two counting rules: a clobbered incumbent reads
-// as count 0, which makes it WIN under KeepLessSeen and LOSE under KeepMoreSeen. A sweep
-// taken through a table-sized ghost therefore measures the two arms under different
-// handicaps, and it measured them that way once on this branch before the key existed.
+// hold the working set, the ghost cannot hold the counts either.
+//
+// And the consequence is worse than a loss of precision: A SATURATED GHOST DOES NOT
+// DEGRADE THESE RULES, IT REPLACES THEM WITH DEGENERATE ONES. Follow set() below.
+// sight() records the newcomer's presentation and returns the count INCLUDING it, so the
+// newcomer's own write has just landed in its ghost slot when the comparison is made --
+// even if that slot belonged to some other key a moment ago, the newcomer reads 1. The
+// incumbent's count is read by peek(), which does not write, so an incumbent whose slot
+// was taken by another key reads 0. Under saturation the comparison is therefore 1
+// against 0, almost every time, for almost every contest:
+//
+//   KeepMoreSeen  admits iff newcomer >= incumbent  ->  1 >= 0  ->  ADMIT EVERYTHING.
+//                 It stops choosing and becomes `always`.
+//   KeepLessSeen  admits iff newcomer <= incumbent  ->  1 <= 0  ->  REFUSE EVERYTHING.
+//
+// So a sweep taken through a table-sized ghost measures neither policy. It measures
+// `always` under one name and refuse-everything under the other, and reports the pair as
+// if they were the two arms of a comparison. That is not hypothetical: it happened once
+// on this branch, before this key existed, and the numbers it produced inverted when the
+// ghost was given a size of its own.
+//
+// HISTORY, because the next reader should know the question was tested rather than
+// assumed: an earlier version of this comment gave a DIFFERENT mechanism -- that a
+// clobbered incumbent reading 0 makes it win under KeepLessSeen and lose under
+// KeepMoreSeen, i.e. an asymmetric handicap. That is wrong in sign, and it is wrong
+// because it reasons about the incumbent's read and forgets that the newcomer's own
+// sighting rewrites its slot first. The re-measurement refuted it; the conclusion it was
+// offered in support of -- that the ghost needs a size of its own -- is unchanged and is
+// better supported by the mechanism above.
+//
 // The ghost's natural size is the WORKING SET -- an absolute quantity, and not a function
 // of how large a table someone chose.
 //

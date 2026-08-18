@@ -132,13 +132,22 @@ class NNCacheShape {
   // rather than derived from nnCacheSizePowerOfTwo.
   //
   // Why this is a knob at all. The ghost is a lossy sketch: two keys landing on one ghost
-  // slot overwrite each other's counts, and a clobbered key reads as count 0. Sized from
-  // the table, its load factor IS the table's load factor -- so in exactly the regime a
-  // replacement rule exists for, where the table cannot hold the working set, the ghost
-  // cannot hold the counts either. Worse, the distortion is not symmetric: a clobbered
-  // incumbent reading 0 makes it WIN under KeepLessSeen and LOSE under KeepMoreSeen, so a
-  // measurement taken through an overloaded ghost is biased between the two arms. The
-  // ghost's natural size is the WORKING SET, which is an absolute quantity and not a
+  // slot overwrite each other's counts. Sized from the table, its load factor IS the
+  // table's load factor -- so in exactly the regime a replacement rule exists for, where
+  // the table cannot hold the working set, the ghost cannot hold the counts either.
+  //
+  // And a saturated ghost does not degrade these rules, it REPLACES them with degenerate
+  // ones. A newcomer's own sighting rewrites its ghost slot immediately before the
+  // comparison, so the newcomer reads 1 whatever was there before; the incumbent's count
+  // is only read, so an overwritten incumbent reads 0. The comparison becomes 1 against 0
+  // almost every time, which makes KeepMoreSeen admit unconditionally -- it stops
+  // choosing and becomes Always -- and KeepLessSeen refuse unconditionally. A sweep
+  // through a table-sized ghost therefore measures neither rule. (An earlier version of
+  // this comment claimed the opposite asymmetry, that an overwritten incumbent's 0 makes
+  // it WIN under KeepLessSeen; that was wrong in sign and the re-measurement refuted it.
+  // The conclusion is unchanged.) See nncachesighting.cpp for the walk through set().
+  //
+  // The ghost's natural size is the WORKING SET, which is an absolute quantity and not a
   // function of how big a table someone chose.
   //
   // REFUSED for Always and KeepSighted: neither allocates a ghost, so a ghost size under
