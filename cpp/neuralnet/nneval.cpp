@@ -86,9 +86,6 @@ NNEvaluator::NNEvaluator(
    nnCacheTable(nullptr),
    nnCacheLevelZeroTable(nullptr),
    nnCacheDirectory(nnCacheConfig.cacheDirectory),
-#ifndef NDEBUG
-   nnCacheEvaluationsInFlight(0),
-#endif
    logger(lg),
    internalModelName(),
    modelVersion(-1),
@@ -451,44 +448,41 @@ NNCacheTwoLevelTable& NNEvaluator::levelZeroTableOrThrow() const {
   return *nnCacheLevelZeroTable;
 }
 
-// The debug tripwire both acts carry. It observes the property the contract is about -- an
-// evaluation is inside evaluate(), and therefore may be inside the lock-free walk of the very
-// vector these acts mutate -- at the moment of the act, rather than a symptom of it later
-// (ADR-0021 Rule 1). Compiled out of a release build entirely.
-void NNEvaluator::assertNoEvaluationInFlightForLevelZeroSwap(const char* act) const {
-#ifndef NDEBUG
-  const int inFlight = nnCacheEvaluationsInFlight.load(std::memory_order_acquire);
-  if(inFlight != 0)
-    Global::fatalError(
-      "NNEvaluator: " + string(act) + " on model '" + modelName + "' while " +
-      Global::intToString(inFlight) + " evaluation(s) are in flight. A get walks the level-0 "
-      "resolution list lock-free and this mutates the vector it walks, so this is a "
-      "use-after-free, not a torn counter. The analysis engine's protocol layer refuses "
-      "cache_attach and cache_detach while any request is open; this caller reached past it."
-    );
-#else
-  (void)act;
-#endif
-}
+// THE TRIPWIRE THAT USED TO STAND HERE IS GONE, and its removal is the point rather than a
+// casualty. assertNoEvaluationInFlightForLevelZeroSwap existed for exactly one caller: one that
+// reached past the protocol layer to these two acts directly. That caller can no longer be
+// written -- both acts now require an NNCacheLevelZeroSwapPermit, which nothing outside the three
+// mints named on that type can construct -- so the assertion policed a class the type system no
+// longer lets anyone express. Keeping it would give one rule two homes, the weaker of which was
+// compiled out of every release build this project ships and therefore never protected a shipped
+// binary at all (ADR-0012 P1; ADR-0000 Rule 2a -- the class is foreclosed at construction, which
+// is the top of ADR-0002's loudness hierarchy, so a run-time check below it adds nothing). The
+// axis the permit does NOT cover, named rather than left silent: a bug INSIDE the protocol layer
+// that called these while a request was open. That axis is the request loop's own refusal
+// (cacheSwapConcurrencyRefusal), which is always on, is exercised by the analysis engine cache
+// action suite, and is not compiled out of anything.
 
 NNCacheLevelZeroAttachment NNEvaluator::attachLevelZeroSource(
-  std::unique_ptr<NNCacheFrozen> source, const NNCacheContextId& servesContext
+  NNCacheLevelZeroSwapPermit permit,
+  std::unique_ptr<NNCacheFrozen> source,
+  const NNCacheContextId& servesContext
 ) {
   NNCacheTwoLevelTable& table = levelZeroTableOrThrow();
-  assertNoEvaluationInFlightForLevelZeroSwap("attachLevelZeroSource");
   // REQUIRED HERE, THOUGH THE TABLE ACCEPTS A SOURCE WITHOUT ONE. This is the protocol's door,
   // and every source that comes through it was loaded from some context's container on that
   // context's behalf -- so an attach through here that named no context would be a source whose
   // retrievals no per-context dump could ever write, which is a silent loss with a client on the
   // other end of it. The table's own door stays permissive because a table can legitimately be
   // handed a source before any context exists: its own construction does exactly that.
-  return table.attachLevelZero(std::move(source), std::optional<NNCacheContextId>(servesContext));
+  return table.attachLevelZero(permit, std::move(source), std::optional<NNCacheContextId>(servesContext));
 }
 
-std::unique_ptr<NNCacheFrozen> NNEvaluator::detachLevelZeroSource(const NNCacheLevelZeroSourceId& id) {
+std::unique_ptr<NNCacheFrozen> NNEvaluator::detachLevelZeroSource(
+  NNCacheLevelZeroSwapPermit permit,
+  const NNCacheLevelZeroSourceId& id
+) {
   NNCacheTwoLevelTable& table = levelZeroTableOrThrow();
-  assertNoEvaluationInFlightForLevelZeroSwap("detachLevelZeroSource");
-  return table.detachLevelZero(id);
+  return table.detachLevelZero(permit, id);
 }
 
 size_t NNEvaluator::numLevelZeroSources() const {
@@ -1021,11 +1015,6 @@ void NNEvaluator::evaluate(
   bool includeOwnerMap
 ) {
   testAssert(!isKilled);
-#ifndef NDEBUG
-  // See assertNoEvaluationInFlightForLevelZeroSwap. Debug builds only; the release build's
-  // evaluation path is unchanged.
-  const InFlightEvaluationMark inFlightMark(nnCacheEvaluationsInFlight);
-#endif
   buf.hasResult = false;
 
   // THE CACHE-CONTEXT TAG IS CONSUMED HERE, not read at the end.

@@ -11,8 +11,13 @@
 #include "../neuralnet/nncachefrozen.h"
 #include "../neuralnet/nncachelevelzero.h"
 #include "../neuralnet/nncachetwolevel.h"
+#include "../tests/testcacheswapseam.h"
 
 using namespace std;
+
+// The declared test seam for the level-0 swap door; see tests/testcacheswapseam.h. One permit,
+// minted once for this file, spent at every attach and detach below.
+static const NNCacheLevelZeroSwapPermit SWAP_PERMIT = NNCacheLevelZeroSwapTestSeam::permit();
 using namespace TestCommon;
 
 // THE ORDERED RESOLUTION LIST: several attached level-0 sources serving one lookup, tried
@@ -165,8 +170,8 @@ void testFirstMatchInAttachOrderWins() {
 
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(std::move(bOwned), noContext()).id;
-  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(std::move(cOwned), noContext()).id;
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(SWAP_PERMIT, std::move(bOwned), noContext()).id;
+  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(SWAP_PERMIT, std::move(cOwned), noContext()).id;
   testAssert(table->numLevelZeroSources() == 3);
 
   // Sole holders resolve to themselves.
@@ -226,16 +231,16 @@ void testDetachPreservesRelativeOrderAndReAttachGoesToTheBack() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
   const NNCacheLevelZeroSourceId idA = table->levelZeroResolutionOrder()[0];
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(std::move(bOwned), noContext()).id;
-  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(std::move(cOwned), noContext()).id;
-  const NNCacheLevelZeroSourceId idD = table->attachLevelZero(std::move(dOwned), noContext()).id;
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(SWAP_PERMIT, std::move(bOwned), noContext()).id;
+  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(SWAP_PERMIT, std::move(cOwned), noContext()).id;
+  const NNCacheLevelZeroSourceId idD = table->attachLevelZero(SWAP_PERMIT, std::move(dOwned), noContext()).id;
 
   testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idA, idB, idC, idD}));
   testAssert(served(*table, shared) == SOURCE_A);
   testAssert(served(*table, cd) == SOURCE_C);
 
   // Detach the SECOND of four. A, C and D keep their relative order.
-  unique_ptr<NNCacheFrozen> bBack = table->detachLevelZero(idB);
+  unique_ptr<NNCacheFrozen> bBack = table->detachLevelZero(SWAP_PERMIT, idB);
   testAssert(bBack != nullptr);
   testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idA, idC, idD}));
   testAssert(served(*table, shared) == SOURCE_A);
@@ -246,13 +251,13 @@ void testDetachPreservesRelativeOrderAndReAttachGoesToTheBack() {
 
   // Detach the FIRST. C is now the earliest holder of the shared key, so the same key
   // resolves differently -- the ordering observed from the other side.
-  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
+  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(SWAP_PERMIT, idA);
   testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idC, idD}));
   testAssert(served(*table, shared) == SOURCE_C);
   testAssert(served(*table, cd) == SOURCE_C);
 
   // Re-attach A. It goes to the BACK, so C keeps the shared key and A's own key returns.
-  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack), noContext()).id;
+  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(SWAP_PERMIT, std::move(aBack), noContext()).id;
   testAssert(idA2 != idA);
   testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idC, idD, idA2}));
   testAssert(served(*table, shared) == SOURCE_C);
@@ -260,9 +265,9 @@ void testDetachPreservesRelativeOrderAndReAttachGoesToTheBack() {
 
   // Detach everything. The table is coherent with an empty list: it serves from level 1
   // alone, and a source can be attached again afterwards.
-  (void)table->detachLevelZero(idC);
-  (void)table->detachLevelZero(idD);
-  (void)table->detachLevelZero(idA2);
+  (void)table->detachLevelZero(SWAP_PERMIT, idC);
+  (void)table->detachLevelZero(SWAP_PERMIT, idD);
+  (void)table->detachLevelZero(SWAP_PERMIT, idA2);
   testAssert(table->numLevelZeroSources() == 0);
   testAssert(served(*table, shared) == nullopt);
   table->set(sharedOutputFor(shared, LEVEL_ONE));
@@ -296,8 +301,8 @@ void testASetShadowsTheKeyInEverySourceThatHoldsIt() {
 
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
-  (void)table->attachLevelZero(std::move(cOwned), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, std::move(bOwned), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, std::move(cOwned), noContext()).id;
 
   // Earn counts in the winner, so the transfer has something to carry.
   testAssert(served(*table, shared) == SOURCE_A);
@@ -342,27 +347,27 @@ void testStaleAndForeignHandlesAreRefused() {
   unique_ptr<NNCacheTwoLevelTable> other =
     makeTwoLevelNNCacheTable(sourceOver({nthKey(30)}, SOURCE_B), defaultLevelOne(8), 8);
 
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({nthKey(31)}, SOURCE_B), noContext()).id;
-  (void)table->detachLevelZero(idB);
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(SWAP_PERMIT, sourceOver({nthKey(31)}, SOURCE_B), noContext()).id;
+  (void)table->detachLevelZero(SWAP_PERMIT, idB);
 
   // Stale: the source it named is gone, and the serial it carries is never reissued, so
   // attaching more sources cannot make this id start naming one of them.
-  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(sourceOver({nthKey(32)}, SOURCE_C), noContext()).id;
+  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(SWAP_PERMIT, sourceOver({nthKey(32)}, SOURCE_C), noContext()).id;
   // Observed at the consequence, not at the id: the claim is that spending the stale handle
   // cannot take the source attached after it, so what is watched is the refusal and then
   // whether C is still there and still serving (ADR-0021 Rule 1).
-  testAssert(refused([&]() { (void)table->detachLevelZero(idB); }, "already been detached"));
+  testAssert(refused([&]() { (void)table->detachLevelZero(SWAP_PERMIT, idB); }, "already been detached"));
   testAssert(served(*table, nthKey(32)) == SOURCE_C);  // idB's second detach took nothing
   testAssert(idC != idB);
 
   // Foreign: an id minted by another table's list is refused by name rather than detaching
   // whichever source sits at the same serial here.
   const NNCacheLevelZeroSourceId foreign = other->levelZeroResolutionOrder()[0];
-  testAssert(refused([&]() { (void)table->detachLevelZero(foreign); }, "different cache"));
+  testAssert(refused([&]() { (void)table->detachLevelZero(SWAP_PERMIT, foreign); }, "different cache"));
   testAssert(table->numLevelZeroSources() == 2);
 
   // A null source is refused rather than becoming a hole in the resolution order.
-  testAssert(refused([&]() { (void)table->attachLevelZero(nullptr, noContext()).id; }, "no source was supplied"));
+  testAssert(refused([&]() { (void)table->attachLevelZero(SWAP_PERMIT, nullptr, noContext()).id; }, "no source was supplied"));
   testAssert(table->numLevelZeroSources() == 2);
 
   cout << "  handles: stale id refused, foreign id refused, null source refused; "
@@ -374,9 +379,9 @@ void testStaleAndForeignHandlesAreRefused() {
 void testDetachedSourceIsHandedBackAndReleasable() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(sourceOver({nthKey(40)}, SOURCE_A), defaultLevelOne(8), 8);
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({nthKey(41), nthKey(42)}, SOURCE_B), noContext()).id;
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(SWAP_PERMIT, sourceOver({nthKey(41), nthKey(42)}, SOURCE_B), noContext()).id;
 
-  unique_ptr<NNCacheFrozen> back = table->detachLevelZero(idB);
+  unique_ptr<NNCacheFrozen> back = table->detachLevelZero(SWAP_PERMIT, idB);
   testAssert(back != nullptr);
   testAssert(back->numEntries() == 2);
   testAssert(back->contains(nthKey(41)));
@@ -402,7 +407,7 @@ void testHarvestEmitsOneRowPerKeyInResolutionOrder() {
   const Hash128 bOnly = nthKey(52);
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(sourceOver({shared, aOnly}, SOURCE_A), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(sourceOver({shared, bOnly}, SOURCE_B), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, sourceOver({shared, bOnly}, SOURCE_B), noContext()).id;
 
   testAssert(served(*table, shared) == SOURCE_A);
   testAssert(served(*table, shared) == SOURCE_A);
@@ -450,7 +455,7 @@ void testStatsSumEverySource() {
   const NNCacheStats one = table->stats();
   testAssert(one.residentEntries == bare.residentEntries + 2);
 
-  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, std::move(bOwned), noContext()).id;
   const NNCacheStats two = table->stats();
   testAssert(two.residentEntries == bare.residentEntries + 5);
   testAssert(two.residentPayloadBytes == bare.residentPayloadBytes + aPayload + bPayload);
@@ -494,10 +499,10 @@ void testAReorderedSourcesHarvestIsSummedRatherThanRefused() {
   testAssert(served(*table, shared) == SOURCE_A);
   testAssert(served(*table, shared) == SOURCE_A);   // A has counted two
 
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({shared, bOnly}, SOURCE_B), noContext()).id;
-  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(SWAP_PERMIT, sourceOver({shared, bOnly}, SOURCE_B), noContext()).id;
+  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(SWAP_PERMIT, idA);
   testAssert(served(*table, shared) == SOURCE_B);   // B resolves it now, and counts one
-  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack), noContext()).id;
+  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(SWAP_PERMIT, std::move(aBack), noContext()).id;
 
   // The state under test, observed rather than assumed: A is last, still holds the key
   // unshadowed, and still carries its two.
@@ -546,8 +551,8 @@ void testASummedHarvestThatWillNotFitARowIsRefusedByName() {
   NNCacheFrozen* c = cOwned.get();
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
-  (void)table->attachLevelZero(std::move(cOwned), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, std::move(bOwned), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, std::move(cOwned), noContext()).id;
 
   // Two holders at the ceiling still fit: the refusal is about the row, so it must not fire
   // one addend early.
@@ -573,7 +578,7 @@ void testAnEmptyListReportsExactlyLevelOne() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(sourceOver({nthKey(80), nthKey(81)}, SOURCE_A), defaultLevelOne(8), 8);
   const NNCacheLevelZeroSourceId idA = table->levelZeroResolutionOrder()[0];
-  const NNCacheLevelZeroRelease released = nnCacheReleaseLevelZero(table->detachLevelZero(idA));
+  const NNCacheLevelZeroRelease released = nnCacheReleaseLevelZero(table->detachLevelZero(SWAP_PERMIT, idA));
   testAssert(released.storageReleased);
 
   testAssert(table->numLevelZeroSources() == 0);
@@ -608,7 +613,7 @@ void testAFullyShadowedEarlierSourceStillHoldsItsPlace() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
   const NNCacheLevelZeroSourceId idA = table->levelZeroResolutionOrder()[0];
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({k0, k1}, SOURCE_B), noContext()).id;
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(SWAP_PERMIT, sourceOver({k0, k1}, SOURCE_B), noContext()).id;
 
   testAssert(served(*table, k0) == SOURCE_A);
   // Shadow both of A's keys -- which also shadows B's, so level 1 owns them now.
@@ -623,7 +628,7 @@ void testAFullyShadowedEarlierSourceStillHoldsItsPlace() {
   testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idA, idB}));
   testAssert(table->stats().capacitySlots >= 4);
   testAssert(table->harvestHitCounts().entries().size() == 2);  // level 1's two keys only
-  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
+  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(SWAP_PERMIT, idA);
   testAssert(aBack != nullptr && aBack->numEntries() == 2);
   testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idB}));
   testAssert(served(*table, k0) == LEVEL_ONE);
@@ -653,7 +658,7 @@ void testEverySourceIsTakenFromSoASecondTakeYieldsNothing() {
   NNCacheFrozen* b = bOwned.get();
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(sourceOver({nthKey(100)}, SOURCE_A), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, std::move(bOwned), noContext()).id;
 
   testAssert(served(*table, nthKey(100)) == SOURCE_A);
   testAssert(served(*table, nthKey(100)) == SOURCE_A);
@@ -717,10 +722,10 @@ void testAReorderedSourcesUnwrittenDeltaIsSummedRatherThanLost() {
   testAssert(served(*table, shared) == SOURCE_A);
   testAssert(served(*table, shared) == SOURCE_A);   // A has two unwritten retrievals
 
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({shared, nthKey(112)}, SOURCE_B), noContext()).id;
-  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(SWAP_PERMIT, sourceOver({shared, nthKey(112)}, SOURCE_B), noContext()).id;
+  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(SWAP_PERMIT, idA);
   testAssert(served(*table, shared) == SOURCE_B);   // B now resolves it, and counts one
-  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack), noContext()).id;
+  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(SWAP_PERMIT, std::move(aBack), noContext()).id;
 
   // The state under test, observed rather than assumed: A is last, still holds the key
   // unshadowed, and still carries its two.
@@ -764,8 +769,8 @@ void testASummedDeltaThatWillNotFitARowIsRefusedByName() {
   NNCacheFrozen* a = aOwned.get();
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
-  (void)table->attachLevelZero(std::move(cOwned), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, std::move(bOwned), noContext()).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, std::move(cOwned), noContext()).id;
 
   testAssert(a->addHits(shared, nearlyFull));
   testAssert(b->addHits(shared, nearlyFull));
@@ -808,8 +813,8 @@ void testAReAttachedSourceCannotServeWhatLevelOneOwns() {
   testAssert(served(*table, shared) == SOURCE_A);
 
   const NNCacheLevelZeroSourceId idB =
-    table->attachLevelZero(sourceOver({shared, nthKey(132)}, SOURCE_B), noContext()).id;
-  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
+    table->attachLevelZero(SWAP_PERMIT, sourceOver({shared, nthKey(132)}, SOURCE_B), noContext()).id;
+  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(SWAP_PERMIT, idA);
   testAssert(served(*table, shared) == SOURCE_B);
 
   // THE SET A IS ABSENT FOR. It shadows the key in B, which is attached, and cannot reach A,
@@ -819,7 +824,7 @@ void testAReAttachedSourceCannotServeWhatLevelOneOwns() {
 
   // THE RE-ATTACH. Under the old contract A returned holding the key unshadowed.
   const NNCacheLevelZeroAttachment reattached =
-    table->attachLevelZero(std::move(aBack), noContext());
+    table->attachLevelZero(SWAP_PERMIT, std::move(aBack), noContext());
   testAssert(table->levelZeroResolutionOrder() ==
              vector<NNCacheLevelZeroSourceId>({idB, reattached.id}));
 
@@ -884,7 +889,7 @@ void testAKeyLevelOneEvictedAndThenCarriedBackInAppearsOnce() {
   // The card comes back, holding the key level 1 no longer has. The reconcile leaves it alone,
   // which is the point: level 0 can serve it and level 1 cannot.
   const NNCacheLevelZeroAttachment attachment =
-    table->attachLevelZero(sourceOver({hot}, SOURCE_A), noContext());
+    table->attachLevelZero(SWAP_PERMIT, sourceOver({hot}, SOURCE_A), noContext());
   testAssert(attachment.entriesLevelOneAlreadyOwned == 0);
   testAssert(served(*table, hot) == SOURCE_A);
 
@@ -932,12 +937,12 @@ void testTheDeltaDividesByContextAndTakesOnlyItsOwn() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()), defaultLevelOne(8), 8);
   const NNCacheLevelZeroSourceId placeholder = table->levelZeroResolutionOrder()[0];
-  (void)table->detachLevelZero(placeholder);
+  (void)table->detachLevelZero(SWAP_PERMIT, placeholder);
 
   const NNCacheContextId cardA = table->attachCacheContext("card-a");
   const NNCacheContextId cardB = table->attachCacheContext("card-b");
-  (void)table->attachLevelZero(sourceOver({aZero}, SOURCE_A), optional<NNCacheContextId>(cardA)).id;
-  (void)table->attachLevelZero(sourceOver({bZero}, SOURCE_B), optional<NNCacheContextId>(cardB)).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, sourceOver({aZero}, SOURCE_A), optional<NNCacheContextId>(cardA)).id;
+  (void)table->attachLevelZero(SWAP_PERMIT, sourceOver({bZero}, SOURCE_B), optional<NNCacheContextId>(cardB)).id;
 
   // Each card earns one key and each serves one out of its own level 0. The level-0 retrievals
   // are the ones no attribution can see: they call no set().
@@ -985,7 +990,7 @@ void testTheDeltaDividesByContextAndTakesOnlyItsOwn() {
   const NNCacheContextId foreign = other->attachCacheContext("card-a");
   testAssert(refused([&]() { (void)table->takeUnpersistedHitCountsFor(foreign); }, "not attached to this cache"));
   testAssert(refused(
-    [&]() { (void)table->attachLevelZero(sourceOver({nthKey(158)}, SOURCE_C), optional<NNCacheContextId>(foreign)); },
+    [&]() { (void)table->attachLevelZero(SWAP_PERMIT, sourceOver({nthKey(158)}, SOURCE_C), optional<NNCacheContextId>(foreign)); },
     "attached to a different cache"
   ));
 
@@ -1021,9 +1026,9 @@ void testThePeekReportsTruthfullyAndAdvancesNothing() {
   const std::function<Fixture()> build = [&]() {
     Fixture f;
     f.table = makeTwoLevelNNCacheTable(NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()), defaultLevelOne(8), 8);
-    (void)f.table->detachLevelZero(f.table->levelZeroResolutionOrder()[0]);
+    (void)f.table->detachLevelZero(SWAP_PERMIT, f.table->levelZeroResolutionOrder()[0]);
     f.card = f.table->attachCacheContext("card-peek");
-    (void)f.table->attachLevelZero(sourceOver({zero}, SOURCE_A), f.card).id;
+    (void)f.table->attachLevelZero(SWAP_PERMIT, sourceOver({zero}, SOURCE_A), f.card).id;
     f.table->set(sharedOutputFor(earned, LEVEL_ONE), NNCacheAttribution::toContext(f.card.value()));
     testAssert(served(*f.table, zero) == SOURCE_A);
     testAssert(served(*f.table, zero) == SOURCE_A);
@@ -1074,6 +1079,145 @@ void testThePeekReportsTruthfullyAndAdvancesNothing() {
 
 }  // namespace
 
+// A LEVEL 1 THAT FAILS ON DEMAND, so a throw can be forced at the exact point of the attach
+// reconcile that can really throw.
+//
+// The reconcile asks level 1 about every arriving key through NNCacheTable::contains, and that
+// call is the reconcile's only fallible step: it is a virtual call onto whatever table shape the
+// operator configured. This decorator wraps a real level 1 and forwards everything, except that
+// the Nth contains() throws instead of answering. The fault is injected at the site the claim is
+// about rather than simulated somewhere adjacent (ADR-0021 Rule 1), and it is a real throw out of
+// a real call in the walk, not a flag the code under test consults.
+class FaultInjectingLevelOne final : public NNCacheTable {
+ public:
+  explicit FaultInjectingLevelOne(unique_ptr<NNCacheTable> inner) : inner_(std::move(inner)), containsCalls_(0), throwOnCall_(0) {}
+
+  // 1-based; zero disarms. Resets the call counter so a test can arm, attach, and arm again.
+  void throwOnContainsCall(int64_t n) { throwOnCall_ = n; containsCalls_ = 0; }
+  int64_t containsCalls() const { return containsCalls_; }
+
+  bool contains(Hash128 nnHash) const override {
+    containsCalls_ += 1;
+    if(throwOnCall_ != 0 && containsCalls_ == throwOnCall_)
+      throw StringError("forced fault: level 1 refused to answer contains() mid-reconcile");
+    return inner_->contains(nnHash);
+  }
+
+  bool get(Hash128 nnHash, shared_ptr<NNOutput>& ret) override { return inner_->get(nnHash, ret); }
+  void set(const shared_ptr<NNOutput>& p) override { inner_->set(p); }
+  void clear() override { inner_->clear(); }
+  NNCacheStats stats() const override { return inner_->stats(); }
+
+ private:
+  unique_ptr<NNCacheTable> inner_;
+  mutable int64_t containsCalls_;
+  int64_t throwOnCall_;
+};
+
+// THE ATTACH IS ALL-OR-NOTHING: a throw partway through the reconcile leaves the table exactly as
+// it was, and the source is not attached.
+//
+// WHAT THE DEFECT WAS. The reconcile walks the arriving source and shadows every key level 1
+// already owns, restoring "at most one level owns any key". Asking level 1 is the step that can
+// throw. In one loop, a throw at entry k left the first k keys shadowed -- their evaluations
+// retired, their unpersisted retrievals already moved into level 1's ledger -- and the rest
+// untouched, for an attach that never happened, with nothing recording it. The operation whose
+// whole purpose is restoring an invariant left it half-restored.
+//
+// THE OBSERVATION IS ON STATE THAT SURVIVES THE FAILED ATTACH, through the public surface. The
+// arriving source is owned by the attach and dies with the throw, so the surviving witness of "an
+// entry was shadowed" is where a shadowed entry's retrievals GO: level 1's counter, read through
+// harvestHitCounts. Every key level 1 owns here carries retrievals in the arriving source, so
+// "shadowed" and "its hits arrived in the ledger" are the same event and the ledger observes it
+// exactly. Three legs, all through the ordinary interface:
+//   (1) the resolution list is unchanged and the source is not on it;
+//   (2) the composed hit counts are byte-for-byte what they were before the failed attach;
+//   (3) a later, clean attach of an identical source transfers the FULL hit total -- so nothing
+//       was skimmed off by the attempt that failed, which (2) alone could not distinguish from a
+//       transfer that happened to land on a key with no row.
+void testAThrowMidReconcileLeavesTheAttachAsIfItNeverHappened() {
+  const Hash128 owned0 = nthKey(170);
+  const Hash128 owned1 = nthKey(171);
+  const Hash128 owned2 = nthKey(172);
+
+  // A source that has really served, so its entries carry unpersisted retrievals for the
+  // reconcile to move. It is built by attaching to a scratch table, serving each key, and
+  // detaching -- the ordinary session-boundary history, not a poke at the counters.
+  const auto sourceWithHits = [&]() {
+    unique_ptr<NNCacheFrozen> owned = sourceOver({owned0, owned1, owned2}, SOURCE_B);
+    unique_ptr<NNCacheTwoLevelTable> scratch = makeTwoLevelNNCacheTable(std::move(owned), defaultLevelOne(8), 8);
+    const NNCacheLevelZeroSourceId id = scratch->levelZeroResolutionOrder()[0];
+    testAssert(served(*scratch, owned0) == SOURCE_B);
+    testAssert(served(*scratch, owned1) == SOURCE_B);
+    testAssert(served(*scratch, owned1) == SOURCE_B);
+    testAssert(served(*scratch, owned2) == SOURCE_B);
+    return scratch->detachLevelZero(SWAP_PERMIT, id);
+  };
+  // 1 + 2 + 1 retrievals, all unpersisted, all on keys level 1 will own below.
+  const uint32_t TOTAL_HITS_TO_TRANSFER = 4;
+
+  // The table under test: one placeholder source, and a level 1 that can be made to fail.
+  unique_ptr<FaultInjectingLevelOne> faultyOwned(new FaultInjectingLevelOne(defaultLevelOne(8)));
+  FaultInjectingLevelOne* faulty = faultyOwned.get();
+  unique_ptr<NNCacheTwoLevelTable> table =
+    makeTwoLevelNNCacheTable(sourceOver({nthKey(179)}, SOURCE_A), std::move(faultyOwned), 8);
+  const vector<NNCacheLevelZeroSourceId> orderBefore = table->levelZeroResolutionOrder();
+  testAssert(orderBefore.size() == 1);
+
+  // Level 1 takes ownership of all three keys, and earns retrievals of its own on one of them so
+  // the ledger is not empty before the failed attach -- an unchanged empty ledger would be a
+  // weaker observation than an unchanged populated one.
+  table->set(sharedOutputFor(owned0, LEVEL_ONE));
+  table->set(sharedOutputFor(owned1, LEVEL_ONE));
+  table->set(sharedOutputFor(owned2, LEVEL_ONE));
+  testAssert(served(*table, owned0) == LEVEL_ONE);
+  testAssert(served(*table, owned0) == LEVEL_ONE);
+
+  const NNCacheHitLedger before = table->harvestHitCounts();
+  const uint32_t owned0Before = hitsForKeyIn(before, owned0);
+  const uint32_t owned1Before = hitsForKeyIn(before, owned1);
+  const uint32_t owned2Before = hitsForKeyIn(before, owned2);
+  testAssert(owned0Before == 2);
+
+  // THE FORCED THROW, on the SECOND key the reconcile asks about. Under one loop the first key is
+  // already shadowed and its retrieval already in level 1's ledger by the time this fires.
+  faulty->throwOnContainsCall(2);
+  unique_ptr<NNCacheFrozen> arriving = sourceWithHits();
+  testAssert(refused(
+    [&]() { (void)table->attachLevelZero(SWAP_PERMIT, std::move(arriving), noContext()); },
+    "forced fault"
+  ));
+  // Read the count BEFORE disarming, since disarming resets it: the walk got exactly as far as
+  // the injected fault and no further.
+  testAssert(faulty->containsCalls() == 2);
+  faulty->throwOnContainsCall(0);
+
+  // (1) NOTHING WAS ATTACHED.
+  testAssert(table->numLevelZeroSources() == 1);
+  testAssert(table->levelZeroResolutionOrder() == orderBefore);
+
+  // (2) NO KEY WAS SHADOWED THAT WAS NOT SHADOWED BEFORE, read where a shadow's retrievals land.
+  const NNCacheHitLedger after = table->harvestHitCounts();
+  testAssert(hitsForKeyIn(after, owned0) == owned0Before);
+  testAssert(hitsForKeyIn(after, owned1) == owned1Before);
+  testAssert(hitsForKeyIn(after, owned2) == owned2Before);
+  testAssert(after.entries().size() == before.entries().size());
+
+  // (3) AND THE WHOLE TRANSFER IS STILL THERE TO BE MADE. An identical source, attached cleanly,
+  // hands over every one of the four retrievals -- so the failed attempt took none of them.
+  const NNCacheLevelZeroAttachment clean =
+    table->attachLevelZero(SWAP_PERMIT, sourceWithHits(), noContext());
+  testAssert(clean.entriesLevelOneAlreadyOwned == 3);
+  testAssert(clean.hitsTransferredToLevelOne == (int64_t)TOTAL_HITS_TO_TRANSFER);
+  testAssert(table->numLevelZeroSources() == 2);
+
+  cout << "  a throw at contains() call 2 of the reconcile left " << table->numLevelZeroSources() - 1
+       << " source(s) attached and the level-1 counts at " << hitsForKeyIn(after, owned0) << "/"
+       << hitsForKeyIn(after, owned1) << "/" << hitsForKeyIn(after, owned2)
+       << ", and the clean attach that followed transferred all "
+       << clean.hitsTransferredToLevelOne << " retrievals" << endl;
+}
+
 void Tests::runNNCacheTwoLevelTests() {
   cout << "Running two-level ordered resolution list tests" << endl;
   testFirstMatchInAttachOrderWins();
@@ -1094,5 +1238,6 @@ void Tests::runNNCacheTwoLevelTests() {
   testAKeyLevelOneEvictedAndThenCarriedBackInAppearsOnce();
   testTheDeltaDividesByContextAndTakesOnlyItsOwn();
   testThePeekReportsTruthfullyAndAdvancesNothing();
+  testAThrowMidReconcileLeavesTheAttachAsIfItNeverHappened();
   cout << "Done" << endl;
 }

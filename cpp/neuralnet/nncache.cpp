@@ -944,7 +944,7 @@ unique_ptr<NNCacheTwoLevelTable> NNCacheTable::createWithLevelZeroList(const NNC
   );
   const vector<NNCacheLevelZeroSourceId> order = table->levelZeroResolutionOrder();
   testAssert(order.size() == 1);
-  const unique_ptr<NNCacheFrozen> placeholder = table->detachLevelZero(order[0]);
+  const unique_ptr<NNCacheFrozen> placeholder = table->detachLevelZero(NNCacheLevelZeroSwapPermit(), order[0]);
   testAssert(placeholder != nullptr);
   testAssert(table->numLevelZeroSources() == 0);
   return table;
