@@ -79,6 +79,13 @@ float tagOf(const shared_ptr<NNOutput>& p) {
   return p->whiteScoreMean;
 }
 
+// A SOURCE ATTACHED UNDER NO CONTEXT, which is what most of these tests want: they are about the
+// resolution order and the count surfaces, and not about which card a source was loaded for. The
+// per-context surfaces have their own tests below, which name a context deliberately.
+optional<NNCacheContextId> noContext() {
+  return optional<NNCacheContextId>();
+}
+
 // A frozen source over `keys`, every entry tagged `tag`.
 unique_ptr<NNCacheFrozen> sourceOver(const vector<Hash128>& keys, float tag) {
   vector<unique_ptr<NNOutput>> outputs;
@@ -158,8 +165,8 @@ void testFirstMatchInAttachOrderWins() {
 
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(std::move(bOwned));
-  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(std::move(cOwned));
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(std::move(bOwned), noContext()).id;
+  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(std::move(cOwned), noContext()).id;
   testAssert(table->numLevelZeroSources() == 3);
 
   // Sole holders resolve to themselves.
@@ -219,9 +226,9 @@ void testDetachPreservesRelativeOrderAndReAttachGoesToTheBack() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
   const NNCacheLevelZeroSourceId idA = table->levelZeroResolutionOrder()[0];
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(std::move(bOwned));
-  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(std::move(cOwned));
-  const NNCacheLevelZeroSourceId idD = table->attachLevelZero(std::move(dOwned));
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(std::move(bOwned), noContext()).id;
+  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(std::move(cOwned), noContext()).id;
+  const NNCacheLevelZeroSourceId idD = table->attachLevelZero(std::move(dOwned), noContext()).id;
 
   testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idA, idB, idC, idD}));
   testAssert(served(*table, shared) == SOURCE_A);
@@ -245,7 +252,7 @@ void testDetachPreservesRelativeOrderAndReAttachGoesToTheBack() {
   testAssert(served(*table, cd) == SOURCE_C);
 
   // Re-attach A. It goes to the BACK, so C keeps the shared key and A's own key returns.
-  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack));
+  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack), noContext()).id;
   testAssert(idA2 != idA);
   testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idC, idD, idA2}));
   testAssert(served(*table, shared) == SOURCE_C);
@@ -289,8 +296,8 @@ void testASetShadowsTheKeyInEverySourceThatHoldsIt() {
 
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(std::move(bOwned));
-  (void)table->attachLevelZero(std::move(cOwned));
+  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
+  (void)table->attachLevelZero(std::move(cOwned), noContext()).id;
 
   // Earn counts in the winner, so the transfer has something to carry.
   testAssert(served(*table, shared) == SOURCE_A);
@@ -335,12 +342,12 @@ void testStaleAndForeignHandlesAreRefused() {
   unique_ptr<NNCacheTwoLevelTable> other =
     makeTwoLevelNNCacheTable(sourceOver({nthKey(30)}, SOURCE_B), defaultLevelOne(8), 8);
 
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({nthKey(31)}, SOURCE_B));
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({nthKey(31)}, SOURCE_B), noContext()).id;
   (void)table->detachLevelZero(idB);
 
   // Stale: the source it named is gone, and the serial it carries is never reissued, so
   // attaching more sources cannot make this id start naming one of them.
-  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(sourceOver({nthKey(32)}, SOURCE_C));
+  const NNCacheLevelZeroSourceId idC = table->attachLevelZero(sourceOver({nthKey(32)}, SOURCE_C), noContext()).id;
   // Observed at the consequence, not at the id: the claim is that spending the stale handle
   // cannot take the source attached after it, so what is watched is the refusal and then
   // whether C is still there and still serving (ADR-0021 Rule 1).
@@ -355,7 +362,7 @@ void testStaleAndForeignHandlesAreRefused() {
   testAssert(table->numLevelZeroSources() == 2);
 
   // A null source is refused rather than becoming a hole in the resolution order.
-  testAssert(refused([&]() { (void)table->attachLevelZero(nullptr); }, "no source was supplied"));
+  testAssert(refused([&]() { (void)table->attachLevelZero(nullptr, noContext()).id; }, "no source was supplied"));
   testAssert(table->numLevelZeroSources() == 2);
 
   cout << "  handles: stale id refused, foreign id refused, null source refused; "
@@ -367,7 +374,7 @@ void testStaleAndForeignHandlesAreRefused() {
 void testDetachedSourceIsHandedBackAndReleasable() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(sourceOver({nthKey(40)}, SOURCE_A), defaultLevelOne(8), 8);
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({nthKey(41), nthKey(42)}, SOURCE_B));
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({nthKey(41), nthKey(42)}, SOURCE_B), noContext()).id;
 
   unique_ptr<NNCacheFrozen> back = table->detachLevelZero(idB);
   testAssert(back != nullptr);
@@ -395,7 +402,7 @@ void testHarvestEmitsOneRowPerKeyInResolutionOrder() {
   const Hash128 bOnly = nthKey(52);
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(sourceOver({shared, aOnly}, SOURCE_A), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(sourceOver({shared, bOnly}, SOURCE_B));
+  (void)table->attachLevelZero(sourceOver({shared, bOnly}, SOURCE_B), noContext()).id;
 
   testAssert(served(*table, shared) == SOURCE_A);
   testAssert(served(*table, shared) == SOURCE_A);
@@ -443,7 +450,7 @@ void testStatsSumEverySource() {
   const NNCacheStats one = table->stats();
   testAssert(one.residentEntries == bare.residentEntries + 2);
 
-  (void)table->attachLevelZero(std::move(bOwned));
+  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
   const NNCacheStats two = table->stats();
   testAssert(two.residentEntries == bare.residentEntries + 5);
   testAssert(two.residentPayloadBytes == bare.residentPayloadBytes + aPayload + bPayload);
@@ -487,10 +494,10 @@ void testAReorderedSourcesHarvestIsSummedRatherThanRefused() {
   testAssert(served(*table, shared) == SOURCE_A);
   testAssert(served(*table, shared) == SOURCE_A);   // A has counted two
 
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({shared, bOnly}, SOURCE_B));
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({shared, bOnly}, SOURCE_B), noContext()).id;
   unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
   testAssert(served(*table, shared) == SOURCE_B);   // B resolves it now, and counts one
-  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack));
+  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack), noContext()).id;
 
   // The state under test, observed rather than assumed: A is last, still holds the key
   // unshadowed, and still carries its two.
@@ -539,8 +546,8 @@ void testASummedHarvestThatWillNotFitARowIsRefusedByName() {
   NNCacheFrozen* c = cOwned.get();
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(std::move(bOwned));
-  (void)table->attachLevelZero(std::move(cOwned));
+  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
+  (void)table->attachLevelZero(std::move(cOwned), noContext()).id;
 
   // Two holders at the ceiling still fit: the refusal is about the row, so it must not fire
   // one addend early.
@@ -601,7 +608,7 @@ void testAFullyShadowedEarlierSourceStillHoldsItsPlace() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
   const NNCacheLevelZeroSourceId idA = table->levelZeroResolutionOrder()[0];
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({k0, k1}, SOURCE_B));
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({k0, k1}, SOURCE_B), noContext()).id;
 
   testAssert(served(*table, k0) == SOURCE_A);
   // Shadow both of A's keys -- which also shadows B's, so level 1 owns them now.
@@ -646,7 +653,7 @@ void testEverySourceIsTakenFromSoASecondTakeYieldsNothing() {
   NNCacheFrozen* b = bOwned.get();
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(sourceOver({nthKey(100)}, SOURCE_A), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(std::move(bOwned));
+  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
 
   testAssert(served(*table, nthKey(100)) == SOURCE_A);
   testAssert(served(*table, nthKey(100)) == SOURCE_A);
@@ -710,10 +717,10 @@ void testAReorderedSourcesUnwrittenDeltaIsSummedRatherThanLost() {
   testAssert(served(*table, shared) == SOURCE_A);
   testAssert(served(*table, shared) == SOURCE_A);   // A has two unwritten retrievals
 
-  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({shared, nthKey(112)}, SOURCE_B));
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({shared, nthKey(112)}, SOURCE_B), noContext()).id;
   unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
   testAssert(served(*table, shared) == SOURCE_B);   // B now resolves it, and counts one
-  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack));
+  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack), noContext()).id;
 
   // The state under test, observed rather than assumed: A is last, still holds the key
   // unshadowed, and still carries its two.
@@ -757,8 +764,8 @@ void testASummedDeltaThatWillNotFitARowIsRefusedByName() {
   NNCacheFrozen* a = aOwned.get();
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
-  (void)table->attachLevelZero(std::move(bOwned));
-  (void)table->attachLevelZero(std::move(cOwned));
+  (void)table->attachLevelZero(std::move(bOwned), noContext()).id;
+  (void)table->attachLevelZero(std::move(cOwned), noContext()).id;
 
   testAssert(a->addHits(shared, nearlyFull));
   testAssert(b->addHits(shared, nearlyFull));
@@ -768,6 +775,301 @@ void testASummedDeltaThatWillNotFitARowIsRefusedByName() {
 
   cout << "  overflow refusal: three holders at 2^31-1 each; the take refuses by name rather "
        << "than wrapping the row" << endl;
+}
+
+//-------------------------------------------------------------------------------------
+// The attach contract: a source rejoining the list cannot serve what level 1 has superseded
+//-------------------------------------------------------------------------------------
+
+// THE DEFECT THIS CLOSES, AND THE SEQUENCE THAT REACHED IT. A set shadows the key in every
+// ATTACHED holder. A source that was DETACHED at that moment is not one, so before this fix it
+// came back holding the key unshadowed, sitting on the resolution list AHEAD of the level 1 that
+// now owned the key -- and served the evaluation the set had superseded.
+//
+// THE OBSERVATION IS THE VALUE SERVED THROUGH THE PUBLIC SURFACE, not a shadow bit and not a
+// count: serving a superseded evaluation into a running search is the harm, so that is what is
+// watched (ADR-0021 Rule 1). The evaluations are tagged, so "which one came back" is a fact this
+// test can read rather than infer.
+//
+// Every step is the class's own ordinary interface -- attach, get, detach, set -- so the state is
+// a history a client reaches at a session boundary, not a poke.
+void testAReAttachedSourceCannotServeWhatLevelOneOwns() {
+  const Hash128 shared = nthKey(130);
+  const Hash128 aOnly = nthKey(131);
+  unique_ptr<NNCacheFrozen> aOwned = sourceOver({shared, aOnly}, SOURCE_A);
+  NNCacheFrozen* a = aOwned.get();
+  unique_ptr<NNCacheTwoLevelTable> table =
+    makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
+  const NNCacheLevelZeroSourceId idA = table->levelZeroResolutionOrder()[0];
+
+  // A serves the key and counts it, so the source that will be detached carries real,
+  // unpersisted retrievals -- the thing the reconcile must move rather than discard.
+  testAssert(served(*table, shared) == SOURCE_A);
+  testAssert(served(*table, shared) == SOURCE_A);
+
+  const NNCacheLevelZeroSourceId idB =
+    table->attachLevelZero(sourceOver({shared, nthKey(132)}, SOURCE_B), noContext()).id;
+  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
+  testAssert(served(*table, shared) == SOURCE_B);
+
+  // THE SET A IS ABSENT FOR. It shadows the key in B, which is attached, and cannot reach A,
+  // which is not. Level 1 owns the key from here on.
+  table->set(sharedOutputFor(shared, LEVEL_ONE));
+  testAssert(served(*table, shared) == LEVEL_ONE);
+
+  // THE RE-ATTACH. Under the old contract A returned holding the key unshadowed.
+  const NNCacheLevelZeroAttachment reattached =
+    table->attachLevelZero(std::move(aBack), noContext());
+  testAssert(table->levelZeroResolutionOrder() ==
+             vector<NNCacheLevelZeroSourceId>({idB, reattached.id}));
+
+  // THE OBSERVATION: what the table SERVES. Under the defect this is SOURCE_A -- the frozen
+  // evaluation, ahead of the fresher one level 1 holds.
+  testAssert(served(*table, shared) == LEVEL_ONE);
+  // And the same fact read at the source: its entry for the shared key is retired, while the key
+  // it alone holds is untouched -- the reconcile shadowed what level 1 owned and nothing else.
+  testAssert(!a->contains(shared));
+  testAssert(a->contains(aOnly));
+  testAssert(served(*table, aOnly) == SOURCE_A);
+
+  // WHAT THE RECONCILE REPORTS, so a client is not left to infer it: one entry level 1 already
+  // owned, and the two retrievals it had accrued and never written handed over.
+  testAssert(reattached.entriesLevelOneAlreadyOwned == 1);
+  testAssert(reattached.hitsTransferredToLevelOne == 2);
+
+  // AND THE KEY APPEARS ONCE ACROSS THE COMPOSED HARVEST, carrying every retrieval of it:
+  // A's two, B's one, and the two level 1 has served since the set. Under the defect it appeared
+  // twice -- once from A, once from the level-1 ledger -- and a dump would have raised its
+  // sessions twice for one dump.
+  const NNCacheHitLedger ledger = table->harvestHitCounts();
+  testAssert(hitsForKeyIn(ledger, shared) == 5);   // hitsForKeyIn asserts one row per key
+  int rowsForShared = 0;
+  for(size_t i = 0; i < ledger.entries().size(); i++)
+    rowsForShared += (ledger.entries()[i].key == shared) ? 1 : 0;
+  testAssert(rowsForShared == 1);
+
+  cout << "  attach reconciles: a source detached across a set comes back with " << reattached.entriesLevelOneAlreadyOwned
+       << " entry shadowed and " << reattached.hitsTransferredToLevelOne
+       << " hits handed to level 1; the table serves " << served(*table, shared).value()
+       << " and the key has " << rowsForShared << " row carrying " << hitsForKeyIn(ledger, shared)
+       << " hits" << endl;
+}
+
+// THE AXIS THE RECONCILE DELIBERATELY DOES NOT COVER, closed at the other seam.
+//
+// attach asks what level 1 HOLDS, because only an entry level 1 can still serve could be served
+// wrongly. A key level 1 has EVICTED is a different case: level 1 cannot answer for it, the
+// arriving source can, and shadowing it would throw away pre-warmed content for nobody's benefit.
+// But the level-1 LEDGER ROW OUTLIVES THE ENTRY on purpose -- "this key was hot this session" is
+// the fact a persistence layer wants and a capacity sweep does not make it untrue -- so that key
+// legitimately sits on both halves of the composed count surface.
+//
+// Concatenated, it is two rows for one key, and appendDump would raise its sessions twice for one
+// dump. Folded, it is one row carrying both disjoint sets of real retrievals. This watches the
+// composed surface, which is what a dump actually receives.
+void testAKeyLevelOneEvictedAndThenCarriedBackInAppearsOnce() {
+  const Hash128 hot = nthKey(140);
+  const Hash128 other = nthKey(141);
+  // A ONE-SLOT LEVEL 1, so eviction is deterministic and needs no capacity heuristics: the next
+  // set displaces whatever is there.
+  unique_ptr<NNCacheTwoLevelTable> table =
+    makeTwoLevelNNCacheTable(sourceOver({nthKey(149)}, SOURCE_C), defaultLevelOne(0), 8);
+
+  table->set(sharedOutputFor(hot, LEVEL_ONE));
+  testAssert(served(*table, hot) == LEVEL_ONE);   // a level-1 hit, so the ledger has a row
+  table->set(sharedOutputFor(other, LEVEL_ONE));  // and the one slot is now other's
+  shared_ptr<NNOutput> gone;
+  testAssert(!table->peek(hot, gone));            // level 1 really has evicted it
+
+  // The card comes back, holding the key level 1 no longer has. The reconcile leaves it alone,
+  // which is the point: level 0 can serve it and level 1 cannot.
+  const NNCacheLevelZeroAttachment attachment =
+    table->attachLevelZero(sourceOver({hot}, SOURCE_A), noContext());
+  testAssert(attachment.entriesLevelOneAlreadyOwned == 0);
+  testAssert(served(*table, hot) == SOURCE_A);
+
+  // THE OBSERVATION: one row on the composed surface, carrying the level-1 retrieval AND the
+  // level-0 one. Two rows here is the defect.
+  const NNCacheHitLedger ledger = table->harvestHitCounts();
+  int rowsForHot = 0;
+  for(size_t i = 0; i < ledger.entries().size(); i++)
+    rowsForHot += (ledger.entries()[i].key == hot) ? 1 : 0;
+  testAssert(rowsForHot == 1);
+  testAssert(hitsForKeyIn(ledger, hot) == 2);
+
+  // And the delta surface folds identically -- the one that matters most, because these rows are
+  // increments a count log ADDS.
+  const NNCacheHitLedger take = table->takeUnpersistedHitCounts();
+  int deltaRowsForHot = 0;
+  for(size_t i = 0; i < take.entries().size(); i++)
+    deltaRowsForHot += (take.entries()[i].key == hot) ? 1 : 0;
+  testAssert(deltaRowsForHot == 1);
+  testAssert(hitsForKeyIn(take, hot) == 2);
+
+  cout << "  evicted-then-carried-back: level 1 dropped the entry but kept its ledger row; the "
+       << "composed harvest carries " << rowsForHot << " row of " << hitsForKeyIn(ledger, hot)
+       << " hits and the delta " << deltaRowsForHot << " row of " << hitsForKeyIn(take, hot) << endl;
+}
+
+//-------------------------------------------------------------------------------------
+// The per-context delta
+//-------------------------------------------------------------------------------------
+
+// TWO CARDS ATTACHED AT ONCE, EACH DUMPABLE ON ITS OWN. The whole-table delta cannot be divided
+// by any caller -- a row carries a key, and a key names a position, never a card -- so before
+// this surface existed a session with two contexts attached could not dump counts at all.
+//
+// The division is watched from both sides: A's take must carry A's retrievals and NOT B's, and
+// B's take afterwards must still carry B's whole delta rather than one that A's take had already
+// spent. Both halves are exercised, level 0 and level 1: a card's own pre-warmed entries serve
+// retrievals that never call set(), and the keys it earns are recorded against it by attribution.
+void testTheDeltaDividesByContextAndTakesOnlyItsOwn() {
+  const Hash128 aZero = nthKey(150);   // in A's level-0 source
+  const Hash128 bZero = nthKey(151);   // in B's level-0 source
+  const Hash128 aEarned = nthKey(152); // set under A
+  const Hash128 bEarned = nthKey(153); // set under B
+
+  unique_ptr<NNCacheTwoLevelTable> table =
+    makeTwoLevelNNCacheTable(NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()), defaultLevelOne(8), 8);
+  const NNCacheLevelZeroSourceId placeholder = table->levelZeroResolutionOrder()[0];
+  (void)table->detachLevelZero(placeholder);
+
+  const NNCacheContextId cardA = table->attachCacheContext("card-a");
+  const NNCacheContextId cardB = table->attachCacheContext("card-b");
+  (void)table->attachLevelZero(sourceOver({aZero}, SOURCE_A), optional<NNCacheContextId>(cardA)).id;
+  (void)table->attachLevelZero(sourceOver({bZero}, SOURCE_B), optional<NNCacheContextId>(cardB)).id;
+
+  // Each card earns one key and each serves one out of its own level 0. The level-0 retrievals
+  // are the ones no attribution can see: they call no set().
+  table->set(sharedOutputFor(aEarned, LEVEL_ONE), NNCacheAttribution::toContext(cardA));
+  table->set(sharedOutputFor(bEarned, LEVEL_ONE), NNCacheAttribution::toContext(cardB));
+  testAssert(served(*table, aZero) == SOURCE_A);
+  testAssert(served(*table, aZero) == SOURCE_A);
+  testAssert(served(*table, aEarned) == LEVEL_ONE);
+  testAssert(served(*table, bZero) == SOURCE_B);
+  testAssert(served(*table, bEarned) == LEVEL_ONE);
+  testAssert(served(*table, bEarned) == LEVEL_ONE);
+
+  // A'S DUMP. Two rows, both A's, carrying both halves: the pre-warmed key retrieved twice out of
+  // level 0, and the earned key retrieved once out of level 1.
+  const NNCacheHitLedger takeA = table->takeUnpersistedHitCountsFor(cardA);
+  testAssert(takeA.disposition() == NNCacheHitLedgerDisposition::Counted);
+  testAssert(takeA.entries().size() == 2);
+  testAssert(hitsForKeyIn(takeA, aZero) == 2);
+  testAssert(hitsForKeyIn(takeA, aEarned) == 1);
+  // AND NOT B'S. Watched as an absence made positive: B's two keys have no row here at all.
+  for(size_t i = 0; i < takeA.entries().size(); i++)
+    testAssert(takeA.entries()[i].key != bZero && takeA.entries()[i].key != bEarned);
+
+  // A SECOND TAKE FOR A, WITH NOTHING IN BETWEEN, YIELDS NOTHING. Not "less" -- nothing.
+  testAssert(table->takeUnpersistedHitCountsFor(cardA).entries().empty());
+
+  // AND B'S DELTA IS STILL WHOLE. A's take advanced A's marks and no others, which is the
+  // difference between a per-context take and a filter over a whole-table one: a filter would
+  // have consumed B's rows and dropped them on the floor.
+  const NNCacheHitLedger takeB = table->takeUnpersistedHitCountsFor(cardB);
+  testAssert(takeB.entries().size() == 2);
+  testAssert(hitsForKeyIn(takeB, bZero) == 1);
+  testAssert(hitsForKeyIn(takeB, bEarned) == 2);
+  testAssert(table->takeUnpersistedHitCountsFor(cardB).entries().empty());
+
+  // The delta resumes from the mark rather than from zero or from the total.
+  testAssert(served(*table, aZero) == SOURCE_A);
+  const NNCacheHitLedger takeAgain = table->takeUnpersistedHitCountsFor(cardA);
+  testAssert(takeAgain.entries().size() == 1);
+  testAssert(hitsForKeyIn(takeAgain, aZero) == 1);
+
+  // An id from another table's name space is refused rather than indexing this one's.
+  unique_ptr<NNCacheTwoLevelTable> other =
+    makeTwoLevelNNCacheTable(sourceOver({nthKey(159)}, SOURCE_C), defaultLevelOne(8), 8);
+  const NNCacheContextId foreign = other->attachCacheContext("card-a");
+  testAssert(refused([&]() { (void)table->takeUnpersistedHitCountsFor(foreign); }, "not attached to this cache"));
+  testAssert(refused(
+    [&]() { (void)table->attachLevelZero(sourceOver({nthKey(158)}, SOURCE_C), optional<NNCacheContextId>(foreign)); },
+    "attached to a different cache"
+  ));
+
+  cout << "  per-context delta: A's take " << takeA.entries().size() << " rows (level 0 and level 1, "
+       << "none of B's), A's second take " << table->takeUnpersistedHitCountsFor(cardA).entries().size()
+       << ", B's take still " << takeB.entries().size() << " rows" << endl;
+}
+
+//-------------------------------------------------------------------------------------
+// The non-consuming question
+//-------------------------------------------------------------------------------------
+
+// A PEEK THAT REPORTS TRUTHFULLY AND ADVANCES NOTHING.
+//
+// The property is stated as an equality between two runs and is watched that way: a peek
+// followed by a take yields EXACTLY what the take would have yielded without the peek. So the
+// same history is built twice, side by side, peeked in one and not in the other, and the two
+// takes are compared row for row. A peek that advanced a mark would show up as a shorter take on
+// the peeked side, which no assertion about the peek's own return value could catch
+// (ADR-0021 Rule 1).
+//
+// The state it is peeked in is deliberately the one the old protocol-layer proxy was blind to:
+// retrievals served ENTIRELY OUT OF LEVEL 0, which call no set(), earn no attributed key, and
+// leave the level-1 ledger untouched.
+void testThePeekReportsTruthfullyAndAdvancesNothing() {
+  const Hash128 zero = nthKey(160);
+  const Hash128 earned = nthKey(161);
+
+  struct Fixture {
+    unique_ptr<NNCacheTwoLevelTable> table;
+    optional<NNCacheContextId> card;
+  };
+  const std::function<Fixture()> build = [&]() {
+    Fixture f;
+    f.table = makeTwoLevelNNCacheTable(NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()), defaultLevelOne(8), 8);
+    (void)f.table->detachLevelZero(f.table->levelZeroResolutionOrder()[0]);
+    f.card = f.table->attachCacheContext("card-peek");
+    (void)f.table->attachLevelZero(sourceOver({zero}, SOURCE_A), f.card).id;
+    f.table->set(sharedOutputFor(earned, LEVEL_ONE), NNCacheAttribution::toContext(f.card.value()));
+    testAssert(served(*f.table, zero) == SOURCE_A);
+    testAssert(served(*f.table, zero) == SOURCE_A);
+    testAssert(served(*f.table, earned) == LEVEL_ONE);
+    return f;
+  };
+
+  Fixture peeked = build();
+  Fixture unpeeked = build();
+
+  // The peek, on one of the two only.
+  testAssert(peeked.table->hasUnpersistedHitCountsFor(peeked.card.value()));
+  testAssert(peeked.table->hasUnpersistedHitCountsFor(peeked.card.value()));  // and again, idempotent
+
+  const NNCacheHitLedger afterPeek = peeked.table->takeUnpersistedHitCountsFor(peeked.card.value());
+  const NNCacheHitLedger withoutPeek = unpeeked.table->takeUnpersistedHitCountsFor(unpeeked.card.value());
+  testAssert(afterPeek.entries().size() == withoutPeek.entries().size());
+  testAssert(afterPeek.entries().size() == 2);
+  testAssert(hitsForKeyIn(afterPeek, zero) == hitsForKeyIn(withoutPeek, zero));
+  testAssert(hitsForKeyIn(afterPeek, earned) == hitsForKeyIn(withoutPeek, earned));
+  testAssert(hitsForKeyIn(afterPeek, zero) == 2);
+  testAssert(hitsForKeyIn(afterPeek, earned) == 1);
+
+  // AND IT REPORTS FALSE WHEN THERE IS NOTHING, which is the half that makes the true above mean
+  // something: after the take, both halves are written and the peek says so.
+  testAssert(!peeked.table->hasUnpersistedHitCountsFor(peeked.card.value()));
+  // A single level-0 retrieval -- no set, no earned key, no ledger row -- arms it again. This is
+  // exactly the state the retired protocol proxy read as "nothing to lose".
+  testAssert(served(*peeked.table, zero) == SOURCE_A);
+  testAssert(peeked.table->hasUnpersistedHitCountsFor(peeked.card.value()));
+  // ...and a level-1 retrieval alone arms it too, so neither half is carrying the other.
+  const NNCacheHitLedger drain = peeked.table->takeUnpersistedHitCountsFor(peeked.card.value());
+  testAssert(drain.entries().size() == 1);
+  testAssert(!peeked.table->hasUnpersistedHitCountsFor(peeked.card.value()));
+  testAssert(served(*peeked.table, earned) == LEVEL_ONE);
+  testAssert(peeked.table->hasUnpersistedHitCountsFor(peeked.card.value()));
+
+  // A single-level table keeps no counts, so it has none unpersisted -- and says so rather than
+  // hedging, while still refusing a context it never attached.
+  unique_ptr<NNCacheTable> single = defaultLevelOne(8);
+  const NNCacheContextId singleCard = single->attachCacheContext("card-single");
+  testAssert(!single->hasUnpersistedHitCountsFor(singleCard));
+
+  cout << "  peek: true on level-0-only retrievals, and the take after it carries "
+       << afterPeek.entries().size() << " rows -- identical row for row to the same history never "
+       << "peeked; false once everything is written" << endl;
 }
 
 }  // namespace
@@ -788,5 +1090,9 @@ void Tests::runNNCacheTwoLevelTests() {
   testEverySourceIsTakenFromSoASecondTakeYieldsNothing();
   testAReorderedSourcesUnwrittenDeltaIsSummedRatherThanLost();
   testASummedDeltaThatWillNotFitARowIsRefusedByName();
+  testAReAttachedSourceCannotServeWhatLevelOneOwns();
+  testAKeyLevelOneEvictedAndThenCarriedBackInAppearsOnce();
+  testTheDeltaDividesByContextAndTakesOnlyItsOwn();
+  testThePeekReportsTruthfullyAndAdvancesNothing();
   cout << "Done" << endl;
 }

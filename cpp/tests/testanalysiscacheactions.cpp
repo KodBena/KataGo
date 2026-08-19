@@ -395,8 +395,8 @@ shared_ptr<NNOutput> makeOutput(int serial, bool withOwnerMap) {
   return out;
 }
 
-AnalysisEngineCounters counters(int64_t requestsAccepted, int64_t openRequests) {
-  return AnalysisEngineCounters{requestsAccepted, openRequests};
+AnalysisEngineCounters counters(int64_t openRequests) {
+  return AnalysisEngineCounters{openRequests};
 }
 
 CacheAttachRequest attachAll(const string& context) {
@@ -442,7 +442,7 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
 
   // The dump. Counts first, then evaluations, which is the order the admission predicate needs.
   const CacheDumpRequest dumpBoth{CONTEXT, CacheDumpWhat::Both, NNCacheDiskAdmission::all()};
-  const json dumped = cacheDumpExecute(*engine.hosts, model, attachments, dumpBoth, counters(10, 0));
+  const json dumped = cacheDumpExecute(*engine.hosts, model, attachments, dumpBoth, counters(0));
   testAssert(dumped["evaluations"]["entriesWritten"].get<int64_t>() == 3);
   testAssert(dumped["evaluations"]["alreadyPersisted"].get<int64_t>() == 0);
   testAssert(dumped["counts"]["bytesAppended"].get<int64_t>() > 0);
@@ -450,13 +450,13 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
 
   // A SECOND dump with nothing in between writes NOTHING. Not "not much" -- nothing: the
   // persisted mark says those bytes are already in the file, and the count delta is empty.
-  const json dumpedAgain = cacheDumpExecute(*engine.hosts, model, attachments, dumpBoth, counters(10, 0));
+  const json dumpedAgain = cacheDumpExecute(*engine.hosts, model, attachments, dumpBoth, counters(0));
   testAssert(dumpedAgain["evaluations"]["entriesWritten"].get<int64_t>() == 0);
   testAssert(dumpedAgain["evaluations"]["alreadyPersisted"].get<int64_t>() == 3);
 
   // Detach: nothing is undumped, so it does not refuse.
   const json detached = cacheDetachExecute(
-    *engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, false}, counters(10, 0)
+    *engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, false}
   );
   testAssert(detached["sourcesDetached"].get<int64_t>() == 1);
   testAssert(detached["storageReleased"].get<bool>());
@@ -493,7 +493,7 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
 
   // Leave the model clean for the tests after this one.
   (void)cacheDetachExecute(
-    *engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, true}, counters(10, 0)
+    *engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, true}
   );
 }
 
@@ -513,9 +513,9 @@ void testALevelOneFillAdmitsTheRemainderAndMarksItPersisted(RealEngineCache& eng
   for(int serial = 301; serial <= 303; serial++)
     eval.cacheTable().set(makeOutput(serial, false), NNCacheAttribution::toContext(contextId));
   const CacheDumpRequest dumpEvaluations{context, CacheDumpWhat::Evaluations, NNCacheDiskAdmission::all()};
-  testAssert(cacheDumpExecute(*engine.hosts, model, attachments, dumpEvaluations, counters(1, 0))
+  testAssert(cacheDumpExecute(*engine.hosts, model, attachments, dumpEvaluations, counters(0))
                ["evaluations"]["entriesWritten"].get<int64_t>() == 3);
-  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{context, true}, counters(1, 0));
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{context, true});
   eval.clearCache();
 
   // Re-attach taking ONE key into level 0 and letting the rest into level 1.
@@ -540,7 +540,7 @@ void testALevelOneFillAdmitsTheRemainderAndMarksItPersisted(RealEngineCache& eng
   // dump now writes nothing and reports the two as already persisted. Without the provenance
   // mark this is where the container would grow by the whole filled remainder every session.
   const json dumpedAfterFill =
-    cacheDumpExecute(*engine.hosts, model, attachments, dumpEvaluations, counters(1, 0));
+    cacheDumpExecute(*engine.hosts, model, attachments, dumpEvaluations, counters(0));
   testAssert(dumpedAfterFill["evaluations"]["entriesWritten"].get<int64_t>() == 0);
   // THREE, not two, and the third is worth naming rather than rounding off: the attribution
   // recorder is a record of what this PROCESS earned under this context, and neither a detach
@@ -553,7 +553,7 @@ void testALevelOneFillAdmitsTheRemainderAndMarksItPersisted(RealEngineCache& eng
   cout << "  level0 maxEntries=1 + level1Fill: 1 frozen, "
        << attached["levelOneFilled"].get<int64_t>() << " filled into level 1, all "
        << resolved << " resolve, 0 owed back to disk" << endl;
-  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{context, true}, counters(1, 0));
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{context, true});
   eval.clearCache();
 }
 
@@ -570,7 +570,7 @@ void testALevelOneFillBudgetOfZeroAdmitsNothing(RealEngineCache& engine) {
   testAssert(attached["entriesInLevelZero"].get<int64_t>() == 1);
   testAssert(attached["levelOneFilled"].get<int64_t>() == 0);
   cout << "  a level1Fill budget of 0 bytes admits 0 entries" << endl;
-  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{context, true}, counters(1, 0));
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{context, true});
   engine.hosts->searchableEval(model)->clearCache();
 }
 
@@ -587,7 +587,7 @@ void testDetachRefusesUndumpedWorkUnlessTheClientSaysDiscard(RealEngineCache& en
 
   const std::optional<string> refusal = refusalOf([&]() {
     (void)cacheDetachExecute(
-      *engine.hosts, model, attachments, CacheDetachRequest{OTHER_CONTEXT, false}, counters(1, 0)
+      *engine.hosts, model, attachments, CacheDetachRequest{OTHER_CONTEXT, false}
     );
   });
   testAssert(refusal.has_value());
@@ -601,7 +601,7 @@ void testDetachRefusesUndumpedWorkUnlessTheClientSaysDiscard(RealEngineCache& en
 
   // The same detach with the client saying so goes through, and says how much it threw away.
   const json discarded = cacheDetachExecute(
-    *engine.hosts, model, attachments, CacheDetachRequest{OTHER_CONTEXT, true}, counters(1, 0)
+    *engine.hosts, model, attachments, CacheDetachRequest{OTHER_CONTEXT, true}
   );
   testAssert(discarded["discardedUndumpedEntries"].get<int64_t>() == 1);
   testAssert(!attachments.isAttached(model, OTHER_CONTEXT));
@@ -609,38 +609,225 @@ void testDetachRefusesUndumpedWorkUnlessTheClientSaysDiscard(RealEngineCache& en
        << refusal.value().substr(0, 70) << "...\"" << endl;
 }
 
-// The one case this version refuses, and it is a limit of the surface underneath rather than a
-// policy: the unpersisted count delta is kept per TABLE, so with two contexts attached it cannot
-// be divided between them and is not guessed into one.
-void testDumpingCountsIsRefusedWhileTwoContextsAreAttached(RealEngineCache& engine) {
+// One key's row in a context's count log, or nothing if the log does not mention it. Read off the
+// file every time, because the file is the observation point these tests exist for.
+std::optional<NNCacheCountRow> countRowFor(const string& dir, const string& context, Hash128 key) {
+  const NNCacheCountLogContents contents = NNCacheCountLog::forContext(dir, context).load();
+  testAssert(contents.tail() == NNCacheCountLogTail::Intact);
+  for(size_t i = 0; i < contents.rows().size(); i++) {
+    if(contents.rows()[i].key == key)
+      return contents.rows()[i];
+  }
+  return std::nullopt;
+}
+
+// COUNTS DUMPED PER CONTEXT, WITH TWO CARDS ATTACHED AT ONCE -- which this action refused outright
+// until the table could divide its unpersisted delta by context.
+//
+// THE REFUSAL WAS HONEST AND THE LIMIT WAS REAL: the delta is what a count log may be handed,
+// because a record is an INCREMENT, and a whole-table delta written into one card's file would
+// file the other card's retrievals under it with no field of the response saying so. What has
+// changed is not the policy but the surface underneath -- the division is now made where the two
+// facts live (which source serves which context, which context earned which key) rather than
+// attempted here, where only keys are visible and a key names a position, never a card.
+//
+// THE OBSERVATION IS THE .nncounts FILES, not the response: each card's own file must carry its
+// own retrievals and none of the other's, and the second dump of an untouched card must leave
+// every row of its file exactly as it was.
+void testCountsAreDumpedPerContextWithTwoContextsAttached(RealEngineCache& engine) {
   AnalysisCacheAttachments& attachments = engine.attachments;
   const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+  NNEvaluator& eval = *engine.hosts->searchableEval(model);
+  const string cardA = "card-multi-a";
+  const string cardB = "card-multi-b";
+  const CacheDumpRequest countsA{cardA, CacheDumpWhat::Counts, NNCacheDiskAdmission::all()};
+  const CacheDumpRequest countsB{cardB, CacheDumpWhat::Counts, NNCacheDiskAdmission::all()};
 
-  (void)cacheAttachExecute(*engine.hosts, model, attachments, attachAll(CONTEXT));
-  // One context: counts dump fine. The red leg below is only meaningful against this green one.
-  const CacheDumpRequest countsOnly{CONTEXT, CacheDumpWhat::Counts, NNCacheDiskAdmission::all()};
-  testAssert(!refusalOf([&]() {
-    (void)cacheDumpExecute(*engine.hosts, model, attachments, countsOnly, counters(1, 0));
-  }).has_value());
+  // A FIRST SESSION FOR CARD A ALONE, so that card A has real pre-warmed content on disk for the
+  // second session to serve out of level 0. That is the half no attribution can see -- a level-0
+  // retrieval calls no set() -- and it is the half a mature card is made of.
+  (void)cacheAttachExecute(*engine.hosts, model, attachments, attachAll(cardA));
+  const NNCacheContextId idA = attachments.attachmentFor(model, cardA).contextId;
+  for(int serial = 401; serial <= 403; serial++)
+    eval.cacheTable().set(makeOutput(serial, false), NNCacheAttribution::toContext(idA));
+  const CacheDumpRequest bothA{cardA, CacheDumpWhat::Both, NNCacheDiskAdmission::all()};
+  testAssert(cacheDumpExecute(*engine.hosts, model, attachments, bothA, counters(0))
+               ["evaluations"]["entriesWritten"].get<int64_t>() == 3);
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{cardA, false});
+  eval.clearCache();
 
-  (void)cacheAttachExecute(*engine.hosts, model, attachments, attachAll(OTHER_CONTEXT));
+  // THE SECOND SESSION: both cards attached at once, which is the shape the refusal made
+  // undumpable.
+  const json attachedA = cacheAttachExecute(*engine.hosts, model, attachments, attachAll(cardA));
+  testAssert(attachedA["entriesInLevelZero"].get<int64_t>() == 3);
+  (void)cacheAttachExecute(*engine.hosts, model, attachments, attachAll(cardB));
+  const NNCacheContextId idB = attachments.attachmentFor(model, cardB).contextId;
+  testAssert(attachments.attachedContexts(model).size() == 2);
+
+  // Card A earns nothing and serves one of its own pre-warmed positions twice. Card B earns one
+  // key and retrieves it once. Both halves of both cards are therefore live.
+  shared_ptr<NNOutput> got;
+  testAssert(eval.cacheTable().get(nthKey(401), got));
+  testAssert(eval.cacheTable().get(nthKey(401), got));
+  eval.cacheTable().set(makeOutput(451, false), NNCacheAttribution::toContext(idB));
+  testAssert(eval.cacheTable().get(nthKey(451), got));
+
+  // A'S DUMP, with B attached. It writes A's retrievals...
+  const json dumpedA = cacheDumpExecute(*engine.hosts, model, attachments, countsA, counters(0));
+  testAssert(dumpedA["counts"]["bytesAppended"].get<int64_t>() > 0);
+  const std::optional<NNCacheCountRow> aRow = countRowFor(engine.cacheDir.path(), cardA, nthKey(401));
+  testAssert(aRow.has_value());
+  testAssert(aRow.value().lookups == 2);
+  testAssert(aRow.value().sessions == 1);
+  // ...AND NOT B'S. Watched as a positive observation about A's file: B's key is not in it, and
+  // B's file does not exist yet at all.
+  testAssert(!countRowFor(engine.cacheDir.path(), cardA, nthKey(451)).has_value());
+  testAssert(NNCacheCountLog::forContext(engine.cacheDir.path(), cardB).load().rows().empty());
+
+  // A SECOND DUMP OF A, WITH NOTHING IN BETWEEN, APPENDS NOTHING. Not "little" -- the delta is
+  // empty, so no row of A's file changes and no key's sessions rises. Read off the file: a dump
+  // that had re-appended the running total would show lookups 2 -> 4 and sessions 1 -> 2, which
+  // is exactly the record inflation the delta type exists to prevent.
+  const json dumpedAgain = cacheDumpExecute(*engine.hosts, model, attachments, countsA, counters(0));
+  const std::optional<NNCacheCountRow> aRowAgain = countRowFor(engine.cacheDir.path(), cardA, nthKey(401));
+  testAssert(aRowAgain.has_value());
+  testAssert(aRowAgain.value().lookups == 2);
+  testAssert(aRowAgain.value().sessions == 1);
+  testAssert(dumpedAgain["counts"]["rowsInLog"].get<int64_t>() == dumpedA["counts"]["rowsInLog"].get<int64_t>());
+
+  // AND B'S DELTA IS STILL WHOLE AFTER A TOOK ITS OWN. A whole-table take dressed as a per-context
+  // one would have consumed B's retrieval here and dropped it on the floor, leaving B's file
+  // claiming its key was never looked up.
+  const json dumpedB = cacheDumpExecute(*engine.hosts, model, attachments, countsB, counters(0));
+  testAssert(dumpedB["counts"]["bytesAppended"].get<int64_t>() > 0);
+  const std::optional<NNCacheCountRow> bRow = countRowFor(engine.cacheDir.path(), cardB, nthKey(451));
+  testAssert(bRow.has_value());
+  testAssert(bRow.value().lookups == 1);
+  testAssert(bRow.value().sessions == 1);
+  testAssert(!countRowFor(engine.cacheDir.path(), cardB, nthKey(401)).has_value());
+
+  cout << "  two contexts attached: card A's counts dump wrote its own level-0 retrievals ("
+       << aRow.value().lookups << " lookups, " << aRow.value().sessions << " session) and none of B's; "
+       << "a second dump left them at " << aRowAgain.value().lookups << "/" << aRowAgain.value().sessions
+       << "; B's own dump then carried its " << bRow.value().lookups << endl;
+
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{cardA, true});
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{cardB, true});
+  eval.clearCache();
+}
+
+// THE UNDER-REFUSAL, EXHIBITED, AND THE QUERY THAT CLOSES IT.
+//
+// cache_detach refuses to drop a context holding work that is not on disk. Its evaluations half is
+// exact. Its counts half was a PROXY -- "has the engine accepted any request since this model last
+// dumped counts" -- documented as over-refusing and never under-refusing, WHICH WAS FALSE AS
+// STATED. Two facts make the gap, and both are structural rather than unlucky:
+//
+//   A LEVEL-0 HIT NEVER CALLS set(). NNCacheTwoLevelTable::get bumps the frozen entry's counter
+//   and returns; the attribution recorder is written on the set path alone. So a query served
+//   entirely out of pre-warmed content earns no attributed key, and unpersistedKeysFor -- the
+//   exact half of the refusal -- stays at zero while retrievals accrue.
+//
+//   THE PROXY'S COUNTER RISES AT ACCEPTANCE, NOT AT COMPLETION. A dump is legal while requests are
+//   open and advances its marks at its own harvest, so a request accepted BEFORE a dump and still
+//   running after it keeps recording retrievals the dump did not write while no new acceptance is
+//   ever observed.
+//
+// THE STATE BOTH BLIND SPOTS MEET IN is built below out of the production actions alone: a fully
+// pre-warmed card, re-attached, whose session only re-studies positions it already had. THE
+// EXHIBIT IS THE LOSS ITSELF -- the retrievals are shown to be gone from the file after a detach
+// that the old pair permitted -- and then the same history is shown refused by the query that
+// replaced it.
+void testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(RealEngineCache& engine) {
+  AnalysisCacheAttachments& attachments = engine.attachments;
+  const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+  NNEvaluator& eval = *engine.hosts->searchableEval(model);
+  const string card = "card-prewarmed";
+  const CacheDumpRequest dumpCounts{card, CacheDumpWhat::Counts, NNCacheDiskAdmission::all()};
+
+  // A first session puts two positions on disk and dumps everything, so the card is mature.
+  (void)cacheAttachExecute(*engine.hosts, model, attachments, attachAll(card));
+  const NNCacheContextId contextId = attachments.attachmentFor(model, card).contextId;
+  for(int serial = 501; serial <= 502; serial++)
+    eval.cacheTable().set(makeOutput(serial, false), NNCacheAttribution::toContext(contextId));
+  const CacheDumpRequest dumpBoth{card, CacheDumpWhat::Both, NNCacheDiskAdmission::all()};
+  testAssert(cacheDumpExecute(*engine.hosts, model, attachments, dumpBoth, counters(0))
+               ["evaluations"]["entriesWritten"].get<int64_t>() == 2);
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{card, false});
+  eval.clearCache();
+
+  // THE SESSION THE PROXY WAS BLIND TO: everything served out of level 0, nothing earned.
+  const json reattached = cacheAttachExecute(*engine.hosts, model, attachments, attachAll(card));
+  testAssert(reattached["entriesInLevelZero"].get<int64_t>() == 2);
+  shared_ptr<NNOutput> got;
+  testAssert(eval.cacheTable().get(nthKey(501), got));
+  testAssert(eval.cacheTable().get(nthKey(501), got));
+  testAssert(eval.cacheTable().get(nthKey(502), got));
+
+  // THE EXHIBIT, HALF ONE: both quantities the OLD refusal read are silent in this state.
+  //
+  //   unpersistedKeysFor is empty -- observed here, and it is the very expression cacheDetachExecute
+  //   still evaluates for its evaluations half.
+  //
+  //   The proxy's own comparison was `requestsAcceptedSoFar > requestsAcceptedAtLastCountsDump`,
+  //   against a counter this test supplies exactly as the request loop did. No request has been
+  //   accepted since the dump above, so both sides are the value passed at that dump and the
+  //   comparison is false. It is arithmetic on numbers visible at this call site, not an inference
+  //   about a mechanism.
+  const NNCacheContextId liveContextId = attachments.attachmentFor(model, card).contextId;
+  testAssert(eval.cacheTable().unpersistedKeysFor(liveContextId).empty());
+  // And the retrievals really are there to be lost, read off the per-context surface rather than
+  // the whole-table one -- this fixture's engine has served other cards, and a figure that
+  // included them would not be about this card at all.
+  const NNCacheHitLedger held = eval.cacheTable().harvestHitCountsFor(liveContextId);
+  int64_t heldHits = 0;
+  for(size_t i = 0; i < held.entries().size(); i++)
+    heldHits += (int64_t)held.entries()[i].hits;
+  testAssert(heldHits == 3);
+
+  // THE EXHIBIT, HALF TWO: THE LOSS. A detach that both blind checks permitted is what
+  // discardUndumped:true reproduces exactly -- the same act, with the refusal stood down -- and
+  // the file afterwards is the observation. The three retrievals are not in it, and nothing
+  // anywhere says they happened.
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{card, true});
+  const std::optional<NNCacheCountRow> afterLoss = countRowFor(engine.cacheDir.path(), card, nthKey(501));
+  testAssert(!afterLoss.has_value());
+  eval.clearCache();
+
+  // NOW THE SAME HISTORY AGAIN, AGAINST THE QUERY THAT REPLACED THE PROXY.
+  (void)cacheAttachExecute(*engine.hosts, model, attachments, attachAll(card));
+  testAssert(eval.cacheTable().get(nthKey(501), got));
+  testAssert(eval.cacheTable().get(nthKey(501), got));
+  testAssert(eval.cacheTable().get(nthKey(502), got));
+  const NNCacheContextId secondId = attachments.attachmentFor(model, card).contextId;
+  testAssert(eval.cacheTable().unpersistedKeysFor(secondId).empty());          // still silent
+  testAssert(eval.cacheTable().hasUnpersistedHitCountsFor(secondId));          // and this is not
+
   const std::optional<string> refusal = refusalOf([&]() {
-    (void)cacheDumpExecute(*engine.hosts, model, attachments, countsOnly, counters(1, 0));
+    (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{card, false});
   });
   testAssert(refusal.has_value());
-  testAssert(refusal.value().find("2 contexts are attached") != string::npos);
-  testAssert(refusal.value().find(OTHER_CONTEXT) != string::npos);
+  testAssert(refusal.value().find("retrieval counts that have not been dumped") != string::npos);
+  // Naming zero undumped ENTRIES while refusing anyway is the whole point: this is the state the
+  // entries half cannot see.
+  testAssert(refusal.value().find("0 earned entries") != string::npos);
+  testAssert(attachments.isAttached(model, card));
 
-  // The evaluations leg IS per context and is unaffected, which is what makes the refusal a
-  // boundary rather than a wall.
-  const CacheDumpRequest evaluationsOnly{CONTEXT, CacheDumpWhat::Evaluations, NNCacheDiskAdmission::all()};
+  // AND THE REFUSAL IS ACTIONABLE: the dump it asks for writes exactly those retrievals, after
+  // which the same detach goes through.
+  (void)cacheDumpExecute(*engine.hosts, model, attachments, dumpCounts, counters(0));
+  const std::optional<NNCacheCountRow> saved = countRowFor(engine.cacheDir.path(), card, nthKey(501));
+  testAssert(saved.has_value());
+  testAssert(saved.value().lookups == 2);
+  testAssert(!eval.cacheTable().hasUnpersistedHitCountsFor(secondId));
   testAssert(!refusalOf([&]() {
-    (void)cacheDumpExecute(*engine.hosts, model, attachments, evaluationsOnly, counters(1, 0));
+    (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{card, false});
   }).has_value());
 
-  cout << "  dumping counts with two contexts attached is refused, naming both" << endl;
-  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, true}, counters(1, 0));
-  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{OTHER_CONTEXT, true}, counters(1, 0));
+  cout << "  level-0-only session: 0 earned entries and " << heldHits
+       << " retrievals; a detach with the refusal stood down left the count log with no row for the key, "
+       << "and the non-consuming query refuses instead: \"" << refusal.value().substr(0, 80) << "...\"" << endl;
+  eval.clearCache();
 }
 
 // A foreign source is another model's container. An unknown name is refused naming the loaded
@@ -685,7 +872,7 @@ void testForeignModelSourcesResolveAgainstTheLoadedModels(RealEngineCache& engin
     testAssert(attached["sources"][1]["model"].get<string>() == secondaryName);
     testAssert(eval.numLevelZeroSources() == 2);
     const json detached = cacheDetachExecute(
-      *engine.hosts, model, attachments, CacheDetachRequest{"card-foreign", true}, counters(1, 0)
+      *engine.hosts, model, attachments, CacheDetachRequest{"card-foreign", true}
     );
     testAssert(detached["sourcesDetached"].get<int64_t>() == 2);
     testAssert(eval.numLevelZeroSources() == 0);
@@ -716,7 +903,7 @@ void testStatsReportsWhatIsResidentAndWhatIsAttached(RealEngineCache& engine) {
   cout << "  cache_stats reports " << after["residentEntries"].get<int64_t>() << " resident entries and "
        << after["contexts"].size() << " attached context(s)" << endl;
 
-  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, true}, counters(1, 0));
+  (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, true});
 }
 
 // THE DEBUG TRIPWIRE, EXERCISED BY BYPASSING THE PROTOCOL LAYER ON PURPOSE.
@@ -770,9 +957,10 @@ void testTheDebugTripwireFiresWhenTheProtocolLayerIsBypassed(RealEngineCache& en
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   // The bypass. In a debug build this does not return.
-  const NNCacheLevelZeroSourceId id =
-    eval.attachLevelZeroSource(NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()));
-  (void)id;
+  const NNCacheContextId tripwireContext = eval.attachCacheContext("card-tripwire");
+  const NNCacheLevelZeroAttachment attachment =
+    eval.attachLevelZeroSource(NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()), tripwireContext);
+  (void)attachment;
 
   stop.store(true, std::memory_order_release);
   evaluator.join();
@@ -832,7 +1020,8 @@ void Tests::runAnalysisCacheActionTests() {
     testALevelOneFillAdmitsTheRemainderAndMarksItPersisted(engine);
     testALevelOneFillBudgetOfZeroAdmitsNothing(engine);
     testDetachRefusesUndumpedWorkUnlessTheClientSaysDiscard(engine);
-    testDumpingCountsIsRefusedWhileTwoContextsAreAttached(engine);
+    testCountsAreDumpedPerContextWithTwoContextsAttached(engine);
+    testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(engine);
     testForeignModelSourcesResolveAgainstTheLoadedModels(engine);
     testStatsReportsWhatIsResidentAndWhatIsAttached(engine);
     testTheDebugTripwireFiresWhenTheProtocolLayerIsBypassed(engine);

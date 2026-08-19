@@ -193,6 +193,11 @@ struct CacheAttachedSource {
   int64_t entriesLeftOver;
   int64_t arenaTotalBytes;
   int64_t structureBytes;
+  // What the attach's reconcile against level 1 did to this source: how many of its entries
+  // level 1 already owned -- and were therefore shadowed on the way in, so the superseded
+  // evaluation cannot be served -- and the unpersisted retrievals those entries handed over.
+  int64_t entriesLevelOneAlreadyOwned;
+  int64_t hitsTransferredToLevelOne;
   NNCacheLevelZeroSourceId sourceId;
 };
 
@@ -240,49 +245,31 @@ class AnalysisCacheAttachments {
   void recordAttach(SearchableModelIdx modelIdx, CacheAttachmentRecord record);
   void recordDetach(SearchableModelIdx modelIdx, const std::string& context);
 
-  // HOW MANY REQUESTS THE ENGINE HAD ACCEPTED WHEN THIS MODEL LAST DUMPED ITS COUNTS, against
-  // the engine's own running request count. It is half of what cache_detach's undumped-work
-  // refusal reads, and it exists because there is no way to ask a cache table how many
-  // retrievals are unpersisted WITHOUT CONSUMING THEM: the delta surface is consuming by
-  // design, which is exactly what makes it safe to append. So the question this can ask is
-  // "was any request ACCEPTED since the last counts dump", and a yes arms the refusal.
+  // WHAT USED TO LIVE HERE, and why it does not any more (recorded rather than silently
+  // deleted). This class carried a pair -- noteCountsDumped / anyRequestAcceptedSinceCountsDump
+  // -- that stood in for the question cache_detach actually has to ask: does this context hold
+  // retrieval counts that are not on disk? It stood in because no surface could answer that
+  // without CONSUMING the counts, the delta surface being consuming by design, which is exactly
+  // what makes it safe to append.
   //
-  // WHAT IT IS NOT, STATED FIRST BECAUSE AN EARLIER VERSION OF THIS COMMENT CLAIMED IT WAS.
-  // This is NOT independently sound in the safe direction. The counter it reads is bumped when
-  // a query is ACCEPTED onto the queue (analysis.cpp, beside the openRequests insert), not when
-  // that query finishes; a counts dump is legal while requests are open, and the marks it
-  // advances are taken at the moment of its harvest. So a request accepted BEFORE a dump and
-  // still running AFTER it keeps recording retrievals that the dump did not write, while its
-  // acceptance already predates the dump -- no new acceptance is ever observed, and this reads
-  // false. The class of workload where that is the ONLY thing standing between a detach and a
-  // silent loss is a session with no new evaluations at all, so that the other half of the
-  // refusal cannot fire: a fully pre-warmed context, re-studied with every position already in
-  // level 0. That is not an exotic shape -- it is the mature spaced-repetition card this whole
-  // feature exists for.
+  // The proxy was documented as over-refusing and never under-refusing, AND THAT WAS FALSE AS
+  // STATED. It read the engine's accepted-request counter, which rises when a query is pushed
+  // onto the queue and not when it finishes; a counts dump is legal while requests are open and
+  // advances its marks at its own harvest; so a request accepted BEFORE a dump and still running
+  // after it kept recording retrievals the dump had not written, while no new acceptance was
+  // ever observed. The other half of the refusal did not cover the gap either, because a
+  // retrieval served entirely out of level 0 never calls set() and so earns no key -- which is
+  // the fully pre-warmed card this whole feature is for.
   //
-  // SO THE HONEST STATEMENT IS ABOUT THE PAIR, NOT ABOUT THIS. cacheDetachExecute refuses on
-  // this OR on unpersistedKeysFor(context) being nonempty, and it is the CONJUNCTION of the two
-  // that has held under every adversarial workload anyone has yet built: a request substantial
-  // enough to still be open across a dump has, in every constructed case, also evaluated
-  // positions that were not already on disk, and that is the check that fired. Isolating this
-  // one -- an open request that touches nothing new -- is UNEXERCISED, by this increment's
-  // author and by its reviewer; neither could build the workload, and neither is claiming the
-  // gap is unreachable.
-  //
-  // The fix is not a better proxy. It is a NON-CONSUMING "are there unpersisted counts" query,
-  // which can only be written where the counters live (nncachetwolevel.cpp) and is filed as its
-  // own work. Until then this is a stopgap that is coarse in two further named ways -- the
-  // engine's request counter is not per model, so another model's request arms the refusal, and
-  // a request that hit nothing arms it too -- each costing a client one extra cache_dump, which
-  // writes nothing when there is nothing to write.
-  void noteCountsDumped(SearchableModelIdx modelIdx, int64_t requestsAcceptedSoFar);
-  [[nodiscard]] bool anyRequestAcceptedSinceCountsDump(SearchableModelIdx modelIdx, int64_t requestsAcceptedSoFar) const;
+  // The replacement is not a better proxy: it is NNCacheTable::hasUnpersistedHitCountsFor, a
+  // non-consuming query that reads the same counters against the same marks the per-context take
+  // reads. cacheDetachExecute asks it directly, so nothing in this class stands between the
+  // refusal and the fact any more.
 
  private:
   struct PerModel {
     std::map<std::string, CacheAttachmentRecord> attached;
     std::map<std::string, NNCacheContextId> registered;
-    int64_t requestsAcceptedAtLastCountsDump;
   };
   [[nodiscard]] PerModel& at(SearchableModelIdx modelIdx);
   [[nodiscard]] const PerModel& at(SearchableModelIdx modelIdx) const;
@@ -303,10 +290,6 @@ class AnalysisCacheAttachments {
 // than reached for, because both are the request loop's own bookkeeping and this file is not
 // the place a second copy of them would live (ADR-0012 P1).
 struct AnalysisEngineCounters {
-  // Requests the engine has accepted since it started, as the request loop counts them. Read
-  // by AnalysisCacheAttachments::anyRequestAcceptedSinceCountsDump; see that method for what
-  // it is conservative about.
-  int64_t requestsAcceptedSoFar;
   // Requests open right now. A dump is legal while requests are open -- every structure it
   // reads is thread-safe and off the hot path -- but the documented posture is dump-at-rest,
   // so the count is reported back in the response and a client that dumped live can see that
@@ -327,12 +310,16 @@ struct AnalysisEngineCounters {
 // Frees the context's level-0 sources and their arenas, and asks the allocator for the pages
 // back. REFUSES, naming what would be lost, when the attachment has state newer than its last
 // dump and the request did not say discardUndumped.
+// TAKES NO ENGINE COUNTERS, and used to. It read one to decide whether this context might hold
+// undumped retrieval counts; it now asks the cache that question directly, so the argument became a
+// parameter the body did not honor -- which is a lying signature whether or not anything noticed
+// (ADR-0012 P2). The open-request count it also carried was never this function's: the concurrency
+// refusal belongs to the caller, which is the layer that can hold the engine still.
 [[nodiscard]] nlohmann::json cacheDetachExecute(
   const AnalysisModelHosts& hosts,
   SearchableModelIdx modelIdx,
   AnalysisCacheAttachments& attachments,
-  const CacheDetachRequest& request,
-  const AnalysisEngineCounters& counters
+  const CacheDetachRequest& request
 );
 
 // The one write verb. Appends this model's unpersisted retrieval counts to <context>.nncounts,

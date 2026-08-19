@@ -471,10 +471,18 @@ void NNEvaluator::assertNoEvaluationInFlightForLevelZeroSwap(const char* act) co
 #endif
 }
 
-NNCacheLevelZeroSourceId NNEvaluator::attachLevelZeroSource(std::unique_ptr<NNCacheFrozen> source) {
+NNCacheLevelZeroAttachment NNEvaluator::attachLevelZeroSource(
+  std::unique_ptr<NNCacheFrozen> source, const NNCacheContextId& servesContext
+) {
   NNCacheTwoLevelTable& table = levelZeroTableOrThrow();
   assertNoEvaluationInFlightForLevelZeroSwap("attachLevelZeroSource");
-  return table.attachLevelZero(std::move(source));
+  // REQUIRED HERE, THOUGH THE TABLE ACCEPTS A SOURCE WITHOUT ONE. This is the protocol's door,
+  // and every source that comes through it was loaded from some context's container on that
+  // context's behalf -- so an attach through here that named no context would be a source whose
+  // retrievals no per-context dump could ever write, which is a silent loss with a client on the
+  // other end of it. The table's own door stays permissive because a table can legitimately be
+  // handed a source before any context exists: its own construction does exactly that.
+  return table.attachLevelZero(std::move(source), std::optional<NNCacheContextId>(servesContext));
 }
 
 std::unique_ptr<NNCacheFrozen> NNEvaluator::detachLevelZeroSource(const NNCacheLevelZeroSourceId& id) {

@@ -515,6 +515,7 @@ class NNCacheTableDirect final : public NNCacheTable {
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override;
   void set(const std::shared_ptr<NNOutput>& p) override;
   void clear() override;
+  bool contains(Hash128 nnHash) const override;
   NNCacheStats stats() const override;
 };
 
@@ -545,6 +546,27 @@ NNCacheTableDirect::NNCacheTableDirect(int sizePowerOfTwo, int mutexPoolSizePowe
 NNCacheTableDirect::~NNCacheTableDirect() {
   delete[] entries;
   delete mutexPool;
+}
+
+// This shape's get happens to touch nothing either -- a 1-way direct-mapped table under
+// `always` has no recency, no frequency and no sighting count to move -- so the two bodies look
+// alike. They are still two methods: the equality is a property of THIS shape, and writing
+// contains() as a call to get() here would make the no-trace guarantee depend on that staying
+// true through every future edit of the shape beside it (ADR-0012 P1: the guarantee has one
+// home, which is this method).
+bool NNCacheTableDirect::contains(Hash128 nnHash) const {
+  const uint64_t idx = nnHash.hash0 & tableMask;
+  const uint32_t mutexIdx = (uint32_t)idx & mutexPoolMask;
+  const Entry& entry = entries[idx];
+  std::lock_guard<std::mutex> lock(mutexPool->getMutex(mutexIdx));
+  // The collision-simulation build's own notion of membership, mirrored rather than ignored: a
+  // key this build's get() would answer is a key this build's level 1 owns, and the two must
+  // not disagree about that under any flag.
+#if defined(SIMULATE_TRUE_HASH_COLLISIONS)
+  return entry.ptr != nullptr && ((entry.ptr->nnHash.hash0 ^ nnHash.hash0) & 0xFFF) == 0;
+#else
+  return entry.ptr != nullptr && entry.ptr->nnHash == nnHash;
+#endif
 }
 
 bool NNCacheTableDirect::get(Hash128 nnHash, shared_ptr<NNOutput>& ret) {
@@ -751,6 +773,24 @@ NNCacheHitLedger NNCacheTable::harvestHitCountsFor(const NNCacheContextId& conte
   const vector<Hash128> keys = attributedKeysFor(context);
   (void)keys;
   return NNCacheHitLedger::notCounted();
+}
+
+// The delta twin's default, through the same ownership check and for the same reason: a table
+// with no counters has no unpersisted counts to divide, and "counted, zero rows" would be a
+// claim it cannot make.
+NNCacheHitLedger NNCacheTable::takeUnpersistedHitCountsFor(const NNCacheContextId& context) {
+  const vector<Hash128> keys = attributedKeysFor(context);
+  (void)keys;
+  return NNCacheHitLedger::notCounted();
+}
+
+// And the non-consuming question's default. FALSE IS THE HONEST ANSWER HERE rather than a hedge:
+// a table that keeps no per-key hit counts has none that are unpersisted, so a detach refusal
+// reading this is told the truth about this table and not "probably nothing".
+bool NNCacheTable::hasUnpersistedHitCountsFor(const NNCacheContextId& context) const {
+  const vector<Hash128> keys = attributedKeysFor(context);
+  (void)keys;
+  return false;
 }
 
 //-------------------------------------------------------------------------------------

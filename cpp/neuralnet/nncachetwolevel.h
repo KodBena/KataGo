@@ -3,10 +3,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "../core/hash.h"
 #include "../neuralnet/nncache.h"
+#include "../neuralnet/nncachecontext.h"
 #include "../neuralnet/nncachefrozen.h"
 #include "../neuralnet/nninputs.h"
 
@@ -37,6 +39,14 @@
 // source holds). It is reported ONCE on the count surfaces -- both of them fold every
 // holder's count into one row per key by summing, so a holder that earned its count under an
 // earlier order keeps it (NNCacheLevelZeroSources::harvest).
+//
+// ONE ROW PER KEY IS A PROPERTY OF THE COMPOSED SURFACE, NOT OF THE LIST ALONE, and it is upheld
+// by folding at BOTH seams. The list folds its sources together; the TABLE then folds level 1's
+// rows into the list's, through the same function, because a key can legitimately sit in a
+// level-0 source AND carry a level-1 ledger row -- a ledger row outlives the entry a capacity
+// sweep dropped, and a source attached afterwards is not reconciled against it, since attach
+// asks what level 1 HOLDS. Concatenating the two would put that key on the surface twice, and
+// appendDump would then raise its sessions twice for one dump.
 //
 // THE MISS COST IS ONE CHD PROBE PER ATTACHED SOURCE, ~40-110 ns at real sizes, against
 // the 2.4-2.8 ms an avoided evaluation costs. Three orders of magnitude of headroom is not
@@ -76,6 +86,56 @@
 // "attach and detach are refused while any request is open"), and the refusal that
 // enforces it belongs to the protocol layer that knows the open-request count, not here.
 // The same posture NNCacheTable::attachCacheContext already carries for the same reason.
+
+//-------------------------------------------------------------------------------------
+// What level 1 already owns
+//-------------------------------------------------------------------------------------
+
+// THE QUESTION AN ATTACH MUST ASK BEFORE A SOURCE JOINS THE LIST, as a parameter of attach
+// rather than a step an attach is supposed to remember.
+//
+// WHY THIS TYPE EXISTS. A set transfers a key from every ATTACHED level-0 holder to level 1
+// (shadowAllHolders), which is what keeps "at most one level owns any key" true. A source that
+// was DETACHED across that set is not one of the attached holders, so it comes back holding the
+// key unshadowed and resolves it ahead of the level 1 that now owns it: the superseded
+// evaluation is served, which is precisely the defect shadowing exists to prevent, reintroduced
+// by the act of re-attaching. Witnessed 2026-08-19 through the public surface alone.
+//
+// SO ATTACH RECONCILES, and this type is why it cannot forget to. The list does not own level 1
+// and has no way to reach it, so the ownership question had to arrive from outside -- and it
+// arrives as a REQUIRED ARGUMENT of the only call that puts a source on the list. There is no
+// attach that skips the reconcile, because there is no attach that can be written without
+// handing it the thing the reconcile asks (ADR-0000 Rule 2a: the type forecloses the class
+// rather than a guard catching each instance).
+//
+// TWO METHODS, BECAUSE THE RECONCILE IS TWO ACTS. Asking is not enough: a source's shadowed
+// entry hands back the retrievals it accrued and never persisted, and those are real retrievals
+// that must land in the counter that takes over, or they are lost with nothing to show for it.
+// So the same oracle absorbs them, in the same call, and no caller is trusted to do the second
+// half.
+class NNCacheLevelOneOwner {
+ public:
+  virtual ~NNCacheLevelOneOwner();
+
+  NNCacheLevelOneOwner(const NNCacheLevelOneOwner&) = delete;
+  NNCacheLevelOneOwner& operator=(const NNCacheLevelOneOwner&) = delete;
+
+  // Does level 1 hold an entry for `key` right now?
+  //
+  // IT MUST NOT BE A get. The reconcile asks this once per entry of an arriving source -- a
+  // whole card's worth -- and a retrieval-shaped probe would rewrite a replacement policy's own
+  // data at a session boundary. NNCacheTable::contains is the surface that answers without
+  // leaving a trace, and it is what the implementation here is required to use.
+  [[nodiscard]] virtual bool ownsKeyForResolution(Hash128 key) const = 0;
+
+  // Folds `hits` -- the retrievals a shadowed level-0 entry accrued and never persisted -- into
+  // level 1's counter for `key`. Called only for a key the previous method said yes to, so the
+  // counter it lands in is the one that owns the key.
+  virtual void absorbTransferredHits(Hash128 key, uint32_t hits) = 0;
+
+ protected:
+  NNCacheLevelOneOwner();
+};
 
 //-------------------------------------------------------------------------------------
 // The handle
@@ -128,6 +188,24 @@ class NNCacheLevelZeroSourceId {
   uint64_t serial_;
 };
 
+// WHAT ONE ATTACH PUT ON THE LIST: the handle, and what reconciling the arriving source against
+// level 1 actually did.
+//
+// The second figure is reported rather than absorbed because it is material to the client: a
+// re-attach of a card the session has been evaluating against can find that level 1 already owns
+// most of it, and "45,000 entries loaded, 44,000 of them already owned by level 1" is a very
+// different session from "45,000 loaded" (ADR-0002 -- the number is surfaced, not summed away).
+struct NNCacheLevelZeroAttachment {
+  NNCacheLevelZeroSourceId id;
+  // Entries of the arriving source that level 1 already owned, and which this attach therefore
+  // shadowed on the way in. Zero for a source whose keys level 1 has never seen, which is every
+  // ordinary first attach.
+  int64_t entriesLevelOneAlreadyOwned;
+  // The unpersisted retrievals those shadowed entries carried, handed to level 1's counter. Zero
+  // unless the arriving source is one that served keys before it was detached.
+  int64_t hitsTransferredToLevelOne;
+};
+
 //-------------------------------------------------------------------------------------
 // The ordered resolution list
 //-------------------------------------------------------------------------------------
@@ -151,27 +229,46 @@ class NNCacheLevelZeroSources {
 
   //---- The list -------------------------------------------------------------------
 
-  // Appends `source` at the END of the resolution order and returns the only kind of value
-  // that can address it. LAST ATTACHED IS LAST TRIED: a client that wants a source to win
-  // a key attaches it earlier, which is the whole of the priority mechanism (§10).
+  // Appends `source` at the END of the resolution order, RECONCILED AGAINST LEVEL 1, and returns
+  // what addresses it plus what the reconcile did. LAST ATTACHED IS LAST TRIED: a client that
+  // wants a source to win a key attaches it earlier, which is the whole of the priority
+  // mechanism (§10).
+  //
+  // ATTACH RECONCILES, and that is this call's contract rather than an optimization inside it.
+  // Every entry of the arriving source is asked of `levelOne`, and every key level 1 already
+  // owns is SHADOWED in the arriving source before this returns -- with the unpersisted
+  // retrievals that entry accrued handed to level 1's counter through the same oracle, so a flow
+  // is moved and never dropped. The source therefore joins the list already holding the
+  // one-owner invariant, rather than joining it broken and being repaired later by something
+  // that might not run.
+  //
+  // WHY THIS, AND NOT THE TWO ALTERNATIVES (both weighed, both rejected, 2026-08-19). Checking
+  // level 1 first on every get would cure it too, and would put a permanent tax on the hot path
+  // for a problem that exists only at a session boundary. Refusing to attach a source that
+  // carries a key level 1 owns costs the SAME O(entries) probe and leaves the client worse off:
+  // its card comes back unattachable for a reason it cannot act on. The reconcile pays the probe
+  // exactly once, at the boundary act, and hands back a usable attachment.
+  //
+  // THE COST IS O(ENTRIES) AND IT IS SAFE HERE BECAUSE NOTHING ELSE IS RUNNING. Attach is
+  // refused while any request is open (§7), so the walk is not competing with a get; a
+  // containment probe is what NNCacheTable::contains costs, which for the default table is a
+  // hash, a lock and a comparison. Measured on this box: see the note in
+  // NNCacheTableTwoLevel::attachLevelZero.
+  //
+  // `servesContext` is the context this source was attached ON BEHALF OF, and it is what makes a
+  // per-context dump possible at all: a level-0 retrieval belongs to the card the source came
+  // from, and no key-shaped predicate can recover that -- two cards genuinely share keys. Absent
+  // means "attached under no context", which is a real and legal state (the table's own
+  // construction attaches one that way, and so does any caller that has attached no context);
+  // such a source contributes to the whole-table surfaces and to no per-context one.
   //
   // Throws StringError for a null source: "no source" is represented by this list being
   // shorter, never by it holding a null (ADR-0012 P11).
-  //
-  // KNOWN DEFECT, WITNESSED AND FILED 2026-08-19 -- RE-ATTACHING A SOURCE THAT SAT OUT A SET.
-  // A set shadows the key in every ATTACHED holder (shadowAllHolders); a source detached at
-  // that moment is not one, so it comes back still holding the key unshadowed and resolves it
-  // ahead of the level 1 that now owns it. Witnessed through this surface alone: attach A over
-  // an empty level 1, serve the key, attach B, detach A, serve it from B, set the key, then
-  // re-attach A -- the table serves A's superseded evaluation while level 1 holds the fresh
-  // one, and the key appears on harvestHitCounts TWICE, once from A and once from the level-1
-  // ledger, breaking the one-row-per-key property a dump depends on. NOT FIXED HERE: the cure
-  // is a decision about the attach contract (shadow on re-attach against level 1, or refuse a
-  // source carrying a key level 1 owns), it costs a probe per entry at attach, and it is a
-  // different defect from the harvest folding rule this increment was chartered for. It is
-  // recorded here, at the act that reintroduces the stale holder, rather than narrated
-  // elsewhere and left (ADR-0013 Rule 4).
-  [[nodiscard]] NNCacheLevelZeroSourceId attach(std::unique_ptr<NNCacheFrozen> source);
+  [[nodiscard]] NNCacheLevelZeroAttachment attach(
+    std::unique_ptr<NNCacheFrozen> source,
+    const std::optional<NNCacheContextId>& servesContext,
+    NNCacheLevelOneOwner& levelOne
+  );
 
   // Removes the source `id` names and HANDS IT BACK, leaving the relative order of every
   // other source exactly as it was. Returning it rather than destroying it is what lets
@@ -200,6 +297,11 @@ class NNCacheLevelZeroSources {
   // against that source's entry and no other's. Returns false, leaving `ret` null, when no
   // attached source holds the key.
   bool get(Hash128 key, std::shared_ptr<NNOutput>& ret);
+
+  // Would get() resolve `key` here -- asked without resolving it, without handing back an
+  // evaluation and without counting a retrieval against anybody. The list's half of
+  // NNCacheTable::contains.
+  [[nodiscard]] bool containsUnshadowed(Hash128 key) const;
 
   // Shadows `key` in EVERY attached source that holds it, and returns the total count they
   // gave up.
@@ -273,6 +375,29 @@ class NNCacheLevelZeroSources {
   // Not const, and not a reporting call: it MOVES the marks. Take it once per dump, at rest.
   [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHits();
 
+  // THE SAME TAKE, RESTRICTED TO THE SOURCES ATTACHED ON BEHALF OF `context`, folding by the
+  // same rule through the same function.
+  //
+  // A source serves exactly one context or none, so the restriction is a property of the LIST
+  // and not a filter over rows: a row carries a key, and a key names a position, never a card --
+  // two cards really do share about 3.7% of their keys, so no key-shaped predicate could
+  // divide these rows and any that tried would file one card's retrievals under another.
+  //
+  // Consuming, exactly as the whole-table take is, and only for the sources it visited: a source
+  // of another context keeps its mark, so that context's own dump still finds its delta whole.
+  [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHitsFor(const NNCacheContextId& context);
+
+  // Would takeUnpersistedHitsFor(context) yield anything? Asked without taking and without
+  // moving a mark -- see NNCacheFrozen::anyUnpersistedHits, which this is the list's composition
+  // of, and NNCacheTable::hasUnpersistedHitCountsFor for what needs it.
+  [[nodiscard]] bool anyUnpersistedHitsFor(const NNCacheContextId& context) const;
+
+  // The absolute per-context surface's level-0 half: every unshadowed entry of the sources
+  // attached for `context`, with its running count, in resolution order. The twin of
+  // takeUnpersistedHitsFor, and it reports a pre-warmed entry that earned nothing as a zero
+  // exactly as harvest() does.
+  [[nodiscard]] std::vector<NNCacheHitCount> harvestFor(const NNCacheContextId& context) const;
+
   //---- What the list holds, for stats() -------------------------------------------
 
   [[nodiscard]] int64_t numReachableEntries() const;
@@ -285,6 +410,8 @@ class NNCacheLevelZeroSources {
  private:
   struct Entry {
     uint64_t serial;
+    // The context this source was attached on behalf of, absent for one attached under none.
+    std::optional<NNCacheContextId> servesContext;
     std::unique_ptr<NNCacheFrozen> source;
   };
 
@@ -313,7 +440,17 @@ class NNCacheTwoLevelTable : public NNCacheTable {
 
   // See NNCacheLevelZeroSources for all four; these are the same acts, on this table's own
   // list, and they carry the same refusals.
-  [[nodiscard]] virtual NNCacheLevelZeroSourceId attachLevelZero(std::unique_ptr<NNCacheFrozen> source) = 0;
+  //
+  // The table supplies the level-1 ownership oracle itself -- it is the only object that holds
+  // both halves -- so a caller cannot attach a source without the reconcile and does not have to
+  // know the reconcile exists. `servesContext` must name a context THIS table attached, and is
+  // refused by name otherwise, exactly as an attribution is: spending another cache's id here
+  // would file this source's retrievals under whichever context sits at the same position in
+  // this table's own name space.
+  [[nodiscard]] virtual NNCacheLevelZeroAttachment attachLevelZero(
+    std::unique_ptr<NNCacheFrozen> source,
+    const std::optional<NNCacheContextId>& servesContext
+  ) = 0;
   [[nodiscard]] virtual std::unique_ptr<NNCacheFrozen> detachLevelZero(const NNCacheLevelZeroSourceId& id) = 0;
   [[nodiscard]] virtual size_t numLevelZeroSources() const = 0;
   [[nodiscard]] virtual std::vector<NNCacheLevelZeroSourceId> levelZeroResolutionOrder() const = 0;
@@ -335,6 +472,13 @@ class NNCacheTwoLevelTable : public NNCacheTable {
 // deliberately not a claim about how many sources the table carries afterwards: the
 // protocol drives that, and detaching the last source is legal and leaves a table that
 // serves everything from level 1 until the next attach.
+//
+// THE SOURCE THIS FACTORY TAKES IS ATTACHED UNDER NO CONTEXT, and it goes through the same
+// attach door -- reconcile included -- that every later source goes through. It cannot name a
+// context because no context can exist yet: a context is attached to the table, and the table is
+// what this call is still building. That is the honest reading of the state and not a gap: a
+// source attached before any context serves none, contributes to the whole-table surfaces, and
+// contributes to no per-context dump.
 //
 // `hitLedgerPowerOfTwo` sizes the level-1 hit ledger at 2^k rows. Level 1 has no per-entry
 // counter of its own and adding one would touch four table implementations and change the

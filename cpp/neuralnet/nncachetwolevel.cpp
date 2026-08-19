@@ -43,20 +43,65 @@ NNCacheLevelZeroSources::NNCacheLevelZeroSources()
 
 NNCacheLevelZeroSources::~NNCacheLevelZeroSources() = default;
 
-NNCacheLevelZeroSourceId NNCacheLevelZeroSources::attach(std::unique_ptr<NNCacheFrozen> source) {
+NNCacheLevelOneOwner::NNCacheLevelOneOwner() {}
+NNCacheLevelOneOwner::~NNCacheLevelOneOwner() {}
+
+NNCacheLevelZeroAttachment NNCacheLevelZeroSources::attach(
+  std::unique_ptr<NNCacheFrozen> source,
+  const std::optional<NNCacheContextId>& servesContext,
+  NNCacheLevelOneOwner& levelOne
+) {
   if(source == nullptr)
     throw StringError(
       "NNCacheLevelZeroSources::attach: no source was supplied. A list with nothing "
       "attached is a list of length zero, never a list holding a null."
     );
+
+  // THE RECONCILE, BEFORE THE SOURCE IS REACHABLE. It runs while the source is still this
+  // function's own -- not yet on the list -- so there is no instant at which a get could resolve
+  // a key level 1 owns out of it. The ordering is the guarantee, not an optimization: a
+  // reconcile after the push would leave exactly that window open, and the whole point of doing
+  // this at attach rather than at the next get is that no window exists at all.
+  //
+  // ASKED OF EVERY ENTRY, in index order, through contains() -- the surface that answers
+  // membership without recording a retrieval. What level 1 OWNS is what level 1 HOLDS: an entry
+  // it can still serve is one that would be served after this source, wrongly, if this source
+  // kept resolving the key. A key whose level-1 entry a capacity sweep has already dropped is
+  // deliberately NOT shadowed here -- level 1 cannot serve it, this source can, and shadowing it
+  // would throw away pre-warmed content to no one's benefit. That leaves such a key able to
+  // appear on both halves of the composed count surface, which is closed at the other seam, by
+  // the fold in NNCacheTableTwoLevel::harvestHitCounts (ADR-0000's closure statement: the axis
+  // this reconcile does not cover is named, and covered elsewhere, rather than left silent).
+  NNCacheLevelZeroAttachment attachment{NNCacheLevelZeroSourceId(listId_, nextSerial_), 0, 0};
+  const uint32_t numEntries = source->index().numEntries();
+  for(uint32_t i = 0; i < numEntries; i++) {
+    const Hash128 key = source->index().keyAt(i);
+    if(!levelOne.ownsKeyForResolution(key))
+      continue;
+    const std::optional<uint32_t> transferred = source->shadow(key);
+    // nullopt only if this source's own entry was already shadowed, which a freshly loaded
+    // source's is not and a re-attached one's may well be; either way there is nothing to move.
+    if(!transferred.has_value())
+      continue;
+    attachment.entriesLevelOneAlreadyOwned += 1;
+    if(transferred.value() > 0) {
+      // The retrievals this entry accrued and never wrote. They are real, and level 1's counter
+      // is the one that owns the key now, so they go there rather than being dropped with the
+      // entry they were shadowed out of.
+      levelOne.absorbTransferredHits(key, transferred.value());
+      attachment.hitsTransferredToLevelOne += (int64_t)transferred.value();
+    }
+  }
+
   Entry entry;
   entry.serial = nextSerial_;
+  entry.servesContext = servesContext;
   entry.source = std::move(source);
   nextSerial_ += 1;
   entries_.push_back(std::move(entry));
   // The end of the vector IS the end of the resolution order. Appending is what makes
   // "attach the strongest first" the whole of the priority mechanism.
-  return NNCacheLevelZeroSourceId(listId_, entries_.back().serial);
+  return attachment;
 }
 
 std::unique_ptr<NNCacheFrozen> NNCacheLevelZeroSources::detach(const NNCacheLevelZeroSourceId& id) {
@@ -98,6 +143,14 @@ bool NNCacheLevelZeroSources::get(Hash128 key, std::shared_ptr<NNOutput>& ret) {
   // same key stays untouched and unreached.
   for(size_t i = 0; i < entries_.size(); i++) {
     if(entries_[i].source->get(key, ret))
+      return true;
+  }
+  return false;
+}
+
+bool NNCacheLevelZeroSources::containsUnshadowed(Hash128 key) const {
+  for(size_t i = 0; i < entries_.size(); i++) {
+    if(entries_[i].source->contains(key))
       return true;
   }
   return false;
@@ -154,6 +207,43 @@ void foldByKey(
     );
   into.hits = (uint32_t)summed;
 }
+
+// THE SECOND SEAM THE ONE-ROW-PER-KEY RULE HAS TO HOLD AT: level 1's rows folded into the
+// list's, rather than appended after them.
+//
+// It is the same rule and the same function as the list's own fold -- a key already on the
+// surface keeps its position and takes the sum; a key that is new is appended -- applied where
+// the OTHER pair of owners meets. The list folds its sources against each other; this folds
+// their result against the level-1 ledger, so "one row per key" is a property of what a caller
+// actually receives and not of one of its two halves.
+//
+// WHAT MAKES THE TWO HALVES OVERLAP AT ALL, since a set shadows level 0 as it hands level 1 the
+// key: a ledger row outlives the level-1 ENTRY, deliberately ("this key was hot this session" is
+// the fact a persistence layer wants, and a capacity sweep does not make it untrue), while
+// attach's reconcile shadows only what level 1 still HOLDS. A key evicted from level 1 and then
+// carried in by a re-attached source therefore sits in both, honestly, with two disjoint sets of
+// real retrievals -- which sum.
+//
+// COST, stated because it is not free: one std::map insert per row on a call that is already
+// O(table) and is taken between sessions, never in a search. A dump with no level-1 rows at all
+// pays nothing, which is the freshly-attached case; the multi-source list harvest above has
+// always paid the same map for the same reason.
+std::vector<NNCacheHitCount> foldLevelOneInto(
+  std::vector<NNCacheHitCount> levelZeroRows,
+  const std::vector<NNCacheHitCount>& levelOneRows,
+  const char* caller,
+  const char* consequence
+) {
+  if(levelOneRows.empty())
+    return levelZeroRows;
+  std::vector<NNCacheHitCount> out = std::move(levelZeroRows);
+  std::map<Hash128,size_t> rowFor;
+  for(size_t i = 0; i < out.size(); i++)
+    rowFor.insert(std::make_pair(out[i].key, i));
+  for(size_t i = 0; i < levelOneRows.size(); i++)
+    foldByKey(levelOneRows[i], rowFor, out, caller, consequence);
+  return out;
+}
 }  // namespace
 
 std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvest() const {
@@ -201,6 +291,56 @@ std::vector<NNCacheHitCount> NNCacheLevelZeroSources::takeUnpersistedHits() {
         "NNCacheLevelZeroSources::takeUnpersistedHits",
         "The marks of every source visited so far have already advanced, so this take must "
         "not be retried against the same attachment."
+      );
+  }
+  return out;
+}
+
+std::vector<NNCacheHitCount> NNCacheLevelZeroSources::takeUnpersistedHitsFor(const NNCacheContextId& context) {
+  std::vector<NNCacheHitCount> out;
+  std::map<Hash128, size_t> rowFor;
+  for(size_t i = 0; i < entries_.size(); i++) {
+    // A source attached under no context, or under another one, is NOT taken from. Its mark
+    // stays where it is, so its own context's dump still finds its delta whole -- which is the
+    // difference between a per-context take and a filter applied to a whole-table one.
+    if(!entries_[i].servesContext.has_value() || entries_[i].servesContext.value() != context)
+      continue;
+    const std::vector<NNCacheHitCount> rows = entries_[i].source->takeUnpersistedHits();
+    for(size_t j = 0; j < rows.size(); j++)
+      foldByKey(
+        rows[j], rowFor, out,
+        "NNCacheLevelZeroSources::takeUnpersistedHitsFor",
+        "The marks of every source of this context visited so far have already advanced, so this "
+        "take must not be retried against the same attachment."
+      );
+  }
+  return out;
+}
+
+bool NNCacheLevelZeroSources::anyUnpersistedHitsFor(const NNCacheContextId& context) const {
+  for(size_t i = 0; i < entries_.size(); i++) {
+    if(!entries_[i].servesContext.has_value() || entries_[i].servesContext.value() != context)
+      continue;
+    // The first source with anything to say answers for the whole list: the question is "is
+    // there any", and nothing is consumed on the way to the answer.
+    if(entries_[i].source->anyUnpersistedHits())
+      return true;
+  }
+  return false;
+}
+
+std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvestFor(const NNCacheContextId& context) const {
+  std::vector<NNCacheHitCount> out;
+  std::map<Hash128, size_t> rowFor;
+  for(size_t i = 0; i < entries_.size(); i++) {
+    if(!entries_[i].servesContext.has_value() || entries_[i].servesContext.value() != context)
+      continue;
+    const std::vector<NNCacheHitCount> rows = entries_[i].source->harvest();
+    for(size_t j = 0; j < rows.size(); j++)
+      foldByKey(
+        rows[j], rowFor, out,
+        "NNCacheLevelZeroSources::harvestFor",
+        "This call reports without taking, so nothing has been consumed and no mark has moved."
       );
   }
   return out;
@@ -370,6 +510,45 @@ class HitLedger {
     return out;
   }
 
+  // ONE KEY'S UNPERSISTED DELTA, TAKEN. The per-key twin of takeUnpersisted above, for a dump
+  // that is writing one context's file and must advance the marks of exactly the rows it wrote.
+  // Same rule, same mark, same reason the count is never zeroed -- read that method for both.
+  uint32_t takeUnpersistedFor(Hash128 key) {
+    const uint64_t home = key.hash0 & mask_;
+    std::mutex& mutex = mutexPool_.getMutex((uint32_t)home & mutexMask_);
+    std::lock_guard<std::mutex> lock(mutex);
+    for(uint32_t step = 0; step < PROBE_WINDOW; step++) {
+      Row& row = rows_[(home + step) & mask_];
+      if(row.count == 0)
+        return 0;
+      if(row.key == key) {
+        if(row.count <= row.persisted)
+          return 0;
+        const uint32_t delta = row.count - row.persisted;
+        row.persisted = row.count;
+        return delta;
+      }
+    }
+    return 0;
+  }
+
+  // The same question asked without taking: what takeUnpersistedFor WOULD return, leaving the
+  // mark exactly where it is. The two read the same two words under the same lock, so they
+  // cannot disagree about a state (ADR-0012 P1).
+  uint32_t unpersistedFor(Hash128 key) const {
+    const uint64_t home = key.hash0 & mask_;
+    std::mutex& mutex = mutexPool_.getMutex((uint32_t)home & mutexMask_);
+    std::lock_guard<std::mutex> lock(mutex);
+    for(uint32_t step = 0; step < PROBE_WINDOW; step++) {
+      const Row& row = rows_[(home + step) & mask_];
+      if(row.count == 0)
+        return 0;
+      if(row.key == key)
+        return row.count > row.persisted ? row.count - row.persisted : 0u;
+    }
+    return 0;
+  }
+
   int64_t unrecordedHits() const { return unrecorded_.load(std::memory_order_relaxed); }
   size_t structureBytes() const {
     return rows_.size() * sizeof(Row) + ((size_t)mutexMask_ + 1) * sizeof(std::mutex);
@@ -398,7 +577,10 @@ class HitLedger {
 // The table
 //-------------------------------------------------------------------------------------
 
-class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
+// The table is its own level-1 ownership oracle, and privately so: it is the only object that
+// holds both the arriving source and the level 1 the reconcile must ask about, and nothing
+// outside this file has any business asking it those two questions in isolation.
+class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheLevelOneOwner {
  public:
   NNCacheTableTwoLevel(
     std::unique_ptr<NNCacheFrozen> levelZero,
@@ -411,13 +593,32 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
      ledger_(hitLedgerPowerOfTwo, hitLedgerMutexPowerOfTwo)
   {
     // The factory has already refused a null, so this cannot throw; the first source is
-    // attached through the same door every later one goes through, so there is no second
-    // way for a source to enter the list.
-    (void)levelZero_.attach(std::move(levelZero));
+    // attached through the same door every later one goes through -- reconcile included, against
+    // a level 1 that is empty at this instant and therefore owns nothing -- so there is no
+    // second way for a source to enter the list. It names no context because none can exist
+    // yet: contexts are attached to this table, and this table is what is being built.
+    (void)levelZero_.attach(std::move(levelZero), std::optional<NNCacheContextId>(), *this);
   }
 
-  NNCacheLevelZeroSourceId attachLevelZero(std::unique_ptr<NNCacheFrozen> source) override {
-    return levelZero_.attach(std::move(source));
+  // ATTACH RECONCILES; see NNCacheLevelZeroSources::attach, which is where the walk lives and
+  // where the two rejected alternatives are recorded. This method's own job is the two things
+  // the list cannot do for itself: refuse a context that is not this table's, and be the oracle.
+  //
+  // MEASURED COST OF THE RECONCILE, on this box, at the corpus sizes the design is dimensioned
+  // against: see runnncachetwolevelbench's attach arm. It is one NNCacheTable::contains per
+  // entry of the arriving source, which for the default direct-mapped level 1 is a mask, a lock
+  // and a 128-bit comparison.
+  NNCacheLevelZeroAttachment attachLevelZero(
+    std::unique_ptr<NNCacheFrozen> source,
+    const std::optional<NNCacheContextId>& servesContext
+  ) override {
+    if(servesContext.has_value() && !cacheContexts().owns(servesContext.value()))
+      throw StringError(
+        "NNCacheTwoLevelTable::attachLevelZero: this context is attached to a different cache. "
+        "Spending it here would file this source's retrievals under whichever context sits at "
+        "the same position in this table's own name space, which is a different card."
+      );
+    return levelZero_.attach(std::move(source), servesContext, *this);
   }
   std::unique_ptr<NNCacheFrozen> detachLevelZero(const NNCacheLevelZeroSourceId& id) override {
     return levelZero_.detach(id);
@@ -472,6 +673,13 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
     return levelOne_->get(nnHash, ret);
   }
 
+  // Either level holds it, and nothing is touched in finding out -- NNCacheFrozen::contains
+  // reads the entry's state word without incrementing it, and level 1's own contains is the
+  // no-trace surface by construction.
+  bool contains(Hash128 nnHash) const override {
+    return levelZero_.containsUnshadowed(nnHash) || levelOne_->contains(nnHash);
+  }
+
   // Level 1 only. Level 0 is the pre-warmed content this session was handed; it cannot be
   // rebuilt in process, and clearing it would discard the whole point of having it. The
   // hit counts survive too: clear() is not the end of a session.
@@ -499,21 +707,53 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
     return s;
   }
 
+  //---- The level-1 ownership oracle the reconcile asks ----------------------------
+  //
+  // Private, and implemented right beside the table's own get/set, because the two answers ARE
+  // that state: what level 1 holds, and where a transferred count goes.
+
+  bool ownsKeyForResolution(Hash128 key) const override {
+    // contains(), never get(): the reconcile asks this once per entry of an arriving source, and
+    // a retrieval-shaped probe would move a whole card's worth of keys in level 1's replacement
+    // order and count a sighting for each. See NNCacheTable::contains.
+    return levelOne_->contains(key);
+  }
+
+  void absorbTransferredHits(Hash128 key, uint32_t hits) override {
+    // The same ledger, through the same door, that set() folds a shadowed entry's count into.
+    // A transfer at attach and a transfer at set are the same act -- level 1 taking ownership of
+    // a key that level 0 was holding -- so they land in the same place by construction.
+    ledger_.add(key, hits);
+  }
+
   NNCacheHitLedger harvestHitCounts() const override {
     // The attached sources' unshadowed entries first -- each source in resolution order,
     // each source's entries in index order 0..n-1, which is the harvest order SPEC.md 3.4
     // requires and -- because the input arrived in descending reference count --
     // descending-popularity order within a source. Then level 1's keys. A key held by
     // several sources is emitted once, with their counts summed, by the list (see
-    // NNCacheLevelZeroSources::harvest); and a set shadows the key in every ATTACHED source
-    // at the same moment its count arrives in the ledger, so level 0 and level 1 do not both
-    // report it -- EXCEPT after a source has been detached across a set and re-attached, the
-    // known defect filed on NNCacheLevelZeroSources::attach, which is the one way a key can
-    // still reach this surface twice.
+    // NNCacheLevelZeroSources::harvest).
+    //
+    // AND LEVEL 1'S ROWS ARE FOLDED IN, NOT CONCATENATED. A set shadows the key in every
+    // ATTACHED source at the moment its count arrives in the ledger, and an attach shadows what
+    // level 1 already holds, so the two halves are disjoint in the ordinary case and the fold
+    // costs a map lookup per row and changes nothing. The case it exists for is the one neither
+    // of those covers: a ledger row OUTLIVES the level-1 entry a capacity sweep dropped, and a
+    // source attached after that sweep holds the key legitimately unshadowed -- attach asks what
+    // level 1 HOLDS, and by then it holds nothing. Concatenated, that key appears twice here and
+    // a dump raises its sessions twice for one dump. Summed, it appears once carrying every
+    // retrieval, which is what it is: two disjoint sets of real retrievals of one position, at
+    // different times, kept in two places.
     std::vector<NNCacheHitCount> rows = levelZero_.harvest();
     const std::vector<NNCacheHitCount> levelOneRows = ledger_.harvest();
-    rows.insert(rows.end(), levelOneRows.begin(), levelOneRows.end());
-    return NNCacheHitLedger::counted(std::move(rows), ledger_.unrecordedHits());
+    return NNCacheHitLedger::counted(
+      foldLevelOneInto(
+        std::move(rows), levelOneRows,
+        "NNCacheTableTwoLevel::harvestHitCounts",
+        "This call reports without taking, so nothing has been consumed and no mark has moved."
+      ),
+      ledger_.unrecordedHits()
+    );
   }
 
   // The delta twin of harvestHitCounts above, composed from the same two owners, in the same
@@ -529,8 +769,17 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
   NNCacheHitLedger takeUnpersistedHitCounts() override {
     std::vector<NNCacheHitCount> rows = levelZero_.takeUnpersistedHits();
     const std::vector<NNCacheHitCount> levelOneRows = ledger_.takeUnpersisted();
-    rows.insert(rows.end(), levelOneRows.begin(), levelOneRows.end());
-    return NNCacheHitLedger::counted(std::move(rows), ledger_.unrecordedHits());
+    // Folded, exactly as the absolute surface is and for exactly the same reason -- and here the
+    // cost of getting it wrong is higher, because these rows are INCREMENTS a count log adds:
+    // one key on two rows would raise its sessions twice for a single dump.
+    return NNCacheHitLedger::counted(
+      foldLevelOneInto(
+        std::move(rows), levelOneRows,
+        "NNCacheTableTwoLevel::takeUnpersistedHitCounts",
+        "Every mark this take reached has already advanced, so it must not be retried."
+      ),
+      ledger_.unrecordedHits()
+    );
   }
 
   // What a dump of one context writes. The two facts are owned in two places and joined
@@ -539,17 +788,86 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
   // other -- an earned key with no hit row appears with zero, which is a fact a dump wants,
   // not a row to drop.
   NNCacheHitLedger harvestHitCountsFor(const NNCacheContextId& context) const override {
+    // THE CONTEXT'S LEVEL-0 SOURCES FIRST, then the keys it earned. Three facts, owned in three
+    // places and joined here once: WHICH sources this context attached is the resolution list's
+    // (a source serves one context, and no key-shaped predicate could recover that -- cards
+    // share keys); WHICH level-1 keys it earned is the base table's attribution ledger; HOW
+    // OFTEN each was retrieved is this table's own two counters. Nothing is re-derived from
+    // anything else -- an earned key with no hit row appears with zero, which is a fact a dump
+    // wants and not a row to drop.
+    //
+    // ITS LEVEL-0 HALF IS NOT OPTIONAL, and leaving it out is what made this surface and its
+    // delta twin disagree about what a context's counts even are: a retrieval served out of a
+    // card's own pre-warmed level 0 calls no set() and earns no key, so a per-context surface
+    // built on attributed keys alone would report a fully pre-warmed card as having been
+    // retrieved zero times -- for precisely the mature card this whole feature exists for.
+    std::vector<NNCacheHitCount> rows = levelZero_.harvestFor(context);
     const std::vector<Hash128> keys = attributedKeysFor(context);
-    std::vector<NNCacheHitCount> rows;
-    rows.reserve(keys.size());
+    std::vector<NNCacheHitCount> levelOneRows;
+    levelOneRows.reserve(keys.size());
     for(size_t i = 0; i < keys.size(); i++) {
       NNCacheHitCount row;
       row.key = keys[i];
       row.hits = ledger_.hitsFor(keys[i]);
-      rows.push_back(row);
+      levelOneRows.push_back(row);
     }
     // Zero, and see NNCacheTable::harvestHitCountsFor for why the residue is not divided.
-    return NNCacheHitLedger::counted(std::move(rows), 0);
+    return NNCacheHitLedger::counted(
+      foldLevelOneInto(
+        std::move(rows), levelOneRows,
+        "NNCacheTableTwoLevel::harvestHitCountsFor",
+        "This call reports without taking, so nothing has been consumed and no mark has moved."
+      ),
+      0
+    );
+  }
+
+  // THE DELTA TWIN, over exactly the same population, taking what it reports.
+  //
+  // Both halves are consuming and both are restricted to this context: the sources attached for
+  // it advance their own entry marks, and the ledger advances the mark of each key this context
+  // earned -- and of no other key, so another context's dump still finds its own delta whole.
+  // That is what makes several attached cards dumpable at all: the division is made where the
+  // two facts live, rather than by a caller trying to divide rows that carry only keys.
+  NNCacheHitLedger takeUnpersistedHitCountsFor(const NNCacheContextId& context) override {
+    std::vector<NNCacheHitCount> rows = levelZero_.takeUnpersistedHitsFor(context);
+    const std::vector<Hash128> keys = attributedKeysFor(context);
+    std::vector<NNCacheHitCount> levelOneRows;
+    for(size_t i = 0; i < keys.size(); i++) {
+      const uint32_t delta = ledger_.takeUnpersistedFor(keys[i]);
+      // A KEY WITH NOTHING TO SAY YIELDS NO ROW, exactly as the whole-table delta omits one:
+      // appendDump would raise this key's sessions for a dump in which it earned nothing.
+      if(delta == 0)
+        continue;
+      NNCacheHitCount row;
+      row.key = keys[i];
+      row.hits = delta;
+      levelOneRows.push_back(row);
+    }
+    return NNCacheHitLedger::counted(
+      foldLevelOneInto(
+        std::move(rows), levelOneRows,
+        "NNCacheTableTwoLevel::takeUnpersistedHitCountsFor",
+        "Every mark this take reached has already advanced, so it must not be retried."
+      ),
+      0
+    );
+  }
+
+  // THE SAME QUESTION, ASKED WITHOUT TAKING. It reads the same two counters against the same two
+  // marks that the take above reads, in the same order, and stops at the first thing either has
+  // to say -- so it is true exactly when that take would yield a row, and it leaves every mark
+  // where it found it. See NNCacheTable::hasUnpersistedHitCountsFor for what needs a question
+  // that consumes nothing.
+  bool hasUnpersistedHitCountsFor(const NNCacheContextId& context) const override {
+    if(levelZero_.anyUnpersistedHitsFor(context))
+      return true;
+    const std::vector<Hash128> keys = attributedKeysFor(context);
+    for(size_t i = 0; i < keys.size(); i++) {
+      if(ledger_.unpersistedFor(keys[i]) > 0)
+        return true;
+    }
+    return false;
   }
 
  private:

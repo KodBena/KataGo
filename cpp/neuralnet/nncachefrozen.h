@@ -321,6 +321,20 @@ class NNCacheFrozen {
   // dump path, at rest.
   [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHits();
 
+  // WOULD takeUnpersistedHits() YIELD ANYTHING? Asked without taking, and without moving one
+  // mark.
+  //
+  // It exists because a REFUSAL has to ask this question and cannot use the call above: taking
+  // the delta is what makes the delta safe to append, so a refusal built on it would consume the
+  // very work it refused to lose. The two are held to agree by construction -- this returns true
+  // exactly when that would emit at least one row, reading the same counter against the same
+  // mark under the same shadow test -- rather than by two readings of one rule
+  // (ADR-0012 P1).
+  //
+  // O(entries) worst case and O(1) when the first entry has something to say: it stops at the
+  // first, because "is there any" is answered by one.
+  [[nodiscard]] bool anyUnpersistedHits() const;
+
   // Resident bytes: the index, the counters, the evaluation handles. Not the evaluations
   // themselves -- those are the two payload figures below.
   size_t structureBytes() const;

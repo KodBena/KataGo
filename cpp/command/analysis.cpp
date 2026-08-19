@@ -772,7 +772,7 @@ int MainCmds::analysis(const vector<string>& args) {
             std::lock_guard<std::mutex> lock(openRequestsMutex);
             openRequestCount = (int64_t)openRequests.size();
           }
-          const AnalysisEngineCounters counters{numRequestsSoFar, openRequestCount};
+          const AnalysisEngineCounters counters{openRequestCount};
 
           //The decode's refusal is reported before the concurrency one deliberately: a client with a
           //typo'd field learns about the typo rather than being told to try again later and hitting
@@ -798,7 +798,7 @@ int MainCmds::analysis(const vector<string>& args) {
               else if(openRequestCount > 0)
                 reportErrorForId(rbase.id, "action", cacheSwapConcurrencyRefusal("cache_detach", openRequestCount));
               else {
-                result = cacheDetachExecute(modelHosts, modelIdx, cacheAttachments, decoded.value().value(), counters);
+                result = cacheDetachExecute(modelHosts, modelIdx, cacheAttachments, decoded.value().value());
                 handled = true;
               }
             }

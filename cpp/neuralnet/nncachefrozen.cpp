@@ -511,6 +511,22 @@ std::vector<NNCacheHitCount> NNCacheFrozen::takeUnpersistedHits() {
   return out;
 }
 
+bool NNCacheFrozen::anyUnpersistedHits() const {
+  const uint32_t n = index_.numEntries();
+  for(uint32_t i = 0; i < n; i++) {
+    const uint32_t state = index_.stateAt(i).load(std::memory_order_relaxed);
+    // A shadowed entry is level 1's key now, exactly as takeUnpersistedHits skips it: whatever
+    // it had left went to level 1's counter at the shadow, and its mark went with it.
+    if((state & SHADOW_BIT) != 0)
+      continue;
+    // The same comparison takeUnpersistedHits makes, and nothing else: no exchange, so the mark
+    // stands and the next take reports exactly what it would have reported had this never run.
+    if((state & COUNT_MASK) > index_.persistedCountAt(i).load(std::memory_order_relaxed))
+      return true;
+  }
+  return false;
+}
+
 size_t NNCacheFrozen::structureBytes() const {
   return
     index_.structureBytes() +

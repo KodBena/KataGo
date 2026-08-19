@@ -378,6 +378,28 @@ class NNCacheTable {
   virtual void set(const std::shared_ptr<NNOutput>& p) = 0;
   virtual void clear() = 0;
 
+  // DOES THIS TABLE HOLD AN ENTRY FOR `nnHash` RIGHT NOW, TOUCHING NOTHING AT ALL?
+  //
+  // WHY IT IS NOT get(), AND WHY IT IS NOT peek() EITHER. A get is a RETRIEVAL, and several
+  // shapes record that one happened: the chained table moves the entry to the front of its
+  // recency order, the probed table's eviction policy marks a hit, and the sighting table
+  // counts a sighting for EVERY key it is handed -- present or absent, in a ghost that decides
+  // which of two candidates keeps a slot. Those are correct responses to a query. They are
+  // wrong responses to an OWNERSHIP QUESTION asked by machinery that is not querying at all:
+  // NNCacheLevelZeroSources::attach asks it once per entry of an arriving level-0 source, so a
+  // get-shaped probe would count an entire card's worth of sightings that no client ever made
+  // and would rewrite a replacement policy's own data at a session boundary (ADR-0009 -- the
+  // instrument must not be inside the instrument).
+  //
+  // PURE VIRTUAL, DELIBERATELY, rather than defaulted to get(). A default is exactly the shape
+  // that lets a table which never thought about this question perturb its own replacement state
+  // silently, at a call site with no way to notice. The compiler refusing to build a table that
+  // has not answered is the strongest available surface for that (ADR-0002).
+  //
+  // Thread-safe, and it takes whatever lock a lookup takes: it is not lock-free, it just leaves
+  // no trace.
+  [[nodiscard]] virtual bool contains(Hash128 nnHash) const = 0;
+
   // Retrieves an entry WITHOUT counting a retrieval against it, and without consulting any
   // pre-warmed level 0.
   //
@@ -491,6 +513,59 @@ class NNCacheTable {
   // reported once, whole, by harvestHitCounts() and harvestAttribution(), and are never
   // smeared across per-context dumps where each context would appear to carry all of them.
   [[nodiscard]] virtual NNCacheHitLedger harvestHitCountsFor(const NNCacheContextId& context) const;
+
+  // THE DELTA TWIN OF harvestHitCountsFor: exactly the rows a dump of `context` appends, taking
+  // them as it reports them.
+  //
+  // It stands to harvestHitCountsFor exactly as takeUnpersistedHitCounts stands to
+  // harvestHitCounts -- CONSUMING, and OMITTING A KEY WITH NOTHING TO SAY -- and it exists for
+  // the same reason that one does: a count log record is an INCREMENT, so what a dump may
+  // append is the delta, never the running total.
+  //
+  // WHY A PER-CONTEXT DELTA IS A SURFACE AND NOT A FILTER THE CALLER APPLIES. The whole-table
+  // delta is exact only while one context is attached, because then everything the table earned
+  // and everything its level 0 served belongs to that one context. With two attached, a caller
+  // holding the whole-table delta cannot divide it: the rows carry keys, and a key names a
+  // position, never a card. The division is knowable only where the two facts live -- which
+  // level-0 source serves which context, and which context earned which level-1 key -- and both
+  // of those live in the table. So the table divides, and the marks it advances are exactly the
+  // ones whose rows it handed over (ADR-0012 P1).
+  //
+  // unrecordedHits() on the result is zero, for the reason harvestHitCountsFor states: the
+  // residues are hits whose CONTEXT is what was lost, so they cannot be divided among contexts
+  // and are reported once, whole, by the whole-table surfaces.
+  //
+  // WHAT NO PER-CONTEXT DUMP WRITES, named rather than left to be discovered. Retrievals of a key
+  // that no context can be attributed to -- a key earned while several contexts were attached and
+  // the request named none, or earned before any context was -- belong to no context's file, so
+  // they are written by no per-context dump and their marks never advance. That population is not
+  // silent: it is exactly what NNCacheAttributionLedger::noAttributableContextEntries counts, and
+  // the dump action reports that figure in every response. The same is true of a level-0 source
+  // attached under no context, which only the whole-table delta above ever reaches.
+  //
+  // NotCounted from a table that keeps no per-key hit counts. Throws StringError for a context
+  // this table did not attach.
+  [[nodiscard]] virtual NNCacheHitLedger takeUnpersistedHitCountsFor(const NNCacheContextId& context);
+
+  // ARE THERE UNPERSISTED HIT COUNTS FOR `context`, WITHOUT TAKING THEM?
+  //
+  // THE NON-CONSUMING QUESTION, which is the only question a REFUSAL can ask. cache_detach
+  // refuses to drop a context holding work that has not reached disk; to ask "is there any" it
+  // may not use the delta surface, because taking the delta advances the marks -- which is
+  // exactly what makes the delta safe to append, and exactly what would make a refusal destroy
+  // the thing it refused to lose. Before this existed the refusal read a protocol-layer PROXY
+  // (whether any request had been accepted since the last counts dump), which under-refuses:
+  // a retrieval served entirely out of level 0 calls no set(), records no attributed key, and
+  // accepts no new request, so a session that only re-studied pre-warmed positions could be
+  // detached with every one of its retrievals unwritten.
+  //
+  // TRUE MEANS EXACTLY "takeUnpersistedHitCountsFor(context) WOULD YIELD AT LEAST ONE ROW", so
+  // the two cannot disagree about a state. False from a table that keeps no per-key hit counts
+  // -- which is not a hedge: a table that counts nothing has nothing unpersisted.
+  //
+  // Const, and it advances no mark anywhere. Throws StringError for a context this table did
+  // not attach.
+  [[nodiscard]] virtual bool hasUnpersistedHitCountsFor(const NNCacheContextId& context) const;
 
   // Thread-safe, and O(table). See NNCacheStats: a reporting call, not a hot-path one.
   virtual NNCacheStats stats() const = 0;
