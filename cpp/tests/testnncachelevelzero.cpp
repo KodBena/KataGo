@@ -125,7 +125,7 @@ void writeContainerBlock(const string& dir, const vector<shared_ptr<const NNOutp
 
 void writeCountDump(const string& dir, const vector<NNCacheHitCount>& rows) {
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir, CONTEXT);
-  const NNCacheCountLogAppendResult r = log.appendDump(NNCacheHitLedger::counted(rows, 0));
+  const NNCacheCountLogAppendResult r = log.appendDump(NNCacheHitCountDelta::ofDeltaRows(rows, 0));
   testAssert(r.bytesAppended > 0);
 }
 

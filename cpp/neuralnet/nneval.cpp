@@ -84,6 +84,11 @@ NNEvaluator::NNEvaluator(
    computeContext(NULL),
    loadedModel(NULL),
    nnCacheTable(nullptr),
+   nnCacheLevelZeroTable(nullptr),
+   nnCacheDirectory(nnCacheConfig.cacheDirectory),
+#ifndef NDEBUG
+   nnCacheEvaluationsInFlight(0),
+#endif
    logger(lg),
    internalModelName(),
    modelVersion(-1),
@@ -126,8 +131,19 @@ NNEvaluator::NNEvaluator(
     );
   }
 
-  if(nnCacheConfig.sizePowerOfTwo >= 0)
-    nnCacheTable = NNCacheTable::create(nnCacheConfig);
+  // A configured cache directory IS the decision to carry a level-0 resolution list, so the
+  // two branches here are the whole of that decision and nothing downstream re-decides it.
+  // Without one, this is byte for byte the table this evaluator always built.
+  if(nnCacheConfig.sizePowerOfTwo >= 0) {
+    if(nnCacheConfig.cacheDirectory.has_value()) {
+      std::unique_ptr<NNCacheTwoLevelTable> twoLevel = NNCacheTable::createWithLevelZeroList(nnCacheConfig);
+      nnCacheLevelZeroTable = twoLevel.get();
+      nnCacheTable = std::move(twoLevel);
+    }
+    else {
+      nnCacheTable = NNCacheTable::create(nnCacheConfig);
+    }
+  }
 
   if(!debugSkipNeuralNet) {
     vector<int> gpuIdxs = gpuIdxByServerThread;
@@ -173,6 +189,7 @@ NNEvaluator::~NNEvaluator() {
     NeuralNet::freeLoadedModel(loadedModel);
   loadedModel = NULL;
 
+  nnCacheLevelZeroTable = nullptr;
   nnCacheTable.reset();
 }
 
@@ -407,6 +424,67 @@ NNCacheHitLedger NNEvaluator::harvestCacheHitCountsFor(const NNCacheContextId& c
       "attached to it and none has earned anything here."
     );
   return nnCacheTable->harvestHitCountsFor(context);
+}
+
+const std::optional<std::string>& NNEvaluator::getCacheDirectory() const {
+  return nnCacheDirectory;
+}
+
+NNCacheTable& NNEvaluator::cacheTable() const {
+  if(nnCacheTable == nullptr)
+    throw StringError(
+      "NNEvaluator: model '" + modelName + "' has no NN cache configured (nnCacheSizePowerOfTwo "
+      "is negative), so there is no cache table to read or persist."
+    );
+  return *nnCacheTable;
+}
+
+// The one home of "this evaluator was built with a level-0 resolution list", so the three
+// surfaces below refuse in the same words and a fourth cannot drift from them.
+NNCacheTwoLevelTable& NNEvaluator::levelZeroTableOrThrow() const {
+  if(nnCacheLevelZeroTable == nullptr)
+    throw StringError(
+      "NNEvaluator: model '" + modelName + "' has no persisted cache: '" +
+      string(NNCacheConfig::KEY_DIR) + "' is not set in its config, so its cache was built "
+      "without a level-0 resolution list and there is nothing to attach a context to."
+    );
+  return *nnCacheLevelZeroTable;
+}
+
+// The debug tripwire both acts carry. It observes the property the contract is about -- an
+// evaluation is inside evaluate(), and therefore may be inside the lock-free walk of the very
+// vector these acts mutate -- at the moment of the act, rather than a symptom of it later
+// (ADR-0021 Rule 1). Compiled out of a release build entirely.
+void NNEvaluator::assertNoEvaluationInFlightForLevelZeroSwap(const char* act) const {
+#ifndef NDEBUG
+  const int inFlight = nnCacheEvaluationsInFlight.load(std::memory_order_acquire);
+  if(inFlight != 0)
+    Global::fatalError(
+      "NNEvaluator: " + string(act) + " on model '" + modelName + "' while " +
+      Global::intToString(inFlight) + " evaluation(s) are in flight. A get walks the level-0 "
+      "resolution list lock-free and this mutates the vector it walks, so this is a "
+      "use-after-free, not a torn counter. The analysis engine's protocol layer refuses "
+      "cache_attach and cache_detach while any request is open; this caller reached past it."
+    );
+#else
+  (void)act;
+#endif
+}
+
+NNCacheLevelZeroSourceId NNEvaluator::attachLevelZeroSource(std::unique_ptr<NNCacheFrozen> source) {
+  NNCacheTwoLevelTable& table = levelZeroTableOrThrow();
+  assertNoEvaluationInFlightForLevelZeroSwap("attachLevelZeroSource");
+  return table.attachLevelZero(std::move(source));
+}
+
+std::unique_ptr<NNCacheFrozen> NNEvaluator::detachLevelZeroSource(const NNCacheLevelZeroSourceId& id) {
+  NNCacheTwoLevelTable& table = levelZeroTableOrThrow();
+  assertNoEvaluationInFlightForLevelZeroSwap("detachLevelZeroSource");
+  return table.detachLevelZero(id);
+}
+
+size_t NNEvaluator::numLevelZeroSources() const {
+  return levelZeroTableOrThrow().numLevelZeroSources();
 }
 
 
@@ -935,6 +1013,11 @@ void NNEvaluator::evaluate(
   bool includeOwnerMap
 ) {
   testAssert(!isKilled);
+#ifndef NDEBUG
+  // See assertNoEvaluationInFlightForLevelZeroSwap. Debug builds only; the release build's
+  // evaluation path is unchanged.
+  const InFlightEvaluationMark inFlightMark(nnCacheEvaluationsInFlight);
+#endif
   buf.hasResult = false;
 
   // THE CACHE-CONTEXT TAG IS CONSUMED HERE, not read at the end.

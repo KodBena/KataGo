@@ -44,9 +44,12 @@ Two rules keep that name honest, and both refuse rather than guess:
 
 A query with no `model` field behaves exactly as it always has.
 
-`model` selects which model analyzes a *query*; no action query reads it, so including `model` on an
-action query (`query_models`, `clear_cache`, `terminate`, `terminate_all`, `query_version`) is an
-error rather than being ignored.
+`model` selects which model analyzes a *query*. Most action queries do not read it, so including `model`
+on `query_models`, `clear_cache`, `terminate`, `terminate_all` or `query_version` is an error rather than
+being ignored. The **cache actions** (`cache_attach`, `cache_detach`, `cache_dump`, `cache_stats`) do read
+it - there it selects whose cache the action addresses - and they follow the same two rules above: an
+unknown name is an error naming what is loaded, and no `model` field means the model started with
+`-model`.
 
 ## Attributing what a query earns in the cache
 
@@ -75,12 +78,99 @@ name attached to one model says nothing about another - which is why `cacheConte
 the model the same query selected with `model`.
 
 A query with no `cacheContext` field behaves exactly as it always has, and so does an engine with no
-context attached to anything, which is every engine today: **the action that attaches a context is not
-implemented yet**, so `cacheContext` currently has no attached name to resolve against and any value for
-it is refused. The field, its validation and its effect on attribution are in place ahead of that action.
+context attached to anything, which is every engine that was started without `nnCacheDir`. Contexts are
+attached with the `cache_attach` action; see "Persisting a model's cache across sessions" below.
 
 `cacheContext` attributes a *query*'s new cache entries; no action query reads it, so including
-`cacheContext` on an action query is an error rather than being ignored, exactly as `model` is.
+`cacheContext` on an action query is an error rather than being ignored. The cache actions name the
+context they act on in their own `context` field, which answers a different question - which body of
+persisted content this action is *about*, rather than which one a query's earnings belong to.
+
+## Persisting a model's cache across sessions
+
+Normally the neural net cache lives and dies with the engine process: everything it computed is gone
+when you exit. If you study the same positions over many sessions, you can instead have KataGo keep
+them on disk, so a later session gets them back without paying for the evaluations again.
+
+**This is off unless you configure a directory for it.** Add to your analysis config:
+
+```
+nnCacheDir = /some/existing/directory
+```
+
+KataGo owns every byte under that directory and will not create it - if the path is not an existing
+directory the engine refuses to start, naming the path, so that a typo does not put your persisted cache
+somewhere you will never look for it. Setting `nnCacheDir` while the cache itself is disabled
+(`nnCacheSizePowerOfTwo` negative) is likewise refused at startup.
+
+With `nnCacheDir` set, every hosted model's cache gains a **level 0**: an immutable, pre-warmed body of
+evaluations that lookups consult before the ordinary cache. That is what a session attaches and detaches.
+Without `nnCacheDir` the cache is exactly what it always was, and every cache action below is refused
+with a message naming the config key.
+
+### Contexts and files
+
+Content on disk is grouped by **context** - the same opaque client-chosen name described under
+"Attributing what a query earns in the cache". A context name must be usable as a filename component:
+ASCII letters, digits, `.`, `_` and `-`, at most 128 characters, and not `.` or `..`. Anything else is
+refused, never rewritten into something acceptable.
+
+Each context has up to two files under `nnCacheDir`:
+
+  * `<context>.nncounts` - how many times each position was retrieved, and in how many dumps it earned a
+    retrieval. It is shared by every model, because a position's hash does not depend on which net
+    evaluated it.
+  * `<context>.<model>.nnevals` - the evaluations themselves, for one model. The model's `internalName`
+    is both in the filename and inside the file's header, so **one file only ever holds one net's
+    evaluations**. This is what keeps two nets' evaluations of the same position from ever being
+    confused for each other: a position's cache key is the same under every net, so model identity lives
+    in the file rather than in the key.
+
+Both files are append-only logs with per-block checksums. If the engine is killed mid-write, the next
+session reads everything up to the last complete block and reports how many bytes it discarded; the
+partial tail is repaired by the next write, not by the read.
+
+A missing file is not an error. Attaching a context nothing has ever written gives you an empty level 0,
+which is a perfectly good thing to analyze against and then dump.
+
+### The session shape
+
+```
+cache_attach   -> analyze, analyze, analyze ... -> cache_dump -> cache_detach
+```
+
+`cache_attach` and `cache_detach` are **session-boundary actions and are refused while any analysis
+request is open**, naming how many are open. This is not a caution you can override: a cache lookup walks
+the list of attached content without taking a lock, so changing that list under a live request would read
+freed memory. Since attaching and detaching is what you do between sessions, when nothing is in flight,
+this costs a normal client nothing. `cache_dump` and `cache_stats` have no such restriction.
+
+`cache_dump` is the **only** action that writes. Nothing is persisted automatically, on a timer, or at
+exit - if you do not dump, nothing you computed reaches disk.
+
+A context's name stays registered with a model for the life of the process once you have attached it, even
+after you detach. Re-attaching the same context later is fine and reuses that registration; attaching a
+context that is *currently* attached is an error.
+
+### Reading an error from a cache action
+
+Errors use the engine's usual shape - an object with `id`, `field` and `error`. Two kinds of
+`field` value appear, and the difference is only where the refusal came from:
+
+  * A field name (`"context"`, `"what"`, `"model"`, `"level0"`, ...) means the request itself could
+    not be read. Nothing was attempted.
+  * `"action"` means the request was well-formed and the engine refused to carry it out - the
+    context is not attached, the detach would lose undumped work, a request is open, the file on
+    disk is not readable. The `error` text says which. Nothing was left half-done: an attach that
+    fails partway takes back whatever it had already attached before returning the error.
+
+### Unknown fields are errors here
+
+Every field of a cache action decides which bytes on disk are read or written. So, unlike an analysis
+query - where an unrecognized top-level field produces a warning and the query is analyzed anyway, and
+where that warning can be switched off with `warnUnusedFields=false` - **an unrecognized field on a cache
+action is an error and the action is not performed**. The error names the field and lists the fields that
+action accepts. There is no config key that turns this into a warning.
 
 ## Example Code
 
@@ -396,6 +486,214 @@ Explanation: KataGo uses a cache of neural net query results to skip querying th
 
 * Testing or studying the variability of KataGo's search results for a given number of visits. Analyzing a position again after a cache clear will give a "fresh" look on that position that better matches the variety of possible results KataGo may return, simliar to if the analysis engine were entirely restarted. Each query will re-randomize the symmetry of the neural net used for that query instead of using the cached result, giving a new and more varied opinion.
 
+**What `clear_cache` does when a context is attached** (see "Persisting a model's cache across sessions").
+Its behaviour is unchanged, and stated here because with persisted content in play "empty the cache" has
+two possible readings and only one of them is right:
+
+* **Attached level-0 content is NOT cleared.** It is the pre-warmed material a session was given, it
+  cannot be rebuilt in the process, and discarding it would throw away the entire point of having
+  attached it. Use `cache_detach` to give it back.
+* **The ordinary cache - everything this session computed - is cleared**, on every hosted model, exactly
+  as before.
+* **Retrieval counts survive**, and so does the record of which context earned which entry. A
+  `clear_cache` is not the end of a session, so a `cache_dump` after one still writes the retrievals that
+  happened before it.
+* Entries that were computed but not yet dumped are **gone**, and `clear_cache` does not warn about that
+  the way `cache_detach` does. If you care about them, dump before you clear.
+
+
+#### cache_attach
+
+Attaches a context's persisted cache content to a model, for the session that is about to run. Requires
+`nnCacheDir` (see "Persisting a model's cache across sessions"). Fields:
+
+   * `id (string)`: Required. An arbitrary string identifier for this query.
+   * `action (string)`: Required. Should be the string `cache_attach`.
+   * `context (string)`: Required. The context to attach.
+   * `model (string)`: Optional. Which model's cache to attach it to, by `internalName`. Defaults to the
+     model started with `-model`.
+   * `level0 (object)`: Optional. How much of the context goes into the frozen, pre-warmed level 0.
+     Exactly one of:
+       * `{"minLookups":N}` - every position the count log records at least `N` retrievals for. A position
+         the count log has never mentioned is never admitted by this at any `N` above 0: its count is not
+         zero, it is unknown.
+       * `{"maxEntries":N}` - the `N` most-retrieved positions.
+       * `{"maxBytes":B}` - the most-retrieved positions that fit in `B` bytes of memory. `B` counts the
+         memory the entries will actually occupy, not the size of the file.
+     Omitted means every persisted position. Two of them at once is an error: they would select two
+     different sets and KataGo will not choose between them - send two attaches, or pick the one you mean.
+   * `level1Fill`: Optional. What to do with the positions `level0` did not take. `false` (the default)
+     leaves them on disk. `{"maxBytes":B}` admits the most-retrieved of them into the ordinary cache, up
+     to `B` bytes. A bare `true` is an error: there is no byte budget KataGo could invent for you.
+   * `foreignModelSources (array of string)`: Optional, and empty by default. Other loaded models whose
+     `<context>.<model>.nnevals` files should also be attached, *after* this model's own, in the order
+     you list them. See "Reading another model's evaluations" below. Listing a model twice, or listing
+     the model you are attaching to, is an error.
+
+Example:
+```
+{"id":"a1","action":"cache_attach","context":"card-5455","level0":{"minLookups":2},"level1Fill":{"maxBytes":268435456}}
+```
+
+The response echoes the query and adds:
+
+   * `context`, `model`: what was attached, and to which model.
+   * `entriesInLevelZero (integer)`: positions now in the frozen level 0, summed over all sources.
+   * `levelZeroPayloadBytes`, `levelZeroStructureBytes (integer)`: the memory this attach is holding -
+     the evaluations themselves, and the lookup structure over them. Both are returned by `cache_detach`.
+   * `levelOneFilled (integer)`, `levelOneFilledBytes (integer)`: what the `level1Fill` admitted.
+   * `sources (array of object)`: one entry per attached file, in the order they will be consulted, each
+     with `model`, `entriesInLevelZero`, `entriesLeftOver`, `payloadBytes`, `structureBytes`.
+   * `containerTail`, `countLogTail (string)`: `"intact"`, or `"truncated"` if a previous run was killed
+     mid-write. With `containerDiscardedTailBytes` / `countLogDiscardedTailBytes`, the bytes after the
+     last complete block. Truncation is not an error - the intact prefix is what a crash left you, and is
+     what you get - but a nonzero figure is worth noticing.
+   * `buildMilliseconds (number)`: how long the read and the structure build took.
+
+Errors, each of which leaves nothing attached:
+
+   * The engine was started without `nnCacheDir`.
+   * The context is already attached to this model.
+   * `model`, or a name in `foreignModelSources`, is not a loaded model.
+   * The context name is not a legal filename component.
+   * A file exists under that name and is not one of KataGo's, is a version this build does not read, or
+     names a different model than the one being attached for.
+
+**Reading another model's evaluations.** By default a model reads only its own file, so two nets never
+share an entry and there is no setting to get wrong. `foreignModelSources` is the opt-in for the case
+where you have several nets, consider their evaluations interchangeable for your purposes, and want the
+strongest one to be able to use what the weaker ones already computed. The list is the priority order:
+the first source that holds a position answers for it, and this model's own file is always first, so its
+own evaluations always win. Everything the session then computes is this model's and dumps to this
+model's file - so over sessions the strong net's entries organically replace the weak ones'. Note what
+you are asking for: an evaluation served this way was produced by a different net than the one analyzing.
+That is why it is off by default, per-attach, and reported back per source.
+
+#### cache_detach
+
+Releases a context's attached content and gives the memory back. Fields:
+
+   * `id (string)`: Required. An arbitrary string identifier for this query.
+   * `action (string)`: Required. Should be the string `cache_detach`.
+   * `context (string)`: Required. The context to detach.
+   * `model (string)`: Optional. Defaults to the model started with `-model`.
+   * `discardUndumped (boolean)`: Optional, default `false`. Whether you accept losing work that has not
+     been dumped.
+
+Example:
+```
+{"id":"a2","action":"cache_detach","context":"card-5455"}
+```
+
+**A detach with undumped work is refused**, and the refusal says how many earned positions are not on
+disk. Silently throwing that work away would lose a session with nothing in the response to say so;
+silently dumping it would make `cache_dump` no longer the only action that writes. So you either send
+`cache_dump` first, or send the detach again with `"discardUndumped":true`, where the decision is visible
+in your own log. The refusal also fires when analysis requests have been served since the last
+`cache_dump` of counts, because retrieval counts cannot be inspected without consuming them; that check
+is deliberately conservative and costs at most one extra dump, which writes nothing when there is nothing
+to write.
+
+The response echoes the query and adds:
+
+   * `sourcesDetached (integer)`: files released.
+   * `storageReleased (boolean)`: whether the memory actually went. This is **observed, not assumed**: a
+     lookup hands out its result in a way that keeps the whole block alive, so a client holding on to a
+     result could keep it resident. `false` means that happened.
+   * `heapReclaim (string)`: `"trimmed"` if the allocator returned pages to the operating system,
+     `"nothingToTrim"` if it had nothing to return, `"unavailable"` on a build whose allocator offers no
+     such call (KataGo asks glibc; other C libraries have no equivalent, and this says so rather than
+     quietly doing nothing).
+   * `discardedUndumpedEntries (integer)`: what `discardUndumped` threw away, or 0.
+
+Detaching frees the pre-warmed level 0. It does not empty the ordinary cache - use `clear_cache` for
+that - and it does not unregister the context's name, so you can attach it again later.
+
+#### cache_dump
+
+Writes a context's work to disk. This is the only action that writes anything; nothing is persisted
+automatically. Fields:
+
+   * `id (string)`: Required. An arbitrary string identifier for this query.
+   * `action (string)`: Required. Should be the string `cache_dump`.
+   * `context (string)`: Required. Must be attached.
+   * `model (string)`: Optional. Defaults to the model started with `-model`.
+   * `what (string)`: **Required**, one of `"counts"`, `"evaluations"` or `"both"`. There is no default:
+     which of the two files a write touched is not something to infer from a field you did not send.
+   * `admission (object)`: Optional. `{"minLookups":N}` writes only positions the count log records at
+     least `N` retrievals for; omitted writes everything this context earned. `{"minLookups":2}` is the
+     usual "only keep what I have seen more than once" policy.
+
+Example:
+```
+{"id":"a3","action":"cache_dump","context":"card-5455","what":"both","admission":{"minLookups":2}}
+```
+
+With `"both"`, counts are written first and the evaluations are then admitted against the freshly written
+counts - so a position first seen and then re-used within this same session can qualify on the strength
+of this session, rather than having to wait for the next one.
+
+Dumping the same context twice with no analysis in between writes **nothing** the second time: each
+position remembers whether its bytes are already in the file, and retrieval counts are written as
+increments since the last dump. Attaching, dumping and detaching repeatedly does not grow your files and
+does not inflate your counts.
+
+The response echoes the query and adds `context`, `model`, `openRequestsAtDump`, and:
+
+   * `counts (object)`, when counts were written: `bytesAppended`, `tornTailBytesDiscarded`,
+     `rewroteTheFile`, `compacted`, `rowsInLog`, `unattributedLookups`, `tail`.
+   * `evaluations (object)`, when evaluations were written: `entriesWritten`, `bytesAppended`,
+     `tornTailBytesDiscarded`, `rewroteTheFile`, `compacted`, `markedPersisted`, `admission`, and three
+     figures naming everything that was *not* written, separately because they have different remedies:
+     `alreadyPersisted` (its bytes are already in the file), `belowThreshold` (your `admission` refused
+     it), `notResident` (it was earned but is no longer in the cache, because a capacity sweep dropped
+     it).
+   * `noAttributableContextEntries`, `unrecordedAttributions (integer)`: how much of the session could not
+     be filed under any context. Normally 0; a nonzero figure says the record is short and by how much,
+     rather than the work being quietly assigned to whichever context happened to be first.
+
+A dump is legal while analysis requests are open - everything it reads is thread-safe and off the search
+path - but the intended posture is to dump at rest, so `openRequestsAtDump` reports how many were open,
+and a client that dumped live can see that it did.
+
+**One limit worth knowing before you design around it.** Dumping `counts` is refused while more than one
+context is attached to the model, naming the attached contexts. Retrieval counts are kept per cache
+table, not per context, so with several attached they cannot be divided between them, and writing them
+whole into one context's file would file another context's retrievals under this one. Dumping
+`evaluations` is per context and is unaffected. If you work several contexts at once and want counts,
+dump and detach them one at a time.
+
+#### cache_stats
+
+Reports what one model's cache is holding right now. Fields:
+
+   * `id (string)`: Required. An arbitrary string identifier for this query.
+   * `action (string)`: Required. Should be the string `cache_stats`.
+   * `model (string)`: Optional. Defaults to the model started with `-model`.
+
+Example:
+```
+{"id":"a4","action":"cache_stats"}
+```
+
+The response echoes the query and adds:
+
+   * `residentEntries`, `residentPayloadBytes`, `fixedStructureBytes (integer)`: what is cached and what
+     it costs. `capacitySlots (integer)` is the slot count occupancy should be read against, and is 0 for
+     a cache configured with `nnCacheCollision = chain`, which is bounded by bytes and has no slot count -
+     a 0 here means "not applicable", not "full".
+   * `cacheDirectory (string)` and `levelZeroSourcesAttached (integer)`, when `nnCacheDir` is set.
+   * `countedKeys`, `retrievalsThisSession`, `unrecordedHits (integer)`: the retrieval counts as they
+     stand. These are running totals for reading, not the increments a dump writes; asking for them does
+     not consume or change anything.
+   * `attributedKeys`, `noAttributableContextEntries`, `unrecordedAttributions (integer)`.
+   * `contexts (array of object)`: one per attached context, each with `context`, `levelOneFilled`,
+     `levelOneFilledBytes`, `unpersistedEntries` (what a `cache_dump` would owe), `sources` (as
+     `cache_attach` reports them), and `countLogRows`, `countLogBlocks`, `countLogTail` read from the
+     context's file.
+
+This walks the whole cache under its locks. It is a between-searches reporting call, not something to
+poll during analysis.
 
 #### terminate
 

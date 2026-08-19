@@ -3,8 +3,12 @@
 #include <cstdlib>
 
 #include "../core/config_parser.h"
+#include "../core/fileutils.h"
+#include "../core/test.h"
 #include "../neuralnet/nncacheimpl.h"
+#include "../neuralnet/nncachefrozen.h"
 #include "../neuralnet/nncachetrace.h"
+#include "../neuralnet/nncachetwolevel.h"
 #include "../search/mutexpool.h"
 
 using namespace std;
@@ -20,6 +24,7 @@ const char* const NNCacheConfig::KEY_ADMISSION = "nnCacheAdmission";
 const char* const NNCacheConfig::KEY_MAX_BYTES = "nnCacheMaxBytes";
 const char* const NNCacheConfig::KEY_REPLACEMENT = "nnCacheReplacement";
 const char* const NNCacheConfig::KEY_SIGHTING_GHOST_POW = "nnCacheSightingGhostPowerOfTwo";
+const char* const NNCacheConfig::KEY_DIR = "nnCacheDir";
 
 static const string COLLISION_DIRECT = "direct";
 static const string COLLISION_LINEAR = "linearprobe";
@@ -295,6 +300,29 @@ bool NNCacheConfig::isStatusQuo() const {
 
 NNCacheConfig NNCacheConfig::fromCfg(ConfigParser& cfg, int sizePowerOfTwo, int mutexPoolSizePowerOfTwo) {
   NNCacheConfig config = NNCacheConfig::statusQuo(sizePowerOfTwo, mutexPoolSizePowerOfTwo);
+
+  // The persisted-cache directory, and with it the decision to build a level-0 resolution
+  // list at all. Both refusals below are construction-time -- the process does not start --
+  // because both describe a configuration the engine cannot honor, and an engine that
+  // started anyway would answer every cache action with a surprise instead of the config
+  // being wrong where it is wrong (ADR-0002 rung 1).
+  if(cfg.contains(KEY_DIR)) {
+    if(sizePowerOfTwo < 0)
+      throw StringError(
+        "Key '" + string(KEY_DIR) + "' cannot be honored with the neural net cache disabled "
+        "(nnCacheSizePowerOfTwo is negative). It names where a cache's persisted contexts are "
+        "read and written, and there is no cache here to attach one to. Either remove '" +
+        string(KEY_DIR) + "' or enable the cache."
+      );
+    const string dir = cfg.getString(KEY_DIR);
+    if(!FileUtils::isDirectory(dir))
+      throw StringError(
+        "Key '" + string(KEY_DIR) + "' = " + dir + " is not an existing directory. KataGo owns "
+        "every byte under it and will not create it: a mistyped path that the engine silently "
+        "created would put a session's persisted cache somewhere nobody looks."
+      );
+    config.cacheDirectory = dir;
+  }
 
   // getString(key,possibles) already refuses an unrecognized value naming the whole
   // vocabulary; reuse it rather than re-authoring a second such check (ADR-0012 P1).
@@ -844,5 +872,40 @@ unique_ptr<NNCacheTable> NNCacheTable::create(const NNCacheConfig& config) {
          << "Do NOT read timings from it." << endl;
     table = NNCacheTrace::wrapWithTrace(std::move(table), string(tracePath));
   }
+  return table;
+}
+
+unique_ptr<NNCacheTwoLevelTable> NNCacheTable::createWithLevelZeroList(const NNCacheConfig& config) {
+  if(!config.cacheDirectory.has_value())
+    throw StringError(
+      "NNCacheTable::createWithLevelZeroList: no cache directory is configured, so a level-0 "
+      "resolution list would have nothing it could ever load from. Set '" +
+      string(NNCacheConfig::KEY_DIR) + "', or build the table with create()."
+    );
+
+  // BUILT WITH ONE SOURCE AND THEN LEFT WITH NONE, which is the two-level table's own
+  // documented shape rather than a workaround: makeTwoLevelNNCacheTable refuses a null level
+  // 0 on purpose -- "absent is represented by not having one of these at all" -- while
+  // detaching the last source is explicitly legal and leaves a table that serves everything
+  // from level 1 until the next attach. An engine starts in exactly that state: it has a
+  // directory and an attach surface, and no session has attached anything yet. So it is
+  // handed an EMPTY frozen structure, which is a legal structure that answers absent to
+  // every key, and that structure is taken straight back off the list.
+  //
+  // The level-1 hit ledger is sized at NNCacheAttributionRecorder::defaultPowerOfTwo(),
+  // deliberately the same constant and for the same reason: both are sized against the
+  // number of DISTINCT KEYS ONE SESSION EARNS, the largest real card in the operator's
+  // corpus at the load factor that structure's bounded probe window needs. One quantity, one
+  // home for its size (ADR-0012 P1).
+  unique_ptr<NNCacheTwoLevelTable> table = makeTwoLevelNNCacheTable(
+    NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()),
+    NNCacheTable::create(config),
+    NNCacheAttributionRecorder::defaultPowerOfTwo()
+  );
+  const vector<NNCacheLevelZeroSourceId> order = table->levelZeroResolutionOrder();
+  testAssert(order.size() == 1);
+  const unique_ptr<NNCacheFrozen> placeholder = table->detachLevelZero(order[0]);
+  testAssert(placeholder != nullptr);
+  testAssert(table->numLevelZeroSources() == 0);
   return table;
 }

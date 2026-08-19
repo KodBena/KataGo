@@ -55,6 +55,16 @@ namespace {
 //-------------------------------------------------------------------------------------
 
 const char* const TMP_DIR_PREFIX = "tmpnncachedump";
+
+// An ABSOLUTE hit surface, forced into the delta type appendDump takes.
+//
+// Used by exactly one test below, which exists to show what the record looks like when an
+// absolute reaches an additive reader. It is named for what it does because that is the whole
+// point: after this increment a caller cannot reach that defect by writing the obvious
+// expression -- the types refuse it -- and has to write this instead.
+NNCacheHitCountDelta launderAsDelta(const NNCacheHitLedger& runningTotals) {
+  return NNCacheHitCountDelta::ofDeltaRows(runningTotals.entries(), runningTotals.unrecordedHits());
+}
 const char* const MODEL = "kata1-b18c384nbt-s9732312320-d4245566942";
 const int MODEL_VERSION = 14;
 const int XLEN = 9;
@@ -633,7 +643,7 @@ void testAnAttachDumpDetachReattachDumpCycleLeavesTheCountLogUnchanged() {
     shared_ptr<NNOutput> got;
     for(int i = 0; i < 5; i++)
       testAssert(table->get(nthKey(100), got));
-    (void)log.appendDump(table->takeUnpersistedHitCounts());
+    (void)log.appendDump(NNCacheHitCountDelta::take(*table));
   }
   const NNCacheCountLogContents afterFirst = log.load();
   testAssert(logHasKey(afterFirst, nthKey(100)));
@@ -643,9 +653,9 @@ void testAnAttachDumpDetachReattachDumpCycleLeavesTheCountLogUnchanged() {
   // The re-attach: the same card, freshly loaded, nothing looked up.
   {
     unique_ptr<NNCacheTable> table = twoLevelTableOver(zeroSerials);
-    const NNCacheHitLedger delta = table->takeUnpersistedHitCounts();
-    testAssert(delta.isCounted());
-    testAssert(delta.entries().empty());
+    const NNCacheHitCountDelta delta = NNCacheHitCountDelta::take(*table);
+    testAssert(delta.ledger().isCounted());
+    testAssert(delta.ledger().entries().empty());
     (void)log.appendDump(delta);
   }
 
@@ -665,8 +675,17 @@ void testAnAttachDumpDetachReattachDumpCycleLeavesTheCountLogUnchanged() {
 }
 
 // The same walk with the PURE-READ surface handed to the dump instead of the delta take --
-// the shape a caller reaches for if the two surfaces are confused. It is the defect, and it
-// is why the delta surface exists as its own type rather than as a comment on the other one.
+// the shape a caller reaches for if the two surfaces are confused. It is the defect this
+// increment's type exists to foreclose, kept here as the RUNTIME half of that witness: what
+// the record looks like when an absolute total reaches an additive reader.
+//
+// It no longer composes the way the defect originally did. appendDump takes
+// NNCacheHitCountDelta, so `log.appendDump(table->harvestHitCounts())` is a compile error --
+// which is the point, and which is witnessed as such rather than here. To keep the runtime
+// consequence observable the harvest is laundered through ofDeltaRows below, deliberately and
+// under a name that says "delta" over rows that are not one. That launder is what a caller
+// would now have to type on purpose to reach this defect; before the type existed it was the
+// obvious one-liner.
 void testTheSameCycleThroughTheReportingSurfaceDoesInflateTheRecord() {
   ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "card-5455");
@@ -677,7 +696,7 @@ void testTheSameCycleThroughTheReportingSurfaceDoesInflateTheRecord() {
     shared_ptr<NNOutput> got;
     for(int i = 0; i < 5; i++)
       testAssert(table->get(nthKey(100), got));
-    (void)log.appendDump(table->harvestHitCounts());
+    (void)log.appendDump(launderAsDelta(table->harvestHitCounts()));
   }
   const NNCacheCountLogContents afterFirst = log.load();
   testAssert(logRowFor(afterFirst, nthKey(100)).lookups == 5);
@@ -688,7 +707,7 @@ void testTheSameCycleThroughTheReportingSurfaceDoesInflateTheRecord() {
     // Not empty: the reporting surface reports a row of zero hits for a pre-warmed key that
     // earned nothing, deliberately, and appendDump raises that key's sessions for it.
     testAssert(!table->harvestHitCounts().entries().empty());
-    (void)log.appendDump(table->harvestHitCounts());
+    (void)log.appendDump(launderAsDelta(table->harvestHitCounts()));
   }
   const NNCacheCountLogContents afterSecond = log.load();
   testAssert(logRowFor(afterSecond, nthKey(100)).lookups == 5);

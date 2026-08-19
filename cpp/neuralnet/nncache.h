@@ -14,6 +14,8 @@
 #include "../neuralnet/nninputs.h"
 
 class ConfigParser;
+class NNCacheFrozen;
+class NNCacheTwoLevelTable;
 
 // How the table resolves two keys landing on the same bucket.
 enum class NNCacheCollisionScheme {
@@ -218,6 +220,22 @@ struct NNCacheConfig {
   NNCacheShape shape;
   NNCacheAdmissionPolicy admission;
 
+  // THE DIRECTORY THIS CACHE'S PERSISTED CONTENT LIVES IN -- the one home of
+  // <context>.nncounts and <context>.<model>.nnevals -- present exactly when the operator
+  // set nnCacheDir.
+  //
+  // IT IS THE SAME DECISION AS "does this table carry a level-0 resolution list", and it is
+  // one field rather than two because they are one fact. A directory with no list is a
+  // configured path nothing can ever read or write; a list with no directory is an attach
+  // surface with nowhere to attach from. Either as a separate key would be a state an
+  // operator could reach and an engine would then have to explain (ADR-0012 P11); as one
+  // field neither is representable. NNCacheTable::createWithLevelZeroList is what reads it.
+  //
+  // DEFAULTED IN THE DECLARATION, so that the several brace-initializations of this struct that
+  // predate it -- statusQuo's and the policy tests' -- keep meaning exactly what they meant, and
+  // so that the next field added here does not silently become "whatever the caller forgot".
+  std::optional<std::string> cacheDirectory = std::nullopt;
+
   // The status-quo configuration: exactly what NNEvaluator built before the policy
   // axes existed.
   static NNCacheConfig statusQuo(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo);
@@ -237,6 +255,7 @@ struct NNCacheConfig {
   static const char* const KEY_MAX_BYTES;   // nnCacheMaxBytes
   static const char* const KEY_REPLACEMENT; // nnCacheReplacement
   static const char* const KEY_SIGHTING_GHOST_POW; // nnCacheSightingGhostPowerOfTwo
+  static const char* const KEY_DIR;         // nnCacheDir
 
   static const std::set<std::string>& collisionVocabulary();
   static const std::set<std::string>& evictionVocabulary();
@@ -515,6 +534,22 @@ class NNCacheTable {
   // shape that is coherent but not implemented yet -- never silently substituting
   // the default one (ADR-0002).
   static std::unique_ptr<NNCacheTable> create(const NNCacheConfig& config);
+
+  // THE SAME TABLE, CARRYING A LEVEL-0 RESOLUTION LIST: what an evaluator gets when the
+  // operator configured a cache directory, and what the cache_attach and cache_detach
+  // actions of the analysis engine drive.
+  //
+  // It returns NNCacheTwoLevelTable -- the type that carries attach and detach -- rather
+  // than the NNCacheTable base, so a caller that needs that surface HOLDS it in its type
+  // and no downcast from a base pointer is written anywhere. `config` describes LEVEL 1
+  // exactly as create() would build it; level 0 is not a configuration but content a
+  // session attaches, so the returned table starts with NO attached source and resolves
+  // every get from level 1, which is what create() would have done.
+  //
+  // Throws StringError if config.cacheDirectory is empty -- a level-0 list with nowhere to
+  // load from is the half-configured state NNCacheConfig::cacheDirectory exists to make
+  // unreachable, and it is refused here rather than built and left useless.
+  static std::unique_ptr<NNCacheTwoLevelTable> createWithLevelZeroList(const NNCacheConfig& config);
 
  protected:
   NNCacheTable();
