@@ -319,30 +319,73 @@ NNCacheFrozenIndex NNCacheFrozenIndex::build(std::vector<Hash128> keysIn) {
 // NNCacheFrozen
 //-------------------------------------------------------------------------------------
 
-NNCacheFrozen::NNCacheFrozen(NNCacheFrozenIndex&& index, std::vector<std::unique_ptr<NNOutput>>&& evaluations)
-  :index_(std::move(index)),
-   evaluations_(std::make_shared<std::vector<std::unique_ptr<NNOutput>>>(std::move(evaluations)))
-{
-  // The record carries the payload pointer so that a resolved lookup reads key, counter
-  // and payload in one access. Ownership stays with evaluations_.
-  for(size_t i = 0; i < evaluations_->size(); i++)
-    index_.setPayloadAt((uint32_t)i, (*evaluations_)[i].get());
-}
+//-------------------------------------------------------------------------------------
+// NNCacheEvaluationStore
+//-------------------------------------------------------------------------------------
 
-std::unique_ptr<NNCacheFrozen> NNCacheFrozen::build(std::vector<std::unique_ptr<NNOutput>> evaluations) {
-  // The key set is DERIVED from the evaluations rather than supplied beside them, so entry
-  // i's key and entry i's evaluation cannot disagree (SPEC.md 3.4) and there is no pair of
-  // lengths to check (SPEC.md 1.1).
-  std::vector<Hash128> keys;
-  keys.reserve(evaluations.size());
+NNCacheEvaluationStore::NNCacheEvaluationStore() {}
+NNCacheEvaluationStore::~NNCacheEvaluationStore() {}
+
+NNCacheHeapEvaluationStore::NNCacheHeapEvaluationStore(std::vector<std::unique_ptr<NNOutput>> evaluations)
+  :evaluations_(std::move(evaluations))
+{}
+
+std::shared_ptr<NNCacheEvaluationStore> NNCacheHeapEvaluationStore::of(
+  std::vector<std::unique_ptr<NNOutput>> evaluations
+) {
+  // The no-null contract is checked HERE, where the store is constructed, so that
+  // evaluationAt's promise never to return null is a property of the type rather than a
+  // thing each caller re-checks (ADR-0012 P2: a boundary refuses what it cannot honor).
   for(size_t i = 0; i < evaluations.size(); i++) {
     if(evaluations[i] == nullptr)
       throw StringError(
         "NNCacheFrozen: the evaluation at key set position " + Global::uint64ToString((uint64_t)i) +
         " is null and carries no position hash to index it by; no structure was produced."
       );
-    keys.push_back(evaluations[i]->nnHash);
   }
+  return std::shared_ptr<NNCacheEvaluationStore>(new NNCacheHeapEvaluationStore(std::move(evaluations)));
+}
+
+size_t NNCacheHeapEvaluationStore::numEvaluations() const {
+  return evaluations_.size();
+}
+
+NNOutput* NNCacheHeapEvaluationStore::evaluationAt(size_t i) const {
+  return evaluations_[i].get();
+}
+
+size_t NNCacheHeapEvaluationStore::handleBytes() const {
+  return evaluations_.size() * sizeof(std::unique_ptr<NNOutput>);
+}
+
+//-------------------------------------------------------------------------------------
+// NNCacheFrozen
+//-------------------------------------------------------------------------------------
+
+NNCacheFrozen::NNCacheFrozen(NNCacheFrozenIndex&& index, std::shared_ptr<NNCacheEvaluationStore>&& evaluations)
+  :index_(std::move(index)),
+   evaluations_(std::move(evaluations))
+{
+  // The record carries the payload pointer so that a resolved lookup reads key, counter
+  // and payload in one access. Ownership stays with evaluations_.
+  for(size_t i = 0; i < evaluations_->numEvaluations(); i++)
+    index_.setPayloadAt((uint32_t)i, evaluations_->evaluationAt(i));
+}
+
+std::unique_ptr<NNCacheFrozen> NNCacheFrozen::build(std::vector<std::unique_ptr<NNOutput>> evaluations) {
+  return build(NNCacheHeapEvaluationStore::of(std::move(evaluations)));
+}
+
+std::unique_ptr<NNCacheFrozen> NNCacheFrozen::build(std::shared_ptr<NNCacheEvaluationStore> evaluations) {
+  if(evaluations == nullptr)
+    throw StringError("NNCacheFrozen: no evaluation store was supplied; no structure was produced.");
+  // The key set is DERIVED from the evaluations rather than supplied beside them, so entry
+  // i's key and entry i's evaluation cannot disagree (SPEC.md 3.4) and there is no pair of
+  // lengths to check (SPEC.md 1.1).
+  std::vector<Hash128> keys;
+  keys.reserve(evaluations->numEvaluations());
+  for(size_t i = 0; i < evaluations->numEvaluations(); i++)
+    keys.push_back(evaluations->evaluationAt(i)->nnHash);
   NNCacheFrozenIndex index = NNCacheFrozenIndex::build(std::move(keys));
   return std::unique_ptr<NNCacheFrozen>(new NNCacheFrozen(std::move(index), std::move(evaluations)));
 }
@@ -441,27 +484,25 @@ std::vector<NNCacheHitCount> NNCacheFrozen::harvest() const {
 size_t NNCacheFrozen::structureBytes() const {
   return
     index_.structureBytes() +
-    evaluations_->size() * sizeof(std::unique_ptr<NNOutput>);
+    evaluations_->handleBytes();
 }
 
 int64_t NNCacheFrozen::reachablePayloadBytes() const {
   int64_t bytes = 0;
-  for(size_t i = 0; i < evaluations_->size(); i++) {
+  for(size_t i = 0; i < evaluations_->numEvaluations(); i++) {
     if((index_.stateAt((uint32_t)i).load(std::memory_order_relaxed) & SHADOW_BIT) != 0)
       continue;
-    if((*evaluations_)[i] != nullptr)
-      bytes += (int64_t)nnOutputFootprintBytes(*(*evaluations_)[i]);
+    bytes += (int64_t)nnOutputFootprintBytes(*evaluations_->evaluationAt(i));
   }
   return bytes;
 }
 
 int64_t NNCacheFrozen::shadowedPayloadBytes() const {
   int64_t bytes = 0;
-  for(size_t i = 0; i < evaluations_->size(); i++) {
+  for(size_t i = 0; i < evaluations_->numEvaluations(); i++) {
     if((index_.stateAt((uint32_t)i).load(std::memory_order_relaxed) & SHADOW_BIT) == 0)
       continue;
-    if((*evaluations_)[i] != nullptr)
-      bytes += (int64_t)nnOutputFootprintBytes(*(*evaluations_)[i]);
+    bytes += (int64_t)nnOutputFootprintBytes(*evaluations_->evaluationAt(i));
   }
   return bytes;
 }
