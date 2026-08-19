@@ -250,8 +250,13 @@ size_t NNCacheLevelZeroBound::select(const std::vector<NNCacheLevelZeroCandidate
     }
     return taken;
   }
+  default:
+    break;
   }
-  throw StringError("NNCacheLevelZeroBound: unreachable bound kind.");
+  // Every kind the enum names is above, so reaching here means a kind was added to the enum
+  // and not to this switch. Refuse rather than silently take everything or nothing -- the
+  // house idiom for a closed-vocabulary switch in this cache (nncachechained.cpp).
+  throw StringError("NNCacheLevelZeroBound: a bound kind this build does not implement.");
 }
 
 std::string NNCacheLevelZeroBound::describe() const {
@@ -260,8 +265,10 @@ std::string NNCacheLevelZeroBound::describe() const {
   case Kind::MinLookups: return "keys with at least " + Global::uint64ToString(lookups_) + " recorded lookups";
   case Kind::MaxEntries: return "at most " + Global::int64ToString(amount_) + " entries";
   case Kind::MaxBytes: return "at most " + Global::int64ToString(amount_) + " resident payload bytes";
+  default:
+    break;
   }
-  throw StringError("NNCacheLevelZeroBound: unreachable bound kind.");
+  throw StringError("NNCacheLevelZeroBound: a bound kind this build does not implement.");
 }
 
 //-------------------------------------------------------------------------------------
