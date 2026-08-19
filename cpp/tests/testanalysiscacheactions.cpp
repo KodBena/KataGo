@@ -236,6 +236,36 @@ void testAContextIsRequiredOnTheThreeActionsThatActOnOne() {
   cout << "  a cache action that acts on a context must name one" << endl;
 }
 
+// A NAME THE ENGINE WILL NEVER ACCEPT IS THE REQUEST FAILING TO READ, AND IS REPORTED AS THAT.
+//
+// The alphabet is enforced deeper too -- by the count log, the container and the context set,
+// which all call the same NNCacheFileName::verify -- and if it were left to them the client would
+// get field "action", which the documented error contract reserves for a well-formed request the
+// engine declined to carry out. A client author following that contract would look for "context".
+// So the decoder calls the same one function and answers under the right field.
+//
+// Both polarities: a name in the alphabet decodes.
+void testAContextNameOutsideTheAlphabetIsRefusedUnderItsOwnField() {
+  json request = attachRequest();
+  request["context"] = "../escape";
+  const CacheActionDecode<CacheAttachRequest> decoded = decodeCacheAttach(request);
+  testAssert(decoded.refusal().has_value());
+  testAssert(decoded.refusal().value().field == "context");
+  // The message is the one shared validator's, so it names the alphabet a client must fit.
+  testAssert(decoded.refusal().value().message.find("ASCII letters, digits") != string::npos);
+  // Not rewritten into something acceptable: no request came out of this at all.
+  testAssert(!decoded.value().has_value());
+
+  request["context"] = "..";
+  testAssert(decodeCacheDetach(request).refusal().has_value());
+
+  // A real internalName-shaped context, which is inside the alphabet, still decodes.
+  request["context"] = "card-5455.v2_a";
+  testAssert(decodeCacheAttach(request).value().has_value());
+  cout << "  an illegal context name is refused under field \"context\": \""
+       << decoded.refusal().value().message.substr(0, 60) << "...\"" << endl;
+}
+
 void testForeignModelSourcesAreAnOrderedListWithoutRepeats() {
   json request = attachRequest();
   request["foreignModelSources"] = json::array({"weaker-net", "weaker-net"});
@@ -793,6 +823,7 @@ void Tests::runAnalysisCacheActionTests() {
   testTheLevelOneFillIsBoundedInBytesOrNotRequested();
   testTheDumpTargetIsRequiredAndClosed();
   testAContextIsRequiredOnTheThreeActionsThatActOnOne();
+  testAContextNameOutsideTheAlphabetIsRefusedUnderItsOwnField();
   testForeignModelSourcesAreAnOrderedListWithoutRepeats();
   testTheSwapRefusalNamesTheOpenRequestCount();
   {

@@ -241,18 +241,40 @@ class AnalysisCacheAttachments {
   void recordDetach(SearchableModelIdx modelIdx, const std::string& context);
 
   // HOW MANY REQUESTS THE ENGINE HAD ACCEPTED WHEN THIS MODEL LAST DUMPED ITS COUNTS, against
-  // the engine's own running request count. It is what cache_detach's undumped-counts refusal
-  // reads, and it reads it because there is no way to ask a cache table how many retrievals
-  // are unpersisted WITHOUT CONSUMING THEM: the delta surface is consuming by design, which is
-  // exactly what makes it safe to append. So the honest conservative question a detach can ask
-  // is "could anything have been retrieved since the last counts dump", and the answer is "yes
-  // if any request was accepted since then".
+  // the engine's own running request count. It is half of what cache_detach's undumped-work
+  // refusal reads, and it exists because there is no way to ask a cache table how many
+  // retrievals are unpersisted WITHOUT CONSUMING THEM: the delta surface is consuming by
+  // design, which is exactly what makes it safe to append. So the question this can ask is
+  // "was any request ACCEPTED since the last counts dump", and a yes arms the refusal.
   //
-  // CONSERVATIVE IN THE SAFE DIRECTION, and coarse in two named ways: the engine's request
-  // counter is not per model, so a request served by another model also arms the refusal; and
-  // a request that hit nothing arms it too. Both cost a client one extra cache_dump, which is
-  // idempotent when there is nothing to write. The unsafe direction -- discarding a session's
-  // retrievals while reporting success -- is the one this cannot take.
+  // WHAT IT IS NOT, STATED FIRST BECAUSE AN EARLIER VERSION OF THIS COMMENT CLAIMED IT WAS.
+  // This is NOT independently sound in the safe direction. The counter it reads is bumped when
+  // a query is ACCEPTED onto the queue (analysis.cpp, beside the openRequests insert), not when
+  // that query finishes; a counts dump is legal while requests are open, and the marks it
+  // advances are taken at the moment of its harvest. So a request accepted BEFORE a dump and
+  // still running AFTER it keeps recording retrievals that the dump did not write, while its
+  // acceptance already predates the dump -- no new acceptance is ever observed, and this reads
+  // false. The class of workload where that is the ONLY thing standing between a detach and a
+  // silent loss is a session with no new evaluations at all, so that the other half of the
+  // refusal cannot fire: a fully pre-warmed context, re-studied with every position already in
+  // level 0. That is not an exotic shape -- it is the mature spaced-repetition card this whole
+  // feature exists for.
+  //
+  // SO THE HONEST STATEMENT IS ABOUT THE PAIR, NOT ABOUT THIS. cacheDetachExecute refuses on
+  // this OR on unpersistedKeysFor(context) being nonempty, and it is the CONJUNCTION of the two
+  // that has held under every adversarial workload anyone has yet built: a request substantial
+  // enough to still be open across a dump has, in every constructed case, also evaluated
+  // positions that were not already on disk, and that is the check that fired. Isolating this
+  // one -- an open request that touches nothing new -- is UNEXERCISED, by this increment's
+  // author and by its reviewer; neither could build the workload, and neither is claiming the
+  // gap is unreachable.
+  //
+  // The fix is not a better proxy. It is a NON-CONSUMING "are there unpersisted counts" query,
+  // which can only be written where the counters live (nncachetwolevel.cpp) and is filed as its
+  // own work. Until then this is a stopgap that is coarse in two further named ways -- the
+  // engine's request counter is not per model, so another model's request arms the refusal, and
+  // a request that hit nothing arms it too -- each costing a client one extra cache_dump, which
+  // writes nothing when there is nothing to write.
   void noteCountsDumped(SearchableModelIdx modelIdx, int64_t requestsAcceptedSoFar);
   [[nodiscard]] bool anyRequestAcceptedSinceCountsDump(SearchableModelIdx modelIdx, int64_t requestsAcceptedSoFar) const;
 

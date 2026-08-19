@@ -5,6 +5,7 @@
 #include "../core/global.h"
 #include "../core/test.h"
 #include "../neuralnet/nncachecountlog.h"
+#include "../neuralnet/nncachefileformat.h"
 #include "../neuralnet/nnevalcontainer.h"
 
 using namespace std;
@@ -69,9 +70,19 @@ string unexpectedKeyMessage(const string& key, const string& action, const std::
   return message + ".";
 }
 
-// "context", present, a string, nonempty. The alphabet itself is checked further in, by the
-// count log and the container, which own that rule (ADR-0012 P1) -- this only gets as far as
-// "there is a name here at all".
+// "context", present, a string, and a name that can be a path component.
+//
+// THE ALPHABET IS CHECKED HERE, THROUGH THE ONE FUNCTION THAT OWNS IT. NNCacheFileName::verify is
+// the single home of "what may be a path component" and the count log, the container and the
+// context set all already call it -- this calls the same function rather than re-authoring the
+// rule, so there is no second copy to drift (ADR-0012 P1).
+//
+// It is checked at THIS boundary, and not left to the deeper layers that also check it, because of
+// what the client is told. A refusal from down there arrives through the generic error handler and
+// is reported under field "action", which the documented error contract reserves for "the request
+// was well-formed and the engine refused to carry it out". An illegal context name is not that: it
+// is a request that cannot be read, and a client author following the contract would look for
+// field "context". Reporting it from here makes the contract true instead of nearly true.
 bool decodeContextField(const json& request, string& context, string& refusalMessage) {
   if(request.find("context") == request.end()) {
     refusalMessage =
@@ -84,7 +95,15 @@ bool decodeContextField(const json& request, string& context, string& refusalMes
     refusalMessage = "Must be a nonempty string naming the context this action acts on.";
     return false;
   }
-  context = request["context"].get<string>();
+  const string name = request["context"].get<string>();
+  try {
+    NNCacheFileName::verify(name, "a cache action", "context name");
+  }
+  catch(const StringError& e) {
+    refusalMessage = string(e.what());
+    return false;
+  }
+  context = name;
   return true;
 }
 
@@ -708,6 +727,13 @@ json cacheDetachExecute(
   // it is the silent-failure shape; silently dumping it would make cache_dump no longer the one
   // verb that writes. So the refusal wins, and the client that means to throw a session away
   // says so in the request, where the decision is visible in the log (ADR-0002).
+  //
+  // THE TWO CHECKS ARE NOT INDEPENDENTLY SOUND AND ARE NOT CLAIMED TO BE. The evaluations half
+  // is exact: unpersistedKeysFor is the recorded truth about which of this context's earned keys
+  // are not on disk. The counts half is a PROXY, and its gap is stated in full at
+  // AnalysisCacheAttachments::anyRequestAcceptedSinceCountsDump -- read it before relying on
+  // this refusal for counts. What has held under every adversarial workload built so far is the
+  // OR of the two, not either alone.
   const int64_t undumpedEntries = (int64_t)eval.cacheTable().unpersistedKeysFor(record.contextId).size();
   const bool maybeUndumpedCounts =
     attachments.anyRequestAcceptedSinceCountsDump(modelIdx, counters.requestsAcceptedSoFar);

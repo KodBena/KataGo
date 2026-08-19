@@ -145,6 +145,13 @@ the list of attached content without taking a lock, so changing that list under 
 freed memory. Since attaching and detaching is what you do between sessions, when nothing is in flight,
 this costs a normal client nothing. `cache_dump` and `cache_stats` have no such restriction.
 
+**"Any request" means any request in the engine, not any request on this model.** The engine keeps one
+set of open requests across every hosted model (see "Hosting more than one model"), so an open query
+against model B refuses a `cache_attach` on model A. That is stricter than it needs to be - the two
+models' caches are separate structures - and it is deliberately the strict direction, but if you host
+several models and drive them from independent client threads, expect attach and detach to need a moment
+when the *whole engine* is quiet, not just the model you are attaching to.
+
 `cache_dump` is the **only** action that writes. Nothing is persisted automatically, on a timer, or at
 exit - if you do not dump, nothing you computed reaches disk.
 
@@ -158,7 +165,8 @@ Errors use the engine's usual shape - an object with `id`, `field` and `error`. 
 `field` value appear, and the difference is only where the refusal came from:
 
   * A field name (`"context"`, `"what"`, `"model"`, `"level0"`, ...) means the request itself could
-    not be read. Nothing was attempted.
+    not be read. Nothing was attempted. A context name outside the legal alphabet comes back this
+    way, under `"context"`, alongside the missing, empty and wrong-typed cases.
   * `"action"` means the request was well-formed and the engine refused to carry it out - the
     context is not attached, the detach would lose undumped work, a request is open, the file on
     disk is not readable. The `error` text says which. Nothing was left half-done: an attach that
@@ -585,14 +593,35 @@ Example:
 {"id":"a2","action":"cache_detach","context":"card-5455"}
 ```
 
-**A detach with undumped work is refused**, and the refusal says how many earned positions are not on
-disk. Silently throwing that work away would lose a session with nothing in the response to say so;
+**A detach with undumped work is refused**, and the refusal says how many earned positions are not
+on disk. Silently throwing that work away would lose a session with nothing in the response to say so;
 silently dumping it would make `cache_dump` no longer the only action that writes. So you either send
 `cache_dump` first, or send the detach again with `"discardUndumped":true`, where the decision is visible
-in your own log. The refusal also fires when analysis requests have been served since the last
-`cache_dump` of counts, because retrieval counts cannot be inspected without consuming them; that check
-is deliberately conservative and costs at most one extra dump, which writes nothing when there is nothing
-to write.
+in your own log.
+
+The refusal fires on either of two conditions, and the difference between them matters if you are
+relying on it:
+
+  * **Undumped evaluations** - positions this context earned whose bytes are not in its file. This is
+    exact: the engine records, per position, whether its bytes reached disk.
+  * **Possibly undumped retrieval counts** - the engine has accepted an analysis request since this
+    model's last `cache_dump` of counts. This one is a **proxy, and a known-imperfect one**. Retrieval
+    counts cannot be inspected without consuming them, so the engine cannot ask "are there any"; it asks
+    "could there be", by watching whether a request was *accepted* since the last counts dump. Requests
+    are counted when they are accepted, not when they finish, and a counts dump is legal while requests
+    are open - so a request accepted **before** a dump and still running **after** it keeps earning
+    retrievals the dump did not write, and arms nothing. The proxy is also coarse in the safe direction:
+    a request served by a *different* hosted model arms it, and so does a request that hit nothing.
+
+**What that means for you.** In every workload anyone has managed to construct, a request long enough to
+still be running across a dump also evaluated positions that were not already on disk - so the exact
+evaluations check fired and the detach was refused. The two conditions together have held; the counts
+proxy alone has not been shown to. The shape where it would matter is a fully pre-warmed context
+re-studied with no new positions at all, where the evaluations check legitimately stays at zero. **If
+your client works that way - a mature card it only ever reviews - dump counts explicitly before you
+detach rather than relying on the refusal to remind you.** A dump with nothing to write costs nothing.
+The real fix is a non-consuming "are there unpersisted counts" query inside the cache, which is filed
+work and not yet built.
 
 The response echoes the query and adds:
 
