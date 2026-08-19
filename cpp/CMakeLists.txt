@@ -1929,9 +1929,30 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "C
   target_link_libraries(katago Threads::Threads)
 
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic -Wall -Wextra -Wno-sign-compare -Wcast-align -Wcast-qual -Wctor-dtor-privacy -Wdisabled-optimization -Wformat=2 -Wmissing-declarations -Wmissing-include-dirs -Woverloaded-virtual -Wredundant-decls -Wshadow -Wstrict-overflow=1 -Wswitch-default -Wfloat-conversion -Wunused")
-  set(CMAKE_CXX_FLAGS_DEBUG "-g3 -O0 -fno-omit-frame-pointer")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2")
-  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+  # These are project defaults for CMAKE_CXX_FLAGS_DEBUG/_RELWITHDEBINFO, applied only
+  # when the cache still holds CMake's own toolchain-initialization value for the flag
+  # (i.e. the user did not pass an explicit -DCMAKE_CXX_FLAGS_<CONFIG>=... override). A
+  # plain set() here would silently discard an explicit user override with no
+  # diagnostic, because it creates a directory-scope variable that shadows the cache
+  # entry a -D populates. The _INIT variables carry a leading space (they are built via
+  # repeated string(APPEND ... " ...")), while the cache entry they seed is stored
+  # trimmed, so both sides are stripped before comparing -- an un-stripped STREQUAL here
+  # is always false, silently disabling the guard and reintroducing the same
+  # unconditional-overwrite bug this change exists to remove.
+  #
+  # CMAKE_CXX_FLAGS_RELEASE is deliberately left unset here: CMake's own default for
+  # GNU/Clang release builds is already "-O3 -DNDEBUG", identical to what this project
+  # wants, so there is no default to apply -- only the cache-shadowing set() to avoid.
+  string(STRIP "${CMAKE_CXX_FLAGS_DEBUG_INIT}" _katago_cxx_flags_debug_init_stripped)
+  if(CMAKE_CXX_FLAGS_DEBUG STREQUAL _katago_cxx_flags_debug_init_stripped)
+    set(CMAKE_CXX_FLAGS_DEBUG "-g3 -O0 -fno-omit-frame-pointer")
+  endif()
+  unset(_katago_cxx_flags_debug_init_stripped)
+  string(STRIP "${CMAKE_CXX_FLAGS_RELWITHDEBINFO_INIT}" _katago_cxx_flags_relwithdebinfo_init_stripped)
+  if(CMAKE_CXX_FLAGS_RELWITHDEBINFO STREQUAL _katago_cxx_flags_relwithdebinfo_init_stripped)
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2")
+  endif()
+  unset(_katago_cxx_flags_relwithdebinfo_init_stripped)
 
   if(NOT CMAKE_CONFIGURATION_TYPES)
     string(TOUPPER "${CMAKE_BUILD_TYPE}" _bt)
