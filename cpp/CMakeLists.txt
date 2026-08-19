@@ -1030,7 +1030,9 @@ add_executable(katago
   tests/testnncache.cpp
   tests/testnncachepolicy.cpp
   tests/testnncachefrozen.cpp
+  tests/testnncachetwolevel.cpp
   tests/testnncachefrozenbench.cpp
+  tests/testnncachetwolevelbench.cpp
   tests/testnncachecountlog.cpp
   tests/testnncachecontext.cpp
   tests/testnnevalcontainer.cpp

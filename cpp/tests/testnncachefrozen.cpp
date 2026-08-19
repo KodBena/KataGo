@@ -9,6 +9,7 @@
 
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncachefrozen.h"
+#include "../neuralnet/nncachetwolevel.h"
 
 using namespace std;
 using namespace TestCommon;

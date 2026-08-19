@@ -350,36 +350,10 @@ class NNCacheFrozen {
 // The two-level resolution strategy
 //-------------------------------------------------------------------------------------
 
-// Composes a frozen level 0 over an ordinary level 1 and presents them as one
-// NNCacheTable, with one unified hit-count surface across both.
-//
-// RESOLUTION. A get asks level 0 first, and falls through to level 1 only on a level-0
-// miss. A set never reaches level 0 -- it is frozen -- so it goes to level 1, and if level
-// 0 held that key the level-0 entry is shadowed first so that ownership of the key, and
-// the count it accrued, move to level 1 together. clear() empties level 1 and shadows
-// nothing: level 0 is the pre-warmed content a session was given and is not the session's
-// to discard.
-//
-// LEVEL 0 IS OPTIONAL, AND ABSENT IS THE DEFAULT -- but absence is represented by not
-// having one of these at all, rather than by one of these holding a null level 0.
-// NNCacheTable::create is untouched and still builds a single-level table for every
-// configuration; this factory is reachable only by handing it a level 0, and it refuses a
-// null one. So the no-level-0 path allocates nothing, tests nothing and branches on
-// nothing (ADR-0000 Rule 2a).
-//
-// `hitLedgerPowerOfTwo` sizes the level-1 hit ledger at 2^k rows. Level 1 has no per-entry
-// counter of its own and adding one would touch four table implementations and change the
-// default table's memory, so the counts for level-1-owned keys live in one table here,
-// holding the full 128-bit key beside each count so a count is never attributed to the
-// wrong key. Throws if either argument cannot be honored.
-std::unique_ptr<NNCacheTable> makeTwoLevelNNCacheTable(
-  std::unique_ptr<NNCacheFrozen> levelZero,
-  std::unique_ptr<NNCacheTable> levelOne,
-  int hitLedgerPowerOfTwo
-);
-
-// The exact resident cost of the level-1 hit ledger that factory allocates. Named here so
-// the bound is stated in one place and can be asserted rather than estimated (ADR-0012 P1).
-size_t twoLevelHitLedgerBytes(int hitLedgerPowerOfTwo);
+// It lives in nncachetwolevel.h, beside its own implementation, because it is no longer
+// one factory function over one level 0: composing several attached sources into one
+// ORDERED resolution list brings a handle type, a list type and a table interface with
+// it, and that is a concern of its own rather than an appendix to this file (ADR-0012
+// P3). Nothing in this header depends on it; it depends on this one.
 
 #endif  // NEURALNET_NNCACHEFROZEN_H_

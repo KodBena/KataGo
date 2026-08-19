@@ -121,6 +121,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::chdvectordriver(subArgs);
   else if(subcommand == "runnncachefrozenbench")
     return MainCmds::runnncachefrozenbench(subArgs);
+  else if(subcommand == "runnncachetwolevelbench")
+    return MainCmds::runnncachetwolevelbench(subArgs);
   // The count log's write-volume measurement. Deliberately absent from printHelp for the
   // same reason as the two above: an instrument, not an operator verb.
   else if(subcommand == "runnncachecountlogbench")
