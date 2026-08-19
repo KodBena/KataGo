@@ -23,6 +23,12 @@ namespace FancyMath {
   //
   //Both substitutions are asserted bit-for-bit in runTests(), so a platform whose libm disagrees
   //fails the test suite instead of silently computing something else.
+  //
+  //Scope, so a reader does not expect more of this than it gives: any other exponent falls through
+  //to std::pow at full cost, so a call site whose configured exponent is neither 1 nor 2 gains
+  //nothing here beyond two predicted comparisons. The constant-exponent precondition is about speed
+  //only, never correctness - passing a genuinely varying exponent still returns exactly what
+  //std::pow would, it just mispredicts the comparisons.
   inline double powConstExponent(double x, double exponent) {
     if(exponent == 1.0)
       return x;
