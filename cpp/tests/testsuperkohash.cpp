@@ -26,7 +26,11 @@ using namespace TestCommon;
 //superko so bans actually arise, territory scoring so the encore is entered, and ko fights so ko
 //recapture blocks and simple ko locs are live. The corpus counts how often it reached each of those
 //states and asserts floors on the counts, because a corpus of quiet openings would pass both checks
-//while witnessing nothing.
+//while witnessing nothing. The floors sit at 63-65% of the counts this fixed seed produces, i.e.
+//tight enough that any single category dropping by more than about half again - a 2x regression
+//included - fails here rather than silently reducing this test to a tautology. The remaining third
+//is headroom for the counts to shift under an unrelated legitimate change to the rules code the
+//corpus plays against; it is not slack for coverage to decay into.
 
 namespace {
 
@@ -296,27 +300,25 @@ void Tests::runSuperKoBannedHashTests() {
   for(int game = 0; game<3000; game++)
     playAndCheckOneGame(rand,stats);
 
-  cout << "Checked " << stats.numPositionsChecked << " positions"
-       << ", " << stats.numWithAnySuperKoBan << " with a superko ban"
-       << ", " << stats.numWithSimpleKoLoc << " with a simple ko loc"
-       << ", " << stats.numWithKoLocAlsoBanned << " with the ko loc itself banned"
-       << ", " << stats.numInEncore1 << " in encore 1"
-       << ", " << stats.numInEncore2 << " in encore 2"
-       << ", " << stats.numWithKoRecapBlock << " with a ko recapture block"
-       << ", " << stats.numKoLocBannedPairsChecked << " constructed ko-loc-is-banned pairs"
-       << endl;
+  //Each count is printed WITH the floor it must clear, so the tightness of the guard is observed
+  //rather than described. A prose claim about how tight a floor is can drift from the floor; a
+  //printed pair cannot.
+  auto report = [](const char* what, int64_t count, int64_t floor) {
+    cout << what << " " << count << " (floor " << floor << ")" << endl;
+    testAssert(count > floor);
+  };
 
-  //A corpus of quiet openings would pass every assertion above while witnessing nothing, so the
-  //corpus's own coverage is asserted too. The floors are set at roughly half the counts this fixed
-  //seed produces, so a future change that quietly stops reaching these states fails here instead of
-  //silently reducing this test to a tautology. numWithKoLocAlsoBanned is deliberately NOT floored:
-  //it is 0 by construction, because a history's own recompute always clears the ban at its board's
-  //ko loc - the constructed pairs counted above are what cover that branch.
-  testAssert(stats.numPositionsChecked > 100000);
-  testAssert(stats.numWithAnySuperKoBan > 300);
-  testAssert(stats.numWithSimpleKoLoc > 500);
-  testAssert(stats.numInEncore1 > 10000);
-  testAssert(stats.numInEncore2 > 10000);
-  testAssert(stats.numWithKoRecapBlock > 2000);
-  testAssert(stats.numKoLocBannedPairsChecked > 200);
+  cout << "Coverage of the differential corpus:" << endl;
+  report("  positions checked                ", stats.numPositionsChecked, 200000);
+  report("  with a superko ban               ", stats.numWithAnySuperKoBan, 800);
+  report("  with a simple ko loc             ", stats.numWithSimpleKoLoc, 1300);
+  report("  in encore phase 1                ", stats.numInEncore1, 41000);
+  report("  in encore phase 2                ", stats.numInEncore2, 47000);
+  report("  with a ko recapture block        ", stats.numWithKoRecapBlock, 5900);
+  report("  constructed ko-loc-is-banned pairs", stats.numKoLocBannedPairsChecked, 360);
+  //Not floored, and printed without one on purpose: this count is 0 by construction, because a
+  //history's own recompute always clears the ban at its own board's ko loc. The constructed pairs
+  //on the line above are what cover that branch instead.
+  cout << "  with the ko loc itself banned    " << " " << stats.numWithKoLocAlsoBanned
+       << " (0 by construction, not floored)" << endl;
 }
