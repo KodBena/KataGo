@@ -609,8 +609,78 @@ NNCacheStats NNCacheTableDirect::stats() const {
 // The seam
 //-------------------------------------------------------------------------------------
 
-NNCacheTable::NNCacheTable() {}
+NNCacheTable::NNCacheTable() : attribution_(nullptr), contexts_() {}
 NNCacheTable::~NNCacheTable() {}
+
+//-------------------------------------------------------------------------------------
+// Context attribution
+//-------------------------------------------------------------------------------------
+
+NNCacheContextId NNCacheTable::attachCacheContext(const string& name) {
+  // attach() validates and refuses first, so a refused name never causes an allocation.
+  const NNCacheContextId id = contexts_.attach(name);
+  if(attribution_ == nullptr) {
+    const int pow = NNCacheAttributionRecorder::defaultPowerOfTwo();
+    // Enough to keep concurrent earnings off one lock, never more mutexes than rows. The
+    // same rule the two-level table's hit ledger uses, read from the same shape rather than
+    // chosen twice.
+    const int mutexPow = pow < 10 ? pow : 10;
+    attribution_.reset(new NNCacheAttributionRecorder(pow, mutexPow));
+  }
+  return id;
+}
+
+const NNCacheContextSet& NNCacheTable::cacheContexts() const {
+  return contexts_;
+}
+
+void NNCacheTable::set(const shared_ptr<NNOutput>& p, const NNCacheAttribution& attribution) {
+  if(attribution.isToContext() && !contexts_.owns(attribution.contextId()))
+    throw StringError(
+      "NNCacheTable::set: this attribution names a context attached to a different cache. "
+      "Spending it here would file the entry under whichever context sits at the same "
+      "position in this table's own name space, which is a different card."
+    );
+  // No context attached means nothing to attribute to and nothing an attribution could have
+  // been: the only representable attribution is NoAttributableContext, and counting a
+  // universe of one outcome would be a number with no reading. This is also what keeps the
+  // default configuration's set path exactly what it was.
+  if(attribution_ != nullptr)
+    attribution_->record(p->nnHash, attribution);
+  set(p);
+}
+
+NNCacheAttributionLedger NNCacheTable::harvestAttribution() const {
+  if(attribution_ == nullptr)
+    return NNCacheAttributionLedger::notAttributed();
+  return NNCacheAttributionLedger::attributed(
+    attribution_->harvest(contexts_),
+    attribution_->noAttributableContextEntries(),
+    attribution_->unrecordedAttributions()
+  );
+}
+
+vector<Hash128> NNCacheTable::attributedKeysFor(const NNCacheContextId& context) const {
+  if(!contexts_.owns(context))
+    throw StringError(
+      "NNCacheTable: this context is not attached to this cache, so it has earned nothing "
+      "here. Asking against the wrong cache's context is refused rather than answered with "
+      "an empty list a caller would read as 'this context earned nothing'."
+    );
+  if(attribution_ == nullptr)
+    return vector<Hash128>();
+  return attribution_->keysFor(context);
+}
+
+// Every table that keeps no per-key hit counts answers the per-context question the same way
+// it answers the whole-table one, and for the same reason: there are no counts to partition.
+// The context is still checked, so asking against the wrong cache is refused rather than
+// answered with a disposition that reads as an ordinary "this table does not count".
+NNCacheHitLedger NNCacheTable::harvestHitCountsFor(const NNCacheContextId& context) const {
+  const vector<Hash128> keys = attributedKeysFor(context);
+  (void)keys;
+  return NNCacheHitLedger::notCounted();
+}
 
 //-------------------------------------------------------------------------------------
 // The unified hit-count surface

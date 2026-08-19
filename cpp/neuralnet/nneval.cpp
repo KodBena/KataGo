@@ -21,7 +21,8 @@ NNResultBuf::NNResultBuf()
     errorLogLockout(false),
     // If no symmetry is specified, it will use default or random based on config.
     symmetry(NNInputs::SYMMETRY_NOTSPECIFIED),
-    policyOptimism(0.0)
+    policyOptimism(0.0),
+    cacheAttribution()
 {}
 
 NNResultBuf::~NNResultBuf() {
@@ -369,6 +370,43 @@ void NNEvaluator::clearStats() {
 void NNEvaluator::clearCache() {
   if(nnCacheTable != nullptr)
     nnCacheTable->clear();
+}
+
+NNCacheContextId NNEvaluator::attachCacheContext(const string& name) {
+  if(nnCacheTable == nullptr)
+    throw StringError(
+      "NNEvaluator: model '" + modelName + "' has no NN cache configured, so there is nothing "
+      "for context '" + name + "' to be attached to and nothing it could ever be attributed. "
+      "Attaching it would report success for a registration that can never be spent."
+    );
+  return nnCacheTable->attachCacheContext(name);
+}
+
+NNCacheContextResolution NNEvaluator::resolveCacheContext(const std::optional<string>& requested) const {
+  if(nnCacheTable == nullptr) {
+    if(!requested.has_value())
+      return NNCacheContextResolution::resolved(NNCacheAttribution::noAttributableContext());
+    return NNCacheContextResolution::refused(
+      "Unknown cacheContext '" + requested.value() + "'. Model '" + modelName +
+      "' has no NN cache configured, so no context is attached to it."
+    );
+  }
+  return nnCacheTable->cacheContexts().resolveForRequest(requested);
+}
+
+NNCacheAttributionLedger NNEvaluator::harvestCacheAttribution() const {
+  if(nnCacheTable == nullptr)
+    return NNCacheAttributionLedger::notAttributed();
+  return nnCacheTable->harvestAttribution();
+}
+
+NNCacheHitLedger NNEvaluator::harvestCacheHitCountsFor(const NNCacheContextId& context) const {
+  if(nnCacheTable == nullptr)
+    throw StringError(
+      "NNEvaluator: model '" + modelName + "' has no NN cache configured, so no context is "
+      "attached to it and none has earned anything here."
+    );
+  return nnCacheTable->harvestHitCountsFor(context);
 }
 
 
@@ -846,10 +884,15 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
   vector<std::shared_ptr<NNOutput>> ptrs;
   std::array<int, SymmetryHelpers::NUM_SYMMETRIES> symmetryIndexes;
   std::iota(symmetryIndexes.begin(), symmetryIndexes.end(), 0);
+  // evaluate() CONSUMES the buffer's cache-context tag, so it has to be re-supplied for each
+  // symmetry rather than set once by the caller. All of these evaluations are the same query's,
+  // earned by the same context, and every one of them sets an entry (skipCache is on).
+  const NNCacheAttribution attributionForEverySymmetry = buf.cacheAttribution;
   for(int i = 0; i<numSymmetriesToSample; i++) {
     std::swap(symmetryIndexes[i], symmetryIndexes[rand.nextInt(i,SymmetryHelpers::NUM_SYMMETRIES-1)]);
     nnInputParams.symmetry = symmetryIndexes[i];
     bool skipCacheThisIteration = true; // Skip cache since there's no guarantee which symmetry is in the cache
+    buf.cacheAttribution = attributionForEverySymmetry;
     evaluate(
       board, history, nextPlayer, sgfMeta,
       nnInputParams,
@@ -893,6 +936,18 @@ void NNEvaluator::evaluate(
 ) {
   testAssert(!isKilled);
   buf.hasResult = false;
+
+  // THE CACHE-CONTEXT TAG IS CONSUMED HERE, not read at the end.
+  //
+  // NNResultBuf is allocated once per thread and reused for every evaluation that thread ever
+  // makes, including this evaluator's and a companion evaluator's. A tag left standing on it
+  // would be spent by whichever evaluation came next -- filing one query's earnings under the
+  // context of the query before it, silently, since both are legal values. Taking it out of the
+  // buffer at entry makes a stale tag unrepresentable rather than something every call site has
+  // to remember not to leave behind: a caller that supplies one gets it spent exactly once, and
+  // a caller that supplies none is unattributed, which is counted and reported.
+  const NNCacheAttribution cacheAttribution = buf.cacheAttribution;
+  buf.cacheAttribution = NNCacheAttribution::noAttributableContext();
 
   if(board.x_size > nnXLen || board.y_size > nnYLen)
     throw StringError("NNEvaluator was configured with nnXLen = " + Global::intToString(nnXLen) +
@@ -1277,9 +1332,11 @@ void NNEvaluator::evaluate(
   }
 
 
-  // And record the nnHash in the result and put it into the table
+  // And record the nnHash in the result and put it into the table, filed under the context
+  // that earned it -- which is the context the request named, carried here on the buffer.
+  // With no context attached anywhere this is the same store it always was.
   buf.result->nnHash = nnHash;
   if(nnCacheTable != nullptr)
-    nnCacheTable->set(buf.result);
+    nnCacheTable->set(buf.result, cacheAttribution);
 
 }

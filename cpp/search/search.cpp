@@ -85,6 +85,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    mirrorAdvantage(0.0),
    mirrorCenterSymmetryError(1e10),
    alwaysIncludeOwnerMap(false),
+   cacheAttribution(),
    searchParams(params),numSearchesBegun(0),searchNodeAge(0),
    plaThatSearchIsFor(C_EMPTY),plaThatSearchIsForLastSearch(C_EMPTY),
    lastSearchNumPlayouts(0),
@@ -299,6 +300,10 @@ void Search::setParamsNoClearing(const SearchParams& params) {
   applyHistoryModesToRootHistory();
 }
 
+void Search::setCacheAttribution(const NNCacheAttribution& attribution) {
+  cacheAttribution = attribution;
+}
+
 void Search::setExternalPatternBonusTable(std::unique_ptr<PatternBonusTable>&& table) {
   if(table == externalPatternBonusTable)
     return;
@@ -339,6 +344,12 @@ Hash128 Search::getEvalCacheModelHash(
 
 void Search::setNNEval(NNEvaluator* nnEval) {
   clearSearch();
+  //A cache context belongs to ONE evaluator's cache: the id names a position in that cache's
+  //own attach order and means something else, or nothing, in another's. Swapping the evaluator
+  //therefore invalidates the attribution, and it is dropped here rather than carried into a
+  //cache that never attached it -- where it would be refused at the set path, one search too
+  //late for the caller to have done anything about it.
+  cacheAttribution = NNCacheAttribution::noAttributableContext();
   nnEvaluator = nnEval;
   nnXLen = nnEval->getNNXLen();
   nnYLen = nnEval->getNNYLen();

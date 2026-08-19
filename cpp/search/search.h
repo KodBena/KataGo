@@ -123,6 +123,18 @@ struct Search {
 
   bool alwaysIncludeOwnerMap;
 
+  //Which of nnEvaluator's attached cache contexts this search's evaluations are earned by.
+  //Carried rather than derived: only the request knows which context it is studying, and only
+  //the boundary that read the request could refuse an unknown one. Defaults to
+  //NoAttributableContext, which is what every caller that never sets it leaves it as, and is
+  //exactly the behaviour before this field existed.
+  //
+  //It is deliberately NOT part of SearchParams. SearchParams is hashed into the eval-cache key
+  //(SearchParams::getHash), and a cache context is a bookkeeping tag that changes nothing a
+  //search computes -- folding it in would split the eval cache along a term with no effect on
+  //any result, which is a cache miss bought for nothing.
+  NNCacheAttribution cacheAttribution;
+
   SearchParams searchParams;
   int64_t numSearchesBegun;
   uint32_t searchNodeAge;
@@ -240,6 +252,13 @@ struct Search {
   void setRootSymmetryPruningOnly(const std::vector<int>& rootPruneOnlySymmetries);
   void setParams(const SearchParams& params);
   void setParamsNoClearing(const SearchParams& params); //Does not clear search
+  //Which attached cache context this search's evaluations are earned by. The attribution must
+  //have been resolved against THIS search's nnEvaluator; spending one resolved against another
+  //model's cache is refused at the set path rather than filing the entry under whichever
+  //context sits at the same position there.
+  //Does not clear the search: attribution is bookkeeping about what a search earns and changes
+  //nothing about what it computes, so there is nothing computed under the old value to discard.
+  void setCacheAttribution(const NNCacheAttribution& attribution);
   //Resolve a false/auto/true alwaysComputePassAliveUnderSuicideRules setting against what a neural net
   //declares that it expects. Auto resolves to the net's declaration (false if nnEval is NULL).
   static bool resolveAlwaysComputePassAliveUnderSuicideRules(const SearchParams& params, const NNEvaluator* nnEval);

@@ -32,6 +32,15 @@ struct AnalyzeRequest {
   //also what a freshly-built request carries before its "model" field has been read.
   SearchableModelIdx modelIdx = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
 
+  //Which of the selected model's attached cache contexts this request's new evaluations are
+  //earned by, already resolved from the request's optional "cacheContext" field against that
+  //model's own attached contexts. The request carries the RESOLUTION and never the requested
+  //name, for the same reason it carries a resolved model index: resolution happens once, at the
+  //boundary that can refuse it, so no later stage can resolve it differently or fail to.
+  //A request that named no context carries NoAttributableContext unless exactly one context is
+  //attached, which is also what a freshly-built request carries.
+  NNCacheAttribution cacheAttribution;
+
   Board board;
   BoardHistory hist;
   Player nextPla;
@@ -293,6 +302,7 @@ int MainCmds::analysis(const vector<string>& args) {
     "id",
     "action",
     "model",
+    "cacheContext",
     "terminateId",
     "turnNumbers",
     "boardXSize",
@@ -443,6 +453,9 @@ int MainCmds::analysis(const vector<string>& args) {
         bot->setPosition(request->nextPla,request->board,request->hist);
         bot->setAlwaysIncludeOwnerMap(request->includeOwnership || request->includeOwnershipStdev || request->includeMovesOwnership || request->includeMovesOwnershipStdev);
         bot->setParams(request->params);
+        //The cache context was resolved when the request was parsed, against this very model; this
+        //is where that resolution is spent.
+        bot->setCacheAttribution(request->cacheAttribution);
         bot->setAvoidMoveUntilByLoc(request->avoidMoveUntilByLocBlack,request->avoidMoveUntilByLocWhite);
 
         Player pla = request->nextPla;
@@ -602,6 +615,15 @@ int MainCmds::analysis(const vector<string>& args) {
           reportErrorForId(rbase.id, "model", "The \"model\" field selects which model analyzes a query and is not supported on an action query");
           continue;
         }
+        //Same disposition, same reason: "cacheContext" says which attached context a QUERY's new
+        //evaluations are earned by, no action reads it, and an action that accepted it and then
+        //did the same thing regardless would be a field the receiver cannot honor. The cache
+        //actions that will mean something by a context carry it as their own named field when
+        //they exist; until then this is refused rather than silently ignored.
+        if(input.find("cacheContext") != input.end()) {
+          reportErrorForId(rbase.id, "cacheContext", "The \"cacheContext\" field attributes a query's new cache entries and is not supported on an action query");
+          continue;
+        }
         if(action == "query_version") {
           input["version"] = Version::getKataGoVersion();
           input["git_hash"] = Version::getGitRevision();
@@ -738,6 +760,9 @@ int MainCmds::analysis(const vector<string>& args) {
       //A request that names no model is served by the primary model, which without -extra-model is
       //the only model there is: the no-model path is the engine's prior behaviour, untouched.
       rbase.modelIdx = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+      //Reset alongside it: rbase is reused across requests, so a context resolved for the previous
+      //one must not survive into a request that named none.
+      rbase.cacheAttribution = NNCacheAttribution::noAttributableContext();
 
       //The optional "model" field. An unrecognized key elsewhere in a request is only WARNED about,
       //and that warning is switchable off with warnUnusedFields -- a disposition this field cannot
@@ -756,6 +781,31 @@ int MainCmds::analysis(const vector<string>& args) {
           continue;
         }
         rbase.modelIdx = resolution.searchableIdx().value();
+      }
+
+      //The optional "cacheContext" field. It is resolved against the model this request already
+      //selected, because contexts are attached per model: each model's cache has its own attach
+      //order and its own name space, and a name attached to one says nothing about another.
+      //Resolving it here, after "model", is what makes that true by construction.
+      //An unknown name is an ERROR and the request is not analyzed, rather than being analyzed
+      //with its earnings filed under some other context -- which would write this session's work
+      //into the wrong card's file, with no field of the response carrying evidence it happened.
+      {
+        std::optional<string> requestedContext;
+        if(input.find("cacheContext") != input.end()) {
+          if(!input["cacheContext"].is_string()) {
+            reportErrorForId(rbase.id, "cacheContext", "Must be a string naming a cache context attached to the model this query selects");
+            continue;
+          }
+          requestedContext = input["cacheContext"].get<string>();
+        }
+        const NNCacheContextResolution contextResolution =
+          modelHosts.searchableEval(rbase.modelIdx)->resolveCacheContext(requestedContext);
+        if(!contextResolution.attribution().has_value()) {
+          reportErrorForId(rbase.id, "cacheContext", contextResolution.refusal().value());
+          continue;
+        }
+        rbase.cacheAttribution = contextResolution.attribution().value();
       }
 
       auto parseInteger = [&rbase,&reportErrorForId](const json& dict, const char* field, int64_t& buf, int64_t min, int64_t max, const char* errorMessage) {
@@ -1323,6 +1373,7 @@ int MainCmds::analysis(const vector<string>& args) {
           newRequest->id = rbase.id;
           newRequest->turnNumber = turnNumber;
           newRequest->modelIdx = rbase.modelIdx;
+          newRequest->cacheAttribution = rbase.cacheAttribution;
           newRequest->board = board;
           newRequest->hist = hist;
           newRequest->nextPla = nextPla;
