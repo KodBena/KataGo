@@ -1,5 +1,6 @@
 #include "../search/search.h"
 
+#include "../core/fancymath.h"
 #include "../search/searchnode.h"
 #include "../search/distributiontable.h"
 
@@ -123,12 +124,14 @@ double Search::computeWeightFromNNOutput(const NNOutput* nnOutput) const {
   double utilityUncertainty = utilityUncertaintyWL + utilityUncertaintyScore;
 
   double poweredUncertainty;
-  if(searchParams.uncertaintyExponent == 1.0)
-    poweredUncertainty = utilityUncertainty;
-  else if(searchParams.uncertaintyExponent == 0.5)
+  //sqrt is correctly rounded where pow is not, so sqrt(x) and pow(x,0.5) differ by one ulp on a
+  //small fraction of inputs. That makes this substitution a numeric choice specific to this site
+  //rather than a general fast path, which is why it stays here instead of moving into
+  //powConstExponent along with the exponents that are bit-identical to pow.
+  if(searchParams.uncertaintyExponent == 0.5)
     poweredUncertainty = sqrt(utilityUncertainty);
   else
-    poweredUncertainty = pow(utilityUncertainty, searchParams.uncertaintyExponent);
+    poweredUncertainty = FancyMath::powConstExponent(utilityUncertainty, searchParams.uncertaintyExponent);
 
   double baselineUncertainty = searchParams.uncertaintyCoeff / searchParams.uncertaintyMaxWeight;
   double weight = searchParams.uncertaintyCoeff / (poweredUncertainty + baselineUncertainty);
@@ -278,7 +281,7 @@ void Search::recomputeNodeStats(SearchNode& node, SearchThread& thread, int numV
 
       if(currentTotalChildWeight > 1e-10) {
         double utilityChildren = utilitySum / currentTotalChildWeight;
-        double subtreeValueBiasWeight = pow(origTotalChildWeight, searchParams.subtreeValueBiasWeightExponent);
+        double subtreeValueBiasWeight = FancyMath::powConstExponent(origTotalChildWeight, searchParams.subtreeValueBiasWeightExponent);
         double subtreeValueBiasDeltaSum = (utilityChildren - utility) * subtreeValueBiasWeight;
 
         while(entry.entryLock.test_and_set(std::memory_order_acquire));
@@ -479,7 +482,7 @@ void Search::downweightBadChildrenAndNormalizeWeight(
     double z = (statsBuf[i].selfUtility - simpleValue) / stdevs[i];
     //Also just for numeric sanity, make sure everything has some tiny minimum value.
     double p = valueWeightDistribution->getCdf(z) + 0.0001;
-    statsBuf[i].weightAdjusted *= pow(p, searchParams.valueWeightExponent);
+    statsBuf[i].weightAdjusted *= FancyMath::powConstExponent(p, searchParams.valueWeightExponent);
     totalNewUnnormWeight += statsBuf[i].weightAdjusted;
   }
 

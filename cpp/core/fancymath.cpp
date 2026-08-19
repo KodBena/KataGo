@@ -1,7 +1,10 @@
 #include "../core/fancymath.h"
 
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 #include "../core/test.h"
@@ -509,5 +512,45 @@ void FancyMath::runTests() {
 )%%";
     TestCommon::expect(name,out,expected);
 
+  }
+
+  {
+    //powConstExponent must be bit-for-bit identical to std::pow on every input, since call sites
+    //rely on switching to it changing nothing about what they compute. Both of its fast paths are
+    //exact by construction on any correct libm, but "any correct libm" is an assumption about the
+    //platform, so it is checked here rather than trusted.
+    auto bitsOf = [](double d) noexcept { uint64_t u; std::memcpy(&u,&d,sizeof(u)); return u; };
+    auto sameBits = [&bitsOf](double a, double b) noexcept { return bitsOf(a) == bitsOf(b); };
+
+    const double specials[] = {
+      0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, 1e-320, -1e-320,
+      std::numeric_limits<double>::denorm_min(),
+      std::numeric_limits<double>::min(),
+      std::numeric_limits<double>::max(),
+      -std::numeric_limits<double>::max(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::quiet_NaN(),
+    };
+    for(double x: specials) {
+      testAssert(sameBits(FancyMath::powConstExponent(x,1.0), std::pow(x,1.0)));
+      testAssert(sameBits(FancyMath::powConstExponent(x,2.0), std::pow(x,2.0)));
+      testAssert(sameBits(FancyMath::powConstExponent(x,0.85), std::pow(x,0.85)));
+    }
+
+    //Sweep random bit patterns, so the sample is spread over exponents and mantissas rather than
+    //over a range of magnitudes. Non-finite patterns are covered by the specials above.
+    uint64_t state = 0x9E3779B97F4A7C15ULL;
+    for(int i = 0; i<400000; i++) {
+      state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+      double x;
+      std::memcpy(&x,&state,sizeof(x));
+      if(!std::isfinite(x))
+        continue;
+      testAssert(sameBits(FancyMath::powConstExponent(x,1.0), std::pow(x,1.0)));
+      testAssert(sameBits(FancyMath::powConstExponent(x,2.0), std::pow(x,2.0)));
+      //And the fallthrough really is plain pow, for an exponent with no fast path.
+      testAssert(sameBits(FancyMath::powConstExponent(x,0.85), std::pow(x,0.85)));
+    }
   }
 }
