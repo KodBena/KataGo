@@ -141,11 +141,15 @@ struct BoardHistory {
   //or an appropriately resolved value (e.g. from Search::resolveHistoryModes or a governing history/book/game).
   BoardHistory(const Board& board, Player pla, const Rules& rules, int encorePhase, const BoardHistoryModes& modes);
 
-  BoardHistory(const BoardHistory& other);
-  BoardHistory& operator=(const BoardHistory& other);
+  //Copy and move are compiler-generated. Every member of this struct is copyable and movable
+  //with exactly the semantics the previous hand-written, member-by-member implementations gave
+  //it, so defaulting them changes no behavior - it only removes the need to remember to extend
+  //four separate operations whenever a member is added to this struct.
+  BoardHistory(const BoardHistory& other) = default;
+  BoardHistory& operator=(const BoardHistory& other) = default;
 
-  BoardHistory(BoardHistory&& other) noexcept;
-  BoardHistory& operator=(BoardHistory&& other) noexcept;
+  BoardHistory(BoardHistory&& other) noexcept = default;
+  BoardHistory& operator=(BoardHistory&& other) noexcept = default;
 
   //Clears all history and status and bonus points, sets encore phase and rules
   void clear(const Board& board, Player pla, const Rules& rules, int encorePhase);
