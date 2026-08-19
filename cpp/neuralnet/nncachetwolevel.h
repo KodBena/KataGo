@@ -47,10 +47,17 @@
 // shape this replaced, the miss path is about 5 ns slower at one attached source (39.5-40.0
 // ns against 44.6-45.5, minima of 21 interleaved rep-pairs, three runs, paired in one
 // process against the pre-change table compiled from d9b6e591 into the same binary; the hit
-// path differs by about 1 ns). The cause is structural and is one extra dependent cache
-// line: the sources live in a heap-allocated array, so resolving the first one loads the
-// array base out of this object and then the source pointer out of that block, where a
-// single owned member was one load inside the object already in cache.
+// path differs by about 1 ns). Independently re-measured by review at 4.3-6.5 ns, same sign
+// every time.
+//
+// THE EFFECT IS MEASURED; THE EXPLANATION BELOW IS NOT, and the two are marked apart on
+// purpose (amended 2026-08-19 after review drew the line). The HYPOTHESIS, consistent with
+// the effect and with the probe arms that ruled out the loop and the bounds reload, is one
+// extra dependent cache line: the sources live in a heap-allocated array, so resolving the
+// first one loads the array base out of this object and then the source pointer out of that
+// block, where a single owned member was one load inside the object already in cache. NO
+// PROFILER WAS RUN, so no cache-miss count was ever observed and this is not a measured
+// cause. Anyone acting on it should measure the mechanism first.
 //
 // THE OPTION THAT WOULD REMOVE IT, named so this is a filed item and not an apology: hold
 // the first few source pointers in a fixed inline array inside this object and spill to the
