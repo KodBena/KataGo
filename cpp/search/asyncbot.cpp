@@ -137,6 +137,10 @@ void AsyncBot::setParamsNoClearing(const SearchParams& params) {
   stopAndWait();
   search->setParamsNoClearing(params);
 }
+void AsyncBot::setCacheAttribution(const NNCacheAttribution& attribution) {
+  stopAndWait();
+  search->setCacheAttribution(attribution);
+}
 void AsyncBot::setExternalPatternBonusTable(std::unique_ptr<PatternBonusTable>&& table) {
   stopAndWait();
   search->setExternalPatternBonusTable(std::move(table));

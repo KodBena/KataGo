@@ -77,6 +77,24 @@ class HitLedger {
     unrecorded_.fetch_add((int64_t)amount, std::memory_order_relaxed);
   }
 
+  // This key's count, or zero if it has no row. The zero is not a sentinel: a key with no row
+  // was never hit, and "never hit" and "hit zero times" are one fact for a counter that only
+  // ever counts up. A row is never written with a count below one, so the two cases cannot be
+  // told apart by any observer either.
+  uint32_t hitsFor(Hash128 key) const {
+    const uint64_t home = key.hash0 & mask_;
+    std::mutex& mutex = mutexPool_.getMutex((uint32_t)home & mutexMask_);
+    std::lock_guard<std::mutex> lock(mutex);
+    for(uint32_t step = 0; step < PROBE_WINDOW; step++) {
+      const Row& row = rows_[(home + step) & mask_];
+      if(row.count == 0)
+        return 0;
+      if(row.key == key)
+        return row.count;
+    }
+    return 0;
+  }
+
   std::vector<NNCacheHitCount> harvest() const {
     std::vector<NNCacheHitCount> out;
     for(size_t i = 0; i < rows_.size(); i++) {
@@ -195,6 +213,25 @@ class NNCacheTableTwoLevel final : public NNCacheTable {
     const std::vector<NNCacheHitCount> levelOneRows = ledger_.harvest();
     rows.insert(rows.end(), levelOneRows.begin(), levelOneRows.end());
     return NNCacheHitLedger::counted(std::move(rows), ledger_.unrecordedHits());
+  }
+
+  // What a dump of one context writes. The two facts are owned in two places and joined
+  // here, once: WHICH keys this context earned is the base table's attribution ledger, and
+  // HOW OFTEN each was retrieved is this table's hit ledger. Neither is re-derived from the
+  // other -- an earned key with no hit row appears with zero, which is a fact a dump wants,
+  // not a row to drop.
+  NNCacheHitLedger harvestHitCountsFor(const NNCacheContextId& context) const override {
+    const std::vector<Hash128> keys = attributedKeysFor(context);
+    std::vector<NNCacheHitCount> rows;
+    rows.reserve(keys.size());
+    for(size_t i = 0; i < keys.size(); i++) {
+      NNCacheHitCount row;
+      row.key = keys[i];
+      row.hits = ledger_.hitsFor(keys[i]);
+      rows.push_back(row);
+    }
+    // Zero, and see NNCacheTable::harvestHitCountsFor for why the residue is not divided.
+    return NNCacheHitLedger::counted(std::move(rows), 0);
   }
 
  private:

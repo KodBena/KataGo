@@ -10,6 +10,7 @@
 
 #include "../core/global.h"
 #include "../core/hash.h"
+#include "../neuralnet/nncachecontext.h"
 #include "../neuralnet/nninputs.h"
 
 class ConfigParser;
@@ -358,6 +359,76 @@ class NNCacheTable {
   virtual void set(const std::shared_ptr<NNOutput>& p) = 0;
   virtual void clear() = 0;
 
+  //-----------------------------------------------------------------------------------
+  // Context attribution of what this session earns
+  //-----------------------------------------------------------------------------------
+
+  // See nncachecontext.h. In one line: with more than one body of pre-warmed content
+  // attached to a model, the engine cannot tell which of them a query served, because the
+  // cache key names a position and nothing else -- so the query carries a tag, and this is
+  // where the tag is spent.
+  //
+  // ATTRIBUTION LIVES ON THE BASE, not on the two-level table, and the reason is that "what
+  // this session earned" is exactly the set of keys that reach set() -- which is true of
+  // every table shape, single-level and two-level alike. Under a two-level table those keys
+  // are precisely level 1's, since level 0 is frozen and never takes a set. Putting the
+  // ledger here means one owner for the fact rather than one copy per table implementation
+  // (ADR-0012 P1/P3), and it is what lets a context be attached to an ordinary cache at all.
+
+  // Registers a context entries may be attributed to, and returns the only kind of value
+  // that can address it. Throws StringError, naming the name, for a name outside the closed
+  // alphabet or one already attached.
+  //
+  // The FIRST attach allocates the ledger. A table with no attached context has none, so the
+  // default configuration -- which attaches nothing, because no protocol action attaches yet
+  // -- pays one predictable null test per set and not one byte of memory.
+  NNCacheContextId attachCacheContext(const std::string& name);
+
+  // What this table has attached, for a resolution boundary to refuse an unknown name
+  // against. Const: attaching goes through attachCacheContext, which owns the ledger's
+  // lifetime too.
+  [[nodiscard]] const NNCacheContextSet& cacheContexts() const;
+
+  // Stores `p` exactly as set(p) does, having first recorded which context earned it.
+  //
+  // Thread-safe, and NOT virtual: recording is the same act for every table shape, and the
+  // storing half is the virtual one it delegates to. Throws StringError for an attribution
+  // naming a context this table did not attach -- an id minted by another model's cache
+  // cannot be spent here, and is refused rather than indexing into this table's name space
+  // at the same position.
+  void set(const std::shared_ptr<NNOutput>& p, const NNCacheAttribution& attribution);
+
+  // The key -> context ledger of what this session earned, for whoever persists it.
+  // Thread-safe and O(ledger); a reporting call taken between sessions, never in a search.
+  //
+  // NotAttributed when no context was ever attached -- the same typed disposition
+  // harvestHitCounts uses, and for the same reason.
+  //
+  // EARNED MEANS EVALUATED AND OFFERED, NOT NECESSARILY RESIDENT, and the difference is named
+  // rather than left to be discovered. Recording happens where the attribution arrives -- at
+  // this entry point -- and the storing half below it may still decline the entry: a
+  // SecondSighting admission policy drops a key on its first sighting, and a capacity sweep
+  // can drop it later. Under the default policy the two sets coincide exactly. Under any other
+  // the ledger is a SUPERSET of what the table holds, which is the honest reading for a record
+  // of what a study session worked on, and which a dump of evaluations intersects with the
+  // table anyway. Reading it as "what is resident" would be wrong under those policies.
+  [[nodiscard]] NNCacheAttributionLedger harvestAttribution() const;
+
+  // The hit-count rows a dump of exactly `context` writes: one per key that context earned,
+  // carrying the hits that key took this session. A key earned and never retrieved again
+  // appears with zero hits, because "this context earned this position and nothing came back
+  // for it" is precisely the fact that says to stop carrying it.
+  //
+  // NotCounted from a table that keeps no per-key hit counts, exactly as harvestHitCounts is.
+  // Throws StringError for a context this table did not attach.
+  //
+  // unrecordedHits() on the returned ledger is zero, and that is a statement rather than an
+  // omission: the unrecorded-hit and unattributed-entry residues are hits and entries whose
+  // CONTEXT is the thing that was lost, so they cannot be divided among contexts. They are
+  // reported once, whole, by harvestHitCounts() and harvestAttribution(), and are never
+  // smeared across per-context dumps where each context would appear to carry all of them.
+  [[nodiscard]] virtual NNCacheHitLedger harvestHitCountsFor(const NNCacheContextId& context) const;
+
   // Thread-safe, and O(table). See NNCacheStats: a reporting call, not a hot-path one.
   virtual NNCacheStats stats() const = 0;
 
@@ -376,6 +447,16 @@ class NNCacheTable {
 
  protected:
   NNCacheTable();
+
+  // Exactly the keys `context` earned, for an implementation that can put hit counts beside
+  // them. Total: a context this table did not attach is refused by attachCacheContext's own
+  // ownership rule before it can be asked about here.
+  [[nodiscard]] std::vector<Hash128> attributedKeysFor(const NNCacheContextId& context) const;
+
+ private:
+  // Allocated by the first attachCacheContext and never before. See attachCacheContext.
+  std::unique_ptr<NNCacheAttributionRecorder> attribution_;
+  NNCacheContextSet contexts_;
 };
 
 #endif  // NEURALNET_NNCACHE_H_

@@ -48,6 +48,40 @@ A query with no `model` field behaves exactly as it always has.
 action query (`query_models`, `clear_cache`, `terminate`, `terminate_all`, `query_version`) is an
 error rather than being ignored.
 
+## Attributing what a query earns in the cache
+
+A client may attach one or more named **cache contexts** to a model. A context is an opaque string the
+client chooses: KataGo compares it for equality, checks it is usable as a filename component, and stores
+it. It understands nothing else by it - there is no relation between contexts, no ordering and no
+meaning attached to what a context stands for.
+
+Contexts exist so that the new entries a session puts into a model's cache can be told apart. The cache
+key names a position and nothing else, so with two contexts attached the engine cannot tell which of them
+a query served. A query says so itself, with the optional `cacheContext` field:
+
+  * A `cacheContext` naming a context attached to the model the query selected attributes that query's
+    new cache entries to it.
+  * **A `cacheContext` that is not attached to that model is an error, and the query is not analyzed.**
+    The error message names it and lists the contexts that are attached. The engine will not fall back to
+    another context, because that would file this session's work under the wrong one and nothing in the
+    response would say it had happened.
+  * With exactly **one** context attached to the model, a query with no `cacheContext` is attributed to
+    it: with one attached, everything the session earns belongs to it.
+  * With any other number attached, a query with no `cacheContext` earns entries that are counted and
+    reported as **unattributed**. They are never assigned to whichever context happens to be first.
+
+Contexts are per model. Each hosted model has its own cache and its own set of attached contexts, and a
+name attached to one model says nothing about another - which is why `cacheContext` is resolved against
+the model the same query selected with `model`.
+
+A query with no `cacheContext` field behaves exactly as it always has, and so does an engine with no
+context attached to anything, which is every engine today: **the action that attaches a context is not
+implemented yet**, so `cacheContext` currently has no attached name to resolve against and any value for
+it is refused. The field, its validation and its effect on attribution are in place ahead of that action.
+
+`cacheContext` attributes a *query*'s new cache entries; no action query reads it, so including
+`cacheContext` on an action query is an error rather than being ignored, exactly as `model` is.
+
 ## Example Code
 
 For example code demonstrating how to invoke the analysis engine from Python, see [here](https://github.com/lightvector/KataGo/blob/master/python/query_analysis_engine_example.py)!
@@ -119,6 +153,7 @@ Explanation of fields (including some optional fields not present in the above q
    * `analyzeTurns (list of integers)`: Optional. Which turns of the game to analyze. 0 is the initial position, 1 is the position after `moves[0]`, 2 is the position after `moves[1]`, etc. If this field is not specified, defaults to analyzing only the last turn, which is the position after all specified `moves` are made.
    * `maxVisits (integer)`: Optional. The maximum number of visits to use. If not specified, defaults to the value in the analysis config file. If specified, overrides it.
    * `model (string)`: Optional. Which of the loaded models should analyze this query, given as the `internalName` that the `query_models` action reports for it. If not specified, the query is analyzed by the model given by `-model` on the command line, which is what the engine has always done and is the only model loaded unless `-extra-model` was also given. A name that is not a loaded model, or that names the human SL model (which participates in searches but is not independently searchable), is an ERROR for that query and nothing is analyzed - the engine will not quietly substitute a different net. See "Hosting more than one model" below.
+   * `cacheContext (string)`: Optional. Which attached cache context this query's new cache entries are earned by, resolved against the model this query selects. A context that is not attached to that model is an ERROR for that query and nothing is analyzed - the engine will not attribute the work to some other context. If not specified, the query is attributed to the sole attached context when exactly one is attached, and is otherwise counted as unattributed. See "Attributing what a query earns in the cache" below.
    * `rootPolicyTemperature (float)`: Optional. Set this to a value > 1 to make KataGo do a wider search.
    * `rootFpuReductionMax (float)`: Optional. Set this to 0 to make KataGo more willing to try a variety of moves.
    * `analysisPVLen (integer)`: Optional. The maximum length of the PV to send for each move (not including the first move).

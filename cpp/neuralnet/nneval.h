@@ -34,6 +34,42 @@ struct NNResultBuf {
   int symmetry; // The symmetry to use for this eval
   double policyOptimism; // The policy optimism to use for this eval
 
+  // Which attached cache context this evaluation is earned by, if this evaluator's cache has
+  // any attached. The last leg of the plumb an analysis request starts: the request names a
+  // context, the boundary resolves it against the model the request selected, the search
+  // carries the resolution, and it arrives HERE -- on the buffer the evaluation rides on --
+  // because the set that files the entry happens at the end of the very call this buffer is
+  // the argument to. Anything shorter-lived than the buffer would need a second channel to
+  // reach that set.
+  //
+  // Defaults to NoAttributableContext, which is what a request naming no context carries and
+  // what every caller of evaluate() that never heard of contexts leaves it as.
+  //
+  // DEFERRED ALTERNATIVE, FILED HERE RATHER THAN NARRATED ELSEWHERE (ADR-0000 Exceptions).
+  // The type-safe carrier is a REQUIRED PARAMETER of NNEvaluator::evaluate rather than a field
+  // on a buffer, because a parameter is checked by the compiler at every call site and a field
+  // is not. It was not taken, and the cost is concrete rather than a preference: outside
+  // nneval.cpp and searchnnhelpers.cpp there are 15 files holding live evaluate() calls -- 7
+  // production (evalsgf, gtp, writetrainingdata, genbook, startposes, play, playutils) and 8
+  // test -- every one of which would have to thread an explicit
+  // NNCacheAttribution::noAttributableContext() argument for no behavioural reason, and none
+  // of which has anything to do with cache contexts. The accepted design
+  // (cache-protocol-consult.wiki section 7) also names NNResultBuf as the carrier by name.
+  //
+  // WHAT THAT COSTS, EXACTLY, so a later reader can weigh it rather than re-derive it: a
+  // MISSING assignment at some future evaluate() call site inside Search is not caught by the
+  // compiler. It degrades to NoAttributableContext, which is counted and reported -- loud, not
+  // silently wrong -- so the residual is under-attribution, never mis-attribution. The other
+  // half of the class, a STALE tag surviving into the next evaluation, is already foreclosed:
+  // evaluate() consumes this field at entry (see nneval.cpp), and testnncachecontext.cpp's
+  // buffer-reuse tripwire holds it there.
+  //
+  // REVISIT WHEN a further evaluate() call site is added inside Search, or when a second
+  // per-evaluation tag of this kind wants the same carrier -- either is the point at which
+  // one parameter pays for the fifteen files, and the second would make the buffer a place
+  // where two independent facts are remembered by convention.
+  NNCacheAttribution cacheAttribution;
+
   NNResultBuf();
   ~NNResultBuf();
   NNResultBuf(const NNResultBuf& other) = delete;
@@ -123,6 +159,40 @@ class NNEvaluator {
 
   // Clear all entires cached in the table
   void clearCache();
+
+  //-----------------------------------------------------------------------------------
+  // Cache contexts (see nncachecontext.h)
+  //-----------------------------------------------------------------------------------
+
+  // Attaches a context that this evaluator's cached earnings may be attributed to, and
+  // returns the only kind of value that can address it.
+  //
+  // THIS IS THE SEAM the cache_attach action plugs into. That action does not exist yet: it
+  // is the increment that reads a context's evaluation container, builds its frozen level-0
+  // structure and joins its count log for build order, and it will call this to register the
+  // name that content arrived under. Registering the name is separable from loading the
+  // content, and separating them is what lets the request tag be resolved, refused and spent
+  // before any loader exists -- rather than the tag waiting on the loader and the loader
+  // landing with no tested consumer.
+  //
+  // Throws StringError, naming what failed, if this evaluator has no cache at all, if the
+  // name is outside the closed alphabet a context name must fit, or if it is already
+  // attached.
+  NNCacheContextId attachCacheContext(const std::string& name);
+
+  // What a request's optional "cacheContext" field selects on THIS model, or the refusal to
+  // hand the client. See NNCacheContextSet::resolveForRequest for the rule; an evaluator
+  // with no cache configured at all answers a named context with a refusal saying so, and no
+  // name with NoAttributableContext, which is exactly today's behaviour.
+  [[nodiscard]] NNCacheContextResolution resolveCacheContext(const std::optional<std::string>& requested) const;
+
+  // The key -> context ledger of what this session earned in this evaluator's cache.
+  // NotAttributed if there is no cache or no context was attached.
+  [[nodiscard]] NNCacheAttributionLedger harvestCacheAttribution() const;
+
+  // The hit-count rows a dump of exactly this context would write. Throws StringError if
+  // there is no cache, or for a context this evaluator did not attach.
+  [[nodiscard]] NNCacheHitLedger harvestCacheHitCountsFor(const NNCacheContextId& context) const;
 
   // Queue a position for the next neural net batch evaluation and wait for it. Upon evaluation, result
   // will be supplied in NNResultBuf& buf, the shared_ptr there can grabbed via std::move if desired.
