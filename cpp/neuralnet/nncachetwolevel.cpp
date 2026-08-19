@@ -1,6 +1,7 @@
 #include "../neuralnet/nncachetwolevel.h"
 
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <set>
 
@@ -158,6 +159,49 @@ std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvest() const {
         continue;
       }
       out.push_back(rows[j]);
+    }
+  }
+  return out;
+}
+
+std::vector<NNCacheHitCount> NNCacheLevelZeroSources::takeUnpersistedHits() {
+  std::vector<NNCacheHitCount> out;
+  // NO EARLY EXIT AND NO SINGLE-SOURCE FAST PATH, unlike harvest() just above. This call
+  // advances every entry's persisted mark as it reads it, so a source not visited is a source
+  // whose mark stays behind and whose delta is reported again next time. The map costs one
+  // lookup per emitted row on a between-sessions call and is what buys that.
+  std::map<Hash128, size_t> rowFor;
+  for(size_t i = 0; i < entries_.size(); i++) {
+    const std::vector<NNCacheHitCount> rows = entries_[i].source->takeUnpersistedHits();
+    for(size_t j = 0; j < rows.size(); j++) {
+      const std::map<Hash128, size_t>::const_iterator found = rowFor.find(rows[j].key);
+      if(found == rowFor.end()) {
+        // First holder in resolution order to have anything to say about this key sets the
+        // row's POSITION, so the output keeps resolution order and, within a source, the
+        // descending-popularity order the input arrived in.
+        rowFor[rows[j].key] = out.size();
+        out.push_back(rows[j]);
+        continue;
+      }
+      // SUMMED, NOT SUPPRESSED -- see the header for why a flow adds where a level does not.
+      // Every retrieval counted here happened against whichever source was resolving the key
+      // at the time, and at most one source resolves a key at any instant, so the addends are
+      // disjoint sets of real retrievals and the sum double-counts nothing.
+      NNCacheHitCount& row = out[found->second];
+      const uint64_t summed = (uint64_t)row.hits + (uint64_t)rows[j].hits;
+      // A row is a uint32 and the sum of several 31-bit counters is not. Unreachable at any
+      // real scale -- the largest lifetime reference count in the operator's whole corpus is
+      // 11,997 -- and refused rather than wrapped, because a wrapped delta is a count log
+      // silently losing four billion retrievals (ADR-0002).
+      if(summed > 0xFFFFFFFFull)
+        throw StringError(
+          "NNCacheLevelZeroSources::takeUnpersistedHits: the unpersisted deltas for key " +
+          rows[j].key.toString() + " sum to " + Global::uint64ToString(summed) +
+          " across attached sources, which does not fit the 32-bit row a count log dump "
+          "writes. The marks of every source visited so far have already advanced, so this "
+          "take must not be retried against the same attachment."
+        );
+      row.hits = (uint32_t)summed;
     }
   }
   return out;
@@ -470,25 +514,28 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
     return NNCacheHitLedger::counted(std::move(rows), ledger_.unrecordedHits());
   }
 
-  // What a dump of one context writes. The two facts are owned in two places and joined
-  // here, once: WHICH keys this context earned is the base table's attribution ledger, and
-  // HOW OFTEN each was retrieved is this table's hit ledger. Neither is re-derived from the
-  // other -- an earned key with no hit row appears with zero, which is a fact a dump wants,
-  // not a row to drop.
   // The delta twin of harvestHitCounts above, composed from the same two owners and in the
-  // same order. See NNCacheTable::takeUnpersistedHitCounts for what it is for.
+  // same order. See NNCacheTable::takeUnpersistedHitCounts for what it is for, and
+  // NNCacheLevelZeroSources::takeUnpersistedHits for the one rule it does NOT share with its
+  // twin: across several attached sources a shared key's deltas are SUMMED into one row, not
+  // de-duplicated, because a delta is a conserved flow and a level is not.
   //
   // unrecordedHits is reported WHOLE rather than as a delta, and that is deliberate: it is a
   // count of hits whose KEY was lost, so there is no row to hold a mark against and no way to
   // divide it. A caller reading it twice sees the same running figure; it is a health number,
   // not a payload.
   NNCacheHitLedger takeUnpersistedHitCounts() override {
-    std::vector<NNCacheHitCount> rows = levelZero_->takeUnpersistedHits();
+    std::vector<NNCacheHitCount> rows = levelZero_.takeUnpersistedHits();
     const std::vector<NNCacheHitCount> levelOneRows = ledger_.takeUnpersisted();
     rows.insert(rows.end(), levelOneRows.begin(), levelOneRows.end());
     return NNCacheHitLedger::counted(std::move(rows), ledger_.unrecordedHits());
   }
 
+  // What a dump of one context writes. The two facts are owned in two places and joined
+  // here, once: WHICH keys this context earned is the base table's attribution ledger, and
+  // HOW OFTEN each was retrieved is this table's hit ledger. Neither is re-derived from the
+  // other -- an earned key with no hit row appears with zero, which is a fact a dump wants,
+  // not a row to drop.
   NNCacheHitLedger harvestHitCountsFor(const NNCacheContextId& context) const override {
     const std::vector<Hash128> keys = attributedKeysFor(context);
     std::vector<NNCacheHitCount> rows;

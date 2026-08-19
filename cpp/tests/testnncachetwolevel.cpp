@@ -559,6 +559,150 @@ void testAFullyShadowedEarlierSourceStillHoldsItsPlace() {
        << " rows" << endl;
 }
 
+//-------------------------------------------------------------------------------------
+// The delta twin
+//-------------------------------------------------------------------------------------
+
+// EVERY ATTACHED SOURCE IS TAKEN FROM, so a second take with nothing in between is empty.
+//
+// The claim is about CONSUMPTION, not about rows, so the second take is asserted FIRST: a
+// take that skipped a source would still look right on its own row count for the sources it
+// did visit, and only the next take would show the skipped one re-reporting a delta it had
+// already handed over. Asserting the emptiness before the row count puts the observation on
+// the property (ADR-0021 Rule 1).
+//
+// The two sources hold DISJOINT keys here on purpose: this test is about visiting every
+// source, and summing is the next test's business. Mixing them would leave a failure
+// ambiguous between the two.
+void testEverySourceIsTakenFromSoASecondTakeYieldsNothing() {
+  unique_ptr<NNCacheFrozen> bOwned = sourceOver({nthKey(101)}, SOURCE_B);
+  NNCacheFrozen* b = bOwned.get();
+  unique_ptr<NNCacheTwoLevelTable> table =
+    makeTwoLevelNNCacheTable(sourceOver({nthKey(100)}, SOURCE_A), defaultLevelOne(8), 8);
+  (void)table->attachLevelZero(std::move(bOwned));
+
+  testAssert(served(*table, nthKey(100)) == SOURCE_A);
+  testAssert(served(*table, nthKey(100)) == SOURCE_A);
+  testAssert(served(*table, nthKey(101)) == SOURCE_B);
+  // A level-1 key too, so the table's own composition of the two owners is exercised.
+  table->set(sharedOutputFor(nthKey(102), LEVEL_ONE));
+  testAssert(served(*table, nthKey(102)) == LEVEL_ONE);
+
+  const NNCacheHitLedger firstTake = table->takeUnpersistedHitCounts();
+  const NNCacheHitLedger secondTake = table->takeUnpersistedHitCounts();
+
+  testAssert(secondTake.disposition() == NNCacheHitLedgerDisposition::Counted);
+  testAssert(secondTake.entries().empty());
+  // Read at the source itself, not only through the table: the LATER source's own mark
+  // advanced, which is the thing a skipped visit would leave behind.
+  testAssert(b->takeUnpersistedHits().empty());
+
+  testAssert(firstTake.disposition() == NNCacheHitLedgerDisposition::Counted);
+  testAssert(firstTake.entries().size() == 3);
+  testAssert(hitsForKeyIn(firstTake, nthKey(100)) == 2);
+  testAssert(hitsForKeyIn(firstTake, nthKey(101)) == 1);
+  testAssert(hitsForKeyIn(firstTake, nthKey(102)) == 1);
+
+  // And the delta resumes from the mark rather than from zero or from the total.
+  testAssert(served(*table, nthKey(101)) == SOURCE_B);
+  const NNCacheHitLedger thirdTake = table->takeUnpersistedHitCounts();
+  testAssert(thirdTake.entries().size() == 1);
+  testAssert(hitsForKeyIn(thirdTake, nthKey(101)) == 1);
+
+  cout << "  delta twin: first take " << firstTake.entries().size()
+       << " rows across 2 sources and level 1, second take " << secondTake.entries().size()
+       << ", third after one more lookup " << thirdTake.entries().size() << endl;
+}
+
+// A REORDERED SOURCE'S UNWRITTEN RETRIEVALS ARE SUMMED INTO THE SURVIVING ROW, NOT DROPPED.
+//
+// THE STATE IS BUILT WITHOUT addHits, deliberately. The point in dispute is whether a
+// suppressed source can legitimately carry a non-zero unpersisted count, and a test that
+// planted one through a fold-in-counts-from-elsewhere API could be answered with "then do not
+// do that". This builds it out of nothing but attach, get and detach -- the class's own
+// ordinary interface -- so the state is a history a client can reach, not a poke:
+//
+//   attach A, which holds the key and serves it twice;
+//   attach B, which also holds it and therefore serves nothing;
+//   detach A, after which B serves it once;
+//   re-attach A, which goes to the BACK because attach appends.
+//
+// A now sits behind B holding two real retrievals that never reached the count log. Under
+// harvest()'s suppress-and-refuse rule those two are a broken invariant. They are not: they
+// happened. appendDump ADDS a row's lookups to the key's running total, so the only rule that
+// keeps them is to sum -- and summing double-counts nothing, because at most one source
+// resolves a key at any instant, so A's two and B's one are disjoint sets of real retrievals.
+void testAReorderedSourcesUnwrittenDeltaIsSummedRatherThanLost() {
+  const Hash128 shared = nthKey(110);
+  unique_ptr<NNCacheFrozen> aOwned = sourceOver({shared, nthKey(111)}, SOURCE_A);
+  NNCacheFrozen* a = aOwned.get();
+  unique_ptr<NNCacheTwoLevelTable> table =
+    makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
+  const NNCacheLevelZeroSourceId idA = table->levelZeroResolutionOrder()[0];
+
+  testAssert(served(*table, shared) == SOURCE_A);
+  testAssert(served(*table, shared) == SOURCE_A);   // A has two unwritten retrievals
+
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({shared, nthKey(112)}, SOURCE_B));
+  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
+  testAssert(served(*table, shared) == SOURCE_B);   // B now resolves it, and counts one
+  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack));
+
+  // The state under test, observed rather than assumed: A is last, still holds the key
+  // unshadowed, and still carries its two.
+  testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idB, idA2}));
+  testAssert(a->contains(shared));
+  testAssert(a->hitCountAt(a->index().find(shared).value()) == 2);
+
+  const NNCacheHitLedger take = table->takeUnpersistedHitCounts();
+  // ONE row for the key -- summing must not cost the one-row-per-key property a dump needs.
+  testAssert(take.entries().size() == 1);
+  testAssert(take.entries()[0].key == shared);
+  // THREE: B's one plus A's two. Under a suppress rule this reads 1 and two real retrievals
+  // are gone from the count log forever, with no honesty counter to show it.
+  testAssert(take.entries()[0].hits == 3);
+
+  // Both marks advanced, so the retrievals are handed over exactly once.
+  testAssert(table->takeUnpersistedHitCounts().entries().empty());
+
+  cout << "  reordered source: A served 2 then went behind B which served 1; the take "
+       << "carries " << take.entries().size() << " row of "
+       << take.entries()[0].hits << " hits, and the second take is empty" << endl;
+}
+
+// THE ONE THING THE DELTA TWIN DOES REFUSE BY NAME: a sum that will not fit the row.
+//
+// A count-log row's lookups field is 32 bits and a frozen counter is 31, so two holders can
+// never overflow it but three can. It is unreachable at any real scale -- the largest lifetime
+// reference count in the operator's whole corpus is 11,997 -- and it is checked anyway,
+// because the alternative to refusing is a silently wrapped delta, which is a count log losing
+// four billion retrievals with nothing to show for it. Constructed here rather than waited
+// for: addHits is the fold-in-counts-from-elsewhere door, and saturating three holders is the
+// only way to reach the branch.
+void testASummedDeltaThatWillNotFitARowIsRefusedByName() {
+  const Hash128 shared = nthKey(120);
+  const uint32_t nearlyFull = 0x7FFFFFFFu;  // NNCacheFrozen's counter is 31 bits
+  unique_ptr<NNCacheFrozen> bOwned = sourceOver({shared}, SOURCE_B);
+  unique_ptr<NNCacheFrozen> cOwned = sourceOver({shared}, SOURCE_C);
+  NNCacheFrozen* b = bOwned.get();
+  NNCacheFrozen* c = cOwned.get();
+  unique_ptr<NNCacheFrozen> aOwned = sourceOver({shared}, SOURCE_A);
+  NNCacheFrozen* a = aOwned.get();
+  unique_ptr<NNCacheTwoLevelTable> table =
+    makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
+  (void)table->attachLevelZero(std::move(bOwned));
+  (void)table->attachLevelZero(std::move(cOwned));
+
+  testAssert(a->addHits(shared, nearlyFull));
+  testAssert(b->addHits(shared, nearlyFull));
+  testAssert(c->addHits(shared, nearlyFull));
+
+  testAssert(refused([&]() { (void)table->takeUnpersistedHitCounts(); }, "does not fit the 32-bit row"));
+
+  cout << "  overflow refusal: three holders at 2^31-1 each; the take refuses by name rather "
+       << "than wrapping the row" << endl;
+}
+
 }  // namespace
 
 void Tests::runNNCacheTwoLevelTests() {
@@ -573,5 +717,8 @@ void Tests::runNNCacheTwoLevelTests() {
   testASuppressedRowCarryingHitsIsRefusedRatherThanDropped();
   testAnEmptyListReportsExactlyLevelOne();
   testAFullyShadowedEarlierSourceStillHoldsItsPlace();
+  testEverySourceIsTakenFromSoASecondTakeYieldsNothing();
+  testAReorderedSourcesUnwrittenDeltaIsSummedRatherThanLost();
+  testASummedDeltaThatWillNotFitARowIsRefusedByName();
   cout << "Done" << endl;
 }

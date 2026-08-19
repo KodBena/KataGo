@@ -198,11 +198,58 @@ class NNCacheLevelZeroSources {
   // hit. Nothing is therefore lost by suppressing it, and what is gained is the one-row-
   // per-key property a persistence layer must never have to repair.
   //
+  // KNOWN DIVERGENCE FROM takeUnpersistedHits BELOW, recorded 2026-08-19 rather than left for
+  // the next reader to trip over. The paragraph above is true only while the RESOLUTION ORDER
+  // HAS NOT CHANGED since a source started counting. Detach the first holder of a key, let the
+  // second serve and count it, then re-attach the first -- it goes to the back, and it is now
+  // a suppressed source carrying a non-zero, entirely legitimate count. This function's
+  // tripwire calls that a broken invariant and throws; takeUnpersistedHits sums instead,
+  // because for a conserved flow summing is the only rule that loses nothing. The same
+  // argument says harvest should sum too. It was NOT changed here: it is a ratified,
+  // separately-reviewed semantic with its own test asserting the refusal, nothing is silently
+  // lost either way (a throw is loud), and rewriting it during an integration repair is not
+  // this increment's call. Raised for a decision, not resolved.
+  //
   // THAT PROOF LEANS ON A DIFFERENT METHOD, so it is CHECKED HERE rather than trusted: a
   // suppressed row carrying a non-zero count means the one-owner invariant has broken
   // somewhere else, and this throws, naming the key and the count, instead of dropping
   // retrievals a persistence layer would never see again.
   [[nodiscard]] std::vector<NNCacheHitCount> harvest() const;
+
+  // THE HITS THAT HAVE NOT REACHED THE COUNT LOG YET, across every attached source, taking
+  // them as it reports them. The delta twin of harvest() above -- and NOT its mirror image,
+  // which is the one thing to read here before reading anything else.
+  //
+  // IT SUMS ACROSS HOLDERS. IT DOES NOT SUPPRESS. harvest() emits a shared key ONCE, from the
+  // source that resolves it, and refuses a suppressed row that carries a count. This does the
+  // opposite: a key held by several sources yields ONE row whose hits are the SUM of every
+  // holder's unpersisted delta. The two rules differ because the two quantities differ in
+  // kind, and the distinction is worth stating in one line: harvest reports a LEVEL (this
+  // session's running total for a key), and a level is read off the one entry that owns it;
+  // this reports a FLOW (the retrievals not yet written to the count log), and a flow is
+  // CONSERVED -- appendDump ADDS each row's lookups to the key's running total, so a delta
+  // dropped here is retrievals gone from the record forever, with no honesty counter to show
+  // it. Levels de-duplicate; flows add.
+  //
+  // WHEN THE TWO RULES ACTUALLY DIVERGE, since under a static order they do not. A source
+  // that has never resolved a key has a zero counter and therefore no delta to report, so a
+  // shared key normally reaches this loop from ONE holder and summing is the same as
+  // suppressing. They part company when the ORDER CHANGES: attach A, let it serve and count
+  // a key, detach it, let B serve and count the same key, then re-attach A -- which goes to
+  // the BACK, behind B. A now holds real, unwritten retrievals of a key it no longer
+  // resolves. That is a legitimate history reachable through this class's own public
+  // interface, not a broken invariant, and summing is the only rule that keeps those
+  // retrievals. It is also the rule this codebase already uses at the same seam:
+  // shadowAllHolders sums what every holder gives up into one level-1 ledger row.
+  //
+  // EVERY SOURCE IS TAKEN FROM, including one whose rows merge into an earlier source's.
+  // This call is CONSUMING -- it advances each entry's persisted mark -- so a source skipped
+  // for being "already covered" would keep its mark behind and re-report the same delta on
+  // the next take. There is therefore no early exit anywhere in it, and the single-source
+  // fast path harvest() has is deliberately absent here.
+  //
+  // Not const, and not a reporting call: it MOVES the marks. Take it once per dump, at rest.
+  [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHits();
 
   //---- What the list holds, for stats() -------------------------------------------
 

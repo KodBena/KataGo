@@ -14,6 +14,7 @@
 #include "../neuralnet/nncachecountlog.h"
 #include "../neuralnet/nncachedump.h"
 #include "../neuralnet/nncachefrozen.h"
+#include "../neuralnet/nncachetwolevel.h"
 #include "../neuralnet/nnevalcontainer.h"
 
 using namespace std;
