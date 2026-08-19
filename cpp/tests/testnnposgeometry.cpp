@@ -10,9 +10,20 @@ using namespace TestCommon;
 //size the compiled-in bound allows, under two different neural net extents - and checks that a
 //geometry that could not answer correctly is refused at construction rather than built.
 //The mapping is discrete, so equality is the bar; a tolerance here would be a category error.
+//
+//These checks need to build geometries from raw nnXLen/nnYLen pairs that no NNEvaluator would
+//hand out - rectangles no net is configured for, and the out-of-range values whose refusal is
+//the point of the last block. That loose-int factory is private precisely so ordinary code
+//cannot reach it; this struct is the single declared exception (NNPosGeometry befriends it),
+//and it exists only in this translation unit.
+struct NNPosGeometryTesting {
+  static NNPosGeometry of(const Board& board, int nnXLen, int nnYLen) {
+    return NNPosGeometry::of(board,nnXLen,nnYLen);
+  }
+};
 
 static void checkAgreesWithNNPos(const Board& board, int nnXLen, int nnYLen) {
-  const NNPosGeometry geometry = NNPosGeometry::of(board,nnXLen,nnYLen);
+  const NNPosGeometry geometry = NNPosGeometryTesting::of(board,nnXLen,nnYLen);
 
   testAssert(geometry.getBoardXSize() == board.x_size);
   testAssert(geometry.getBoardYSize() == board.y_size);
@@ -31,7 +42,7 @@ static void checkAgreesWithNNPos(const Board& board, int nnXLen, int nnYLen) {
 static void expectRefused(const char* what, const Board& board, int nnXLen, int nnYLen) {
   bool refused = false;
   try {
-    NNPosGeometry::of(board,nnXLen,nnYLen);
+    NNPosGeometryTesting::of(board,nnXLen,nnYLen);
   }
   catch(const StringError& e) {
     refused = true;
@@ -59,7 +70,7 @@ void Tests::runNNPosGeometryTests() {
     Board board(19,19);
     Board smallerBoard(9,9);
     Board rectangularBoard(19,9);
-    const NNPosGeometry geometry = NNPosGeometry::of(board,19,19);
+    const NNPosGeometry geometry = NNPosGeometryTesting::of(board,19,19);
     testAssert(geometry.matches(board,19,19));
     testAssert(geometry.matchesBoardSize(board));
     testAssert(!geometry.matches(smallerBoard,19,19));

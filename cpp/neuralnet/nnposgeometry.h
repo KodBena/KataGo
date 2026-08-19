@@ -12,6 +12,8 @@
 #include "../neuralnet/nninputs.h"
 
 class NNEvaluator;
+//Defined only in the geometry's own test translation unit; see the friend declaration below.
+struct NNPosGeometryTesting;
 
 //The mapping between a policy-vector index ("pos") and a board location ("Loc") is a pure
 //function of four numbers - the board size and the neural net's spatial extent - and all four
@@ -29,11 +31,14 @@ class NNEvaluator;
 //particular board size - the table bounds come from the compiled-in Board::MAX_LEN and the
 //entries are filled from the actual runtime sizes.
 struct NNPosGeometry {
-  //Build the geometry for the given board searched with a net of the given spatial extent.
+  //Build the geometry for a board searched with the evaluator whose extent defines it. Every
+  //number arrives from a typed source, so there is no argument order for a caller to get wrong.
   //Throws StringError if a size is outside the range the compiled-in bounds can represent -
   //a geometry whose tables would not cover the board it is asked about is not constructible.
-  static NNPosGeometry of(const Board& board, int nnXLen, int nnYLen);
-  //Same, taking the extent from the evaluator that defines it, so no int can be transposed.
+  //
+  //This is the only way to build one from outside. The underlying loose-int form is private
+  //below: it takes nnXLen and nnYLen as two same-typed positional ints, which is exactly the
+  //transposable shape this type exists to remove, so it is not offered as public API.
   static NNPosGeometry of(const Board& board, const NNEvaluator& nnEval);
 
   inline int getBoardXSize() const { return boardXSize; }
@@ -68,6 +73,13 @@ struct NNPosGeometry {
   }
 
 private:
+  //The loose-int form. Reachable only from the evaluator overload above (which fixes the
+  //argument order once, here, in one hand-checked expression) and from the geometry's own
+  //tests, which must sweep nnXLen/nnYLen pairs no evaluator would produce - including the
+  //out-of-range ones whose refusal is under test.
+  static NNPosGeometry of(const Board& board, int nnXLen, int nnYLen);
+  friend struct NNPosGeometryTesting;
+
   NNPosGeometry() = default;
 
   int boardXSize;
