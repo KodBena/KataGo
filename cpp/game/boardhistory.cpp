@@ -1,9 +1,21 @@
 #include "../game/boardhistory.h"
 
 #include <algorithm>
+#include <type_traits>
 #include "../core/test.h"
 
 using namespace std;
+
+//BoardHistory's move operations are declared noexcept but are defaulted, and some of the members
+//they move (Board) have copy constructors that are not themselves declared noexcept. Under the
+//resolution of CWG issue 1778 that is fine and the declared specification stands, but under the
+//literal C++17 wording such a defaulted function would instead be defined as deleted. Assert the
+//outcome we depend on, so a toolchain that gets this wrong fails here with a clear message rather
+//than at some distant use site.
+static_assert(std::is_nothrow_move_constructible<BoardHistory>::value,
+              "BoardHistory move constructor is deleted or not noexcept");
+static_assert(std::is_nothrow_move_assignable<BoardHistory>::value,
+              "BoardHistory move assignment is deleted or not noexcept");
 
 static Hash128 getKoHash(const Rules& rules, const Board& board, Player pla, int encorePhase, Hash128 koRecapBlockHash) {
   if(rules.koRule == Rules::KO_SITUATIONAL || rules.koRule == Rules::KO_SIMPLE || encorePhase > 0)
@@ -122,177 +134,6 @@ BoardHistory::BoardHistory(const Board& board, Player pla, const Rules& r, int e
   std::fill(secondEncoreStartColors, secondEncoreStartColors+Board::MAX_ARR_SIZE, C_EMPTY);
 
   clear(board,pla,rules,ePhase);
-}
-
-BoardHistory::BoardHistory(const BoardHistory& other)
-  :rules(other.rules),
-   moveHistory(other.moveHistory),
-   preventEncoreHistory(other.preventEncoreHistory),
-   koHashHistory(other.koHashHistory),
-   firstTurnIdxWithKoHistory(other.firstTurnIdxWithKoHistory),
-   initialBoard(other.initialBoard),
-   initialPla(other.initialPla),
-   initialEncorePhase(other.initialEncorePhase),
-   initialTurnNumber(other.initialTurnNumber),
-   assumeMultipleStartingBlackMovesAreHandicap(other.assumeMultipleStartingBlackMovesAreHandicap),
-   whiteHasMoved(other.whiteHasMoved),
-   overrideNumHandicapStones(other.overrideNumHandicapStones),
-   modes(other.modes),
-   recentBoards(),
-   currentRecentBoardIdx(other.currentRecentBoardIdx),
-   presumedNextMovePla(other.presumedNextMovePla),
-   consecutiveEndingPasses(other.consecutiveEndingPasses),
-   hashesBeforeBlackPass(other.hashesBeforeBlackPass),hashesBeforeWhitePass(other.hashesBeforeWhitePass),
-   encorePhase(other.encorePhase),
-   numTurnsThisPhase(other.numTurnsThisPhase),
-   numApproxValidTurnsThisPhase(other.numApproxValidTurnsThisPhase),
-   numConsecValidTurnsThisGame(other.numConsecValidTurnsThisGame),
-   koRecapBlockHash(other.koRecapBlockHash),
-   koCapturesInEncore(other.koCapturesInEncore),
-   whiteBonusScore(other.whiteBonusScore),
-   whiteHandicapBonusScore(other.whiteHandicapBonusScore),
-   hasButton(other.hasButton),
-   isPastNormalPhaseEnd(other.isPastNormalPhaseEnd),
-   isGameFinished(other.isGameFinished),winner(other.winner),finalWhiteMinusBlackScore(other.finalWhiteMinusBlackScore),
-   isScored(other.isScored),isNoResult(other.isNoResult),isResignation(other.isResignation)
-{
-  std::copy(other.recentBoards, other.recentBoards+NUM_RECENT_BOARDS, recentBoards);
-  std::copy(other.wasEverOccupiedOrPlayed, other.wasEverOccupiedOrPlayed+Board::MAX_ARR_SIZE, wasEverOccupiedOrPlayed);
-  std::copy(other.superKoBanned, other.superKoBanned+Board::MAX_ARR_SIZE, superKoBanned);
-  std::copy(other.koRecapBlocked, other.koRecapBlocked+Board::MAX_ARR_SIZE, koRecapBlocked);
-  std::copy(other.secondEncoreStartColors, other.secondEncoreStartColors+Board::MAX_ARR_SIZE, secondEncoreStartColors);
-}
-
-
-BoardHistory& BoardHistory::operator=(const BoardHistory& other)
-{
-  if(this == &other)
-    return *this;
-  rules = other.rules;
-  moveHistory = other.moveHistory;
-  preventEncoreHistory = other.preventEncoreHistory;
-  koHashHistory = other.koHashHistory;
-  firstTurnIdxWithKoHistory = other.firstTurnIdxWithKoHistory;
-  initialBoard = other.initialBoard;
-  initialPla = other.initialPla;
-  initialEncorePhase = other.initialEncorePhase;
-  initialTurnNumber = other.initialTurnNumber;
-  assumeMultipleStartingBlackMovesAreHandicap = other.assumeMultipleStartingBlackMovesAreHandicap;
-  whiteHasMoved = other.whiteHasMoved;
-  overrideNumHandicapStones = other.overrideNumHandicapStones;
-  modes = other.modes;
-  std::copy(other.recentBoards, other.recentBoards+NUM_RECENT_BOARDS, recentBoards);
-  currentRecentBoardIdx = other.currentRecentBoardIdx;
-  presumedNextMovePla = other.presumedNextMovePla;
-  std::copy(other.wasEverOccupiedOrPlayed, other.wasEverOccupiedOrPlayed+Board::MAX_ARR_SIZE, wasEverOccupiedOrPlayed);
-  std::copy(other.superKoBanned, other.superKoBanned+Board::MAX_ARR_SIZE, superKoBanned);
-  consecutiveEndingPasses = other.consecutiveEndingPasses;
-  hashesBeforeBlackPass = other.hashesBeforeBlackPass;
-  hashesBeforeWhitePass = other.hashesBeforeWhitePass;
-  encorePhase = other.encorePhase;
-  numTurnsThisPhase = other.numTurnsThisPhase;
-  numApproxValidTurnsThisPhase = other.numApproxValidTurnsThisPhase;
-  numConsecValidTurnsThisGame = other.numConsecValidTurnsThisGame;
-  std::copy(other.koRecapBlocked, other.koRecapBlocked+Board::MAX_ARR_SIZE, koRecapBlocked);
-  koRecapBlockHash = other.koRecapBlockHash;
-  koCapturesInEncore = other.koCapturesInEncore;
-  std::copy(other.secondEncoreStartColors, other.secondEncoreStartColors+Board::MAX_ARR_SIZE, secondEncoreStartColors);
-  whiteBonusScore = other.whiteBonusScore;
-  whiteHandicapBonusScore = other.whiteHandicapBonusScore;
-  hasButton = other.hasButton;
-  isPastNormalPhaseEnd = other.isPastNormalPhaseEnd;
-  isGameFinished = other.isGameFinished;
-  winner = other.winner;
-  finalWhiteMinusBlackScore = other.finalWhiteMinusBlackScore;
-  isScored = other.isScored;
-  isNoResult = other.isNoResult;
-  isResignation = other.isResignation;
-
-  return *this;
-}
-
-BoardHistory::BoardHistory(BoardHistory&& other) noexcept
- :rules(other.rules),
-  moveHistory(std::move(other.moveHistory)),
-  preventEncoreHistory(std::move(other.preventEncoreHistory)),
-  koHashHistory(std::move(other.koHashHistory)),
-  firstTurnIdxWithKoHistory(other.firstTurnIdxWithKoHistory),
-  initialBoard(other.initialBoard),
-  initialPla(other.initialPla),
-  initialEncorePhase(other.initialEncorePhase),
-  initialTurnNumber(other.initialTurnNumber),
-  assumeMultipleStartingBlackMovesAreHandicap(other.assumeMultipleStartingBlackMovesAreHandicap),
-  whiteHasMoved(other.whiteHasMoved),
-  overrideNumHandicapStones(other.overrideNumHandicapStones),
-  modes(other.modes),
-  recentBoards(),
-  currentRecentBoardIdx(other.currentRecentBoardIdx),
-  presumedNextMovePla(other.presumedNextMovePla),
-  consecutiveEndingPasses(other.consecutiveEndingPasses),
-  hashesBeforeBlackPass(std::move(other.hashesBeforeBlackPass)),hashesBeforeWhitePass(std::move(other.hashesBeforeWhitePass)),
-  encorePhase(other.encorePhase),
-  numTurnsThisPhase(other.numTurnsThisPhase),
-  numApproxValidTurnsThisPhase(other.numApproxValidTurnsThisPhase),
-  numConsecValidTurnsThisGame(other.numConsecValidTurnsThisGame),
-  koRecapBlockHash(other.koRecapBlockHash),
-  koCapturesInEncore(std::move(other.koCapturesInEncore)),
-  whiteBonusScore(other.whiteBonusScore),
-  whiteHandicapBonusScore(other.whiteHandicapBonusScore),
-  hasButton(other.hasButton),
-  isPastNormalPhaseEnd(other.isPastNormalPhaseEnd),
-  isGameFinished(other.isGameFinished),winner(other.winner),finalWhiteMinusBlackScore(other.finalWhiteMinusBlackScore),
-  isScored(other.isScored),isNoResult(other.isNoResult),isResignation(other.isResignation)
-{
-  std::copy(other.recentBoards, other.recentBoards+NUM_RECENT_BOARDS, recentBoards);
-  std::copy(other.wasEverOccupiedOrPlayed, other.wasEverOccupiedOrPlayed+Board::MAX_ARR_SIZE, wasEverOccupiedOrPlayed);
-  std::copy(other.superKoBanned, other.superKoBanned+Board::MAX_ARR_SIZE, superKoBanned);
-  std::copy(other.koRecapBlocked, other.koRecapBlocked+Board::MAX_ARR_SIZE, koRecapBlocked);
-  std::copy(other.secondEncoreStartColors, other.secondEncoreStartColors+Board::MAX_ARR_SIZE, secondEncoreStartColors);
-}
-
-BoardHistory& BoardHistory::operator=(BoardHistory&& other) noexcept
-{
-  rules = other.rules;
-  moveHistory = std::move(other.moveHistory);
-  preventEncoreHistory = std::move(other.preventEncoreHistory);
-  koHashHistory = std::move(other.koHashHistory);
-  firstTurnIdxWithKoHistory = other.firstTurnIdxWithKoHistory;
-  initialBoard = other.initialBoard;
-  initialPla = other.initialPla;
-  initialEncorePhase = other.initialEncorePhase;
-  initialTurnNumber = other.initialTurnNumber;
-  assumeMultipleStartingBlackMovesAreHandicap = other.assumeMultipleStartingBlackMovesAreHandicap;
-  whiteHasMoved = other.whiteHasMoved;
-  overrideNumHandicapStones = other.overrideNumHandicapStones;
-  modes = other.modes;
-  std::copy(other.recentBoards, other.recentBoards+NUM_RECENT_BOARDS, recentBoards);
-  currentRecentBoardIdx = other.currentRecentBoardIdx;
-  presumedNextMovePla = other.presumedNextMovePla;
-  std::copy(other.wasEverOccupiedOrPlayed, other.wasEverOccupiedOrPlayed+Board::MAX_ARR_SIZE, wasEverOccupiedOrPlayed);
-  std::copy(other.superKoBanned, other.superKoBanned+Board::MAX_ARR_SIZE, superKoBanned);
-  consecutiveEndingPasses = other.consecutiveEndingPasses;
-  hashesBeforeBlackPass = std::move(other.hashesBeforeBlackPass);
-  hashesBeforeWhitePass = std::move(other.hashesBeforeWhitePass);
-  encorePhase = other.encorePhase;
-  numTurnsThisPhase = other.numTurnsThisPhase;
-  numApproxValidTurnsThisPhase = other.numApproxValidTurnsThisPhase;
-  numConsecValidTurnsThisGame = other.numConsecValidTurnsThisGame;
-  std::copy(other.koRecapBlocked, other.koRecapBlocked+Board::MAX_ARR_SIZE, koRecapBlocked);
-  koRecapBlockHash = other.koRecapBlockHash;
-  koCapturesInEncore = std::move(other.koCapturesInEncore);
-  std::copy(other.secondEncoreStartColors, other.secondEncoreStartColors+Board::MAX_ARR_SIZE, secondEncoreStartColors);
-  whiteBonusScore = other.whiteBonusScore;
-  whiteHandicapBonusScore = other.whiteHandicapBonusScore;
-  hasButton = other.hasButton;
-  isPastNormalPhaseEnd = other.isPastNormalPhaseEnd;
-  isGameFinished = other.isGameFinished;
-  winner = other.winner;
-  finalWhiteMinusBlackScore = other.finalWhiteMinusBlackScore;
-  isScored = other.isScored;
-  isNoResult = other.isNoResult;
-  isResignation = other.isResignation;
-
-  return *this;
 }
 
 void BoardHistory::clear(const Board& board, Player pla, const Rules& r, int ePhase) {
