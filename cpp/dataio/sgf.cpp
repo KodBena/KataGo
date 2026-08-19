@@ -951,7 +951,7 @@ void Sgf::iterAllPositionsHelper(
       // ruleSuicideIllegal - a multi-stone self-capture that the rules in force forbid
       bool tolerantLegal = hist.isLegalTolerant(board,moveLoc,movePla);
       bool simpleKoBanned = board.isKoBanned(moveLoc);
-      bool superKoIllegal = hist.superKoBanned[moveLoc];
+      bool superKoIllegal = hist.isSuperKoBanned(moveLoc);
       bool ruleSuicideIllegal = moveLoc != Board::PASS_LOC && board.isIllegalSuicide(moveLoc,movePla,rules.multiStoneSuicideLegal);
 
       // Ko/superko/out-of-turn are history-or-turn-order violations of an otherwise-normal board transition, so we

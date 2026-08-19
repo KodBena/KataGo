@@ -44,6 +44,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runBoardAreaTests();
 
   Tests::runRulesTests();
+  Tests::runSuperKoBannedHashTests();
   Tests::runPassAliveSuicideModeTests();
   Tests::runExcludeTerritoryAtariModeTests();
 

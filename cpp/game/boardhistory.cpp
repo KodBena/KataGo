@@ -88,7 +88,7 @@ BoardHistory::BoardHistory()
    isScored(false),isNoResult(false),isResignation(false)
 {
   std::fill(wasEverOccupiedOrPlayed, wasEverOccupiedOrPlayed+Board::MAX_ARR_SIZE, false);
-  std::fill(superKoBanned, superKoBanned+Board::MAX_ARR_SIZE, false);
+  clearSuperKoBanned();
   std::fill(koRecapBlocked, koRecapBlocked+Board::MAX_ARR_SIZE, false);
   std::fill(secondEncoreStartColors, secondEncoreStartColors+Board::MAX_ARR_SIZE, C_EMPTY);
 }
@@ -129,7 +129,7 @@ BoardHistory::BoardHistory(const Board& board, Player pla, const Rules& r, int e
    isScored(false),isNoResult(false),isResignation(false)
 {
   std::fill(wasEverOccupiedOrPlayed, wasEverOccupiedOrPlayed+Board::MAX_ARR_SIZE, false);
-  std::fill(superKoBanned, superKoBanned+Board::MAX_ARR_SIZE, false);
+  clearSuperKoBanned();
   std::fill(koRecapBlocked, koRecapBlocked+Board::MAX_ARR_SIZE, false);
   std::fill(secondEncoreStartColors, secondEncoreStartColors+Board::MAX_ARR_SIZE, C_EMPTY);
 
@@ -167,7 +167,7 @@ void BoardHistory::clear(const Board& board, Player pla, const Rules& r, int ePh
     }
   }
 
-  std::fill(superKoBanned, superKoBanned+Board::MAX_ARR_SIZE, false);
+  clearSuperKoBanned();
   consecutiveEndingPasses = 0;
   hashesBeforeBlackPass.clear();
   hashesBeforeWhitePass.clear();
@@ -644,6 +644,18 @@ void BoardHistory::setKoRecapBlocked(Loc loc, bool b) {
   }
 }
 
+void BoardHistory::setSuperKoBanned(Loc loc, bool b) {
+  if(superKoBanned[loc] != b) {
+    superKoBanned[loc] = b;
+    superKoBannedHash ^= Board::ZOBRIST_KO_LOC_HASH[loc];
+  }
+}
+
+void BoardHistory::clearSuperKoBanned() {
+  std::fill(superKoBanned, superKoBanned+Board::MAX_ARR_SIZE, false);
+  superKoBannedHash = Hash128();
+}
+
 bool BoardHistory::isLegal(const Board& board, Loc moveLoc, Player movePla) const {
   if(movePla != presumedNextMovePla)
     return false;
@@ -666,7 +678,7 @@ bool BoardHistory::isLegal(const Board& board, Loc moveLoc, Player movePla) cons
   }
   if(!board.isLegalIgnoringKo(moveLoc,movePla,rules.multiStoneSuicideLegal))
     return false;
-  if(superKoBanned[moveLoc])
+  if(isSuperKoBanned(moveLoc))
     return false;
 
   return true;
@@ -928,28 +940,28 @@ void BoardHistory::makeBoardMoveAssumeLegal(Board& board, Loc moveLoc, Player mo
         Loc loc = Location::getLoc(x,y,board.x_size);
         //Cannot be superko banned if it's not a pseudolegal move in the first place, or we would already ban the move under simple ko.
         if(board.colors[loc] != C_EMPTY)
-          superKoBanned[loc] = false;
+          setSuperKoBanned(loc,false);
         //Also cannot be superko banned if a stone was never there or played there before AND the move is not suicide, because that means
         //the move results in a new stone there and if no stone was ever there in the past the it must be a new position.
         else if(!wasEverOccupiedOrPlayed[loc] && !board.isSuicide(loc,nextPla))
-          superKoBanned[loc] = false;
+          setSuperKoBanned(loc,false);
         else if(board.isIllegalSuicide(loc,nextPla,rules.multiStoneSuicideLegal) || loc == board.ko_loc)
-          superKoBanned[loc] = false;
+          setSuperKoBanned(loc,false);
         else {
           Hash128 posHashAfterMove = board.getPosHashAfterMove(loc,nextPla);
           Hash128 koHashAfterMove = getKoHashAfterMoveNonEncore(rules, posHashAfterMove, getOpp(nextPla));
-          superKoBanned[loc] = koHashOccursInHistory(koHashAfterMove,rootKoHashTable);
+          setSuperKoBanned(loc,koHashOccursInHistory(koHashAfterMove,rootKoHashTable));
         }
       }
     }
   }
   else if(encorePhase > 0) {
     //During the encore, only one capture of each ko in a given position by a given player
-    std::fill(superKoBanned, superKoBanned+Board::MAX_ARR_SIZE, false);
+    clearSuperKoBanned();
     for(size_t i = 0; i<koCapturesInEncore.size(); i++) {
       const EncoreKoCapture& ekc = koCapturesInEncore[i];
       if(ekc.posHashBeforeMove == board.pos_hash && ekc.movePla == nextPla)
-        superKoBanned[ekc.moveLoc] = true;
+        setSuperKoBanned(ekc.moveLoc,true);
     }
   }
 
@@ -994,7 +1006,7 @@ void BoardHistory::makeBoardMoveAssumeLegal(Board& board, Loc moveLoc, Player mo
           if(encorePhase == 2)
             std::copy(board.colors, board.colors+Board::MAX_ARR_SIZE, secondEncoreStartColors);
 
-          std::fill(superKoBanned, superKoBanned+Board::MAX_ARR_SIZE, false);
+          clearSuperKoBanned();
           consecutiveEndingPasses = 0;
           hashesBeforeBlackPass.clear();
           hashesBeforeWhitePass.clear();
@@ -1086,6 +1098,11 @@ Hash128 BoardHistory::getSituationRulesAndKoHash(
   int xSize = board.x_size;
   int ySize = board.y_size;
 
+  //hist's mark sets are indexed by Loc, which is only meaningful relative to the board size hist was
+  //built on. A caller passing a differently-sized board was never getting a meaningful hash out of
+  //them; say so plainly rather than folding in marks that mean something else.
+  testAssert(xSize == hist.initialBoard.x_size && ySize == hist.initialBoard.y_size);
+
   //Note that board.pos_hash also incorporates the size of the board.
   Hash128 hash = board.pos_hash;
   hash ^= Board::ZOBRIST_PLAYER_HASH[nextPlayer];
@@ -1096,24 +1113,18 @@ Hash128 BoardHistory::getSituationRulesAndKoHash(
   if(hist.encorePhase == 0) {
     if(board.ko_loc != Board::NULL_LOC)
       hash ^= Board::ZOBRIST_KO_LOC_HASH[board.ko_loc];
-    for(int y = 0; y<ySize; y++) {
-      for(int x = 0; x<xSize; x++) {
-        Loc loc = Location::getLoc(x,y,xSize);
-        if(hist.superKoBanned[loc] && loc != board.ko_loc)
-          hash ^= Board::ZOBRIST_KO_LOC_HASH[loc];
-      }
-    }
+    //superKoBannedHash already folds ZOBRIST_KO_LOC_HASH over every superko-banned loc. The simple
+    //ko loc is excluded from that part of the hash because the line above contributes its term
+    //instead, so xor its term back out in the one case where the two would otherwise both fire.
+    hash ^= hist.superKoBannedHash;
+    if(board.ko_loc != Board::NULL_LOC && hist.superKoBanned[board.ko_loc])
+      hash ^= Board::ZOBRIST_KO_LOC_HASH[board.ko_loc];
   }
   else {
-    for(int y = 0; y<ySize; y++) {
-      for(int x = 0; x<xSize; x++) {
-        Loc loc = Location::getLoc(x,y,xSize);
-        if(hist.superKoBanned[loc])
-          hash ^= Board::ZOBRIST_KO_LOC_HASH[loc];
-        if(hist.koRecapBlocked[loc])
-          hash ^= Board::ZOBRIST_KO_MARK_HASH[loc][P_BLACK] ^ Board::ZOBRIST_KO_MARK_HASH[loc][P_WHITE];
-      }
-    }
+    //Both mark sets carry their own zobrist fold, maintained at their write sites. In the encore
+    //there is no simple ko loc to exclude, so both fold in whole.
+    hash ^= hist.superKoBannedHash;
+    hash ^= hist.koRecapBlockHash;
     if(hist.encorePhase == 2) {
       for(int y = 0; y<ySize; y++) {
         for(int x = 0; x<xSize; x++) {
