@@ -225,18 +225,18 @@ size_t NNCacheLevelZeroBound::select(const std::vector<NNCacheLevelZeroCandidate
     return std::min((size_t)amount_, ordered.size());
   case Kind::MinLookups: {
     // A prefix, because the order is descending lookups: the first candidate below the
-    // threshold is followed only by candidates at or below it. An uncounted key has an
-    // UNKNOWN count rather than a zero one, so it is admitted only by a threshold of zero,
-    // which admits everything.
+    // threshold is followed only by candidates at or below it.
+    //
+    // AN UNCOUNTED KEY IS ADMITTED ONLY BY A THRESHOLD OF ZERO, and there is NO SEPARATE
+    // CHECK FOR IT because there is nothing for one to catch: an uncounted candidate carries
+    // a lookups of 0, so any threshold above zero already excludes it by the comparison
+    // below. A guard here would read as though it decided something and would in fact be
+    // unreachable -- which is worse than its absence, because a later reader would trust it
+    // (ADR-0013 Rule 4: the honest disposition of a check that catches nothing is to remove
+    // it and say why, not to keep it as reassurance).
     size_t taken = 0;
-    while(taken < ordered.size()) {
-      const NNCacheLevelZeroCandidate& c = ordered[taken];
-      if(!c.counted && lookups_ > 0)
-        break;
-      if(c.lookups < lookups_)
-        break;
+    while(taken < ordered.size() && ordered[taken].lookups >= lookups_)
       taken += 1;
-    }
     return taken;
   }
   case Kind::MaxBytes: {

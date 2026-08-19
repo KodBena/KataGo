@@ -387,6 +387,19 @@ void testTheSelectionBoundsTakeAPrefixInTheirOwnCurrency() {
     (void)nnCacheReleaseLevelZero(std::move(load.levelZero));
   }
   {
+    // AN UNCOUNTED KEY IS NOT ADMITTED BY A THRESHOLD ABOVE ZERO. Keys 6 and 7 are not in the
+    // count log; every key that is has at least 10 lookups, so a threshold of 10 would admit
+    // all six counted keys and then meet the two uncounted ones. It stops.
+    NNCacheLevelZeroLoad load =
+      nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::minLookups(10)));
+    testAssert(load.report.entriesInLevelZero == 6);
+    testAssert(load.report.entriesCounted == 6);
+    testAssert(load.report.entriesUncounted == 2);
+    testAssert(load.remainder.size() == 2);
+    testAssert(!load.remainder[0].counted && !load.remainder[1].counted);
+    (void)nnCacheReleaseLevelZero(std::move(load.levelZero));
+  }
+  {
     NNCacheLevelZeroLoad load =
       nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::maxEntries(0)));
     testAssert(load.report.entriesInLevelZero == 0);
@@ -489,6 +502,14 @@ void testTheArenaIsReleasedAtDetachAndNotOneMomentLater() {
     writeContainerBlock(tmp.path(), written);
   }
 
+  // TRIM BEFORE THE BASELINE, and this is method rather than tidiness. Writing that container
+  // allocated and freed ~45 MiB of its own, and glibc does not return a free to the operating
+  // system: an untrimmed baseline is therefore already carrying that free pool, the attach
+  // below reuses it instead of growing the process, and the whole observation collapses to
+  // noise. It collapsed exactly that way on the first attempt, and the missing-trim seen-red
+  // leg passed green against it (ADR-0021 Rule 4: a green that cannot go red witnesses
+  // nothing).
+  (void)nnCacheReclaimFreedHeap();
   const int64_t baseline = residentBytes();
 
   NNCacheLevelZeroLoad load = nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::all()));
@@ -532,7 +553,12 @@ void testTheArenaIsReleasedAtDetachAndNotOneMomentLater() {
     // the page cache, the allocator's own bookkeeping and the container read all move it;
     // what is being asserted is that tens of megabytes appear and then leave, not a figure.
     testAssert(afterAttach - baseline > arenaBytes / 2);
-    testAssert(afterDetach - baseline < arenaBytes / 2);
+    // THE DETACH GAVE THE PAGES BACK. Against a trimmed baseline this is the whole claim:
+    // the process is within a quarter of the arena of where it started, having held all of
+    // it a moment ago. The quarter is slack for the allocator's own bookkeeping and for the
+    // key set and remainder this scope still holds, not a hedge -- the figure it is
+    // distinguishing between is zero returned and all of it returned.
+    testAssert(afterDetach - baseline < arenaBytes / 4);
     cout << "level-0 loader: RSS baseline " << (baseline / 1048576) << " MiB, after attach of "
          << (arenaBytes / 1048576) << " MiB arena " << (afterAttach / 1048576)
          << " MiB, after detach " << (afterDetach / 1048576) << " MiB" << endl;
