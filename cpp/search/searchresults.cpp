@@ -264,8 +264,8 @@ bool Search::getPlaySelectionValues(
 
     bool obeyAllowedRootMove = true;
     while(true) {
-      for(int movePos = 0; movePos<policySize; movePos++) {
-        Loc moveLoc = NNPos::posToLoc(movePos,rootBoard.x_size,rootBoard.y_size,nnXLen,nnYLen);
+      for(int movePos = 0; movePos<getPolicySize(); movePos++) {
+        Loc moveLoc = nnPosGeometry.posToLoc(movePos);
         double policyProb = policyProbs[movePos];
         if(!isOkayRawPolicyMoveAtRoot(moveLoc,policyProb,obeyAllowedRootMove))
           continue;
@@ -338,8 +338,8 @@ bool Search::getPlaySelectionValues(
       // First, take a pass to just fill out all the legal/allowed moves into the play selection values, if allowed, and if at root.
       if(&node == rootNode && allowDirectPolicyMoves) {
         std::set<Loc> locsSet(locs.begin(),locs.end());
-        for(int movePos = 0; movePos<policySize; movePos++) {
-          Loc moveLoc = NNPos::posToLoc(movePos,rootBoard.x_size,rootBoard.y_size,nnXLen,nnYLen);
+        for(int movePos = 0; movePos<getPolicySize(); movePos++) {
+          Loc moveLoc = nnPosGeometry.posToLoc(movePos);
           double humanProb = humanProbs[movePos];
           const bool obeyAllowedRootMove = true;
           if(!isOkayRawPolicyMoveAtRoot(moveLoc,humanProb,obeyAllowedRootMove))
@@ -1151,7 +1151,7 @@ void Search::getAnalysisData(
       if(bestPos < 0 || bestPolicy < 0.0)
         break;
 
-      Loc bestMove = NNPos::posToLoc(bestPos,rootBoard.x_size,rootBoard.y_size,nnXLen,nnYLen);
+      Loc bestMove = nnPosGeometry.posToLoc(bestPos);
       AnalysisData data = getAnalysisDataOfSingleChild(
         NULL, 0, scratchLocs, scratchValues, bestMove, bestPolicy, fpuValue, parentUtility, parentWinLossValue,
         parentScoreMean, parentScoreStdev, parentLead, maxPVDepth
@@ -1752,9 +1752,10 @@ vector<double> Search::getAverageTreeOwnership(const SearchNode* node) const {
     node = rootNode;
   if(!alwaysIncludeOwnerMap)
     throw StringError("Called Search::getAverageTreeOwnership when alwaysIncludeOwnerMap is false");
-  vector<double> vec(nnXLen*nnYLen,0.0);
-  auto accumulate = [&vec,this](const float* ownership, double selfProp){
-    for (int pos = 0; pos < nnXLen*nnYLen; pos++)
+  const int nnArea = getNNXLen()*getNNYLen();
+  vector<double> vec(nnArea,0.0);
+  auto accumulate = [&vec,nnArea](const float* ownership, double selfProp){
+    for (int pos = 0; pos < nnArea; pos++)
       vec[pos] += selfProp * ownership[pos];
   };
   int64_t visits = node->stats.visits.load(std::memory_order_acquire);
@@ -1771,10 +1772,11 @@ vector<double> Search::getAverageTreeOwnership(const SearchNode* node) const {
 std::pair<vector<double>,vector<double>> Search::getAverageAndStandardDeviationTreeOwnership(const SearchNode* node) const {
   if(node == NULL)
     node = rootNode;
-  vector<double> average(nnXLen*nnYLen,0.0);
-  vector<double> stdev(nnXLen*nnYLen,0.0);
-  auto accumulate = [&average,&stdev,this](const float* ownership, double selfProp) {
-    for (int pos = 0; pos < nnXLen*nnYLen; pos++) {
+  const int nnArea = getNNXLen()*getNNYLen();
+  vector<double> average(nnArea,0.0);
+  vector<double> stdev(nnArea,0.0);
+  auto accumulate = [&average,&stdev,nnArea](const float* ownership, double selfProp) {
+    for (int pos = 0; pos < nnArea; pos++) {
       const double value = ownership[pos];
       average[pos] += selfProp * value;
       stdev[pos] += selfProp * value * value;
@@ -1788,7 +1790,7 @@ std::pair<vector<double>,vector<double>> Search::getAverageAndStandardDeviationT
   double pruneProp = minProp * 0.01;
   std::unordered_set<const SearchNode*> graphPath;
   traverseTreeForOwnership(minProp,pruneProp,1.0,node,graphPath,accumulate);
-  for(int pos = 0; pos<nnXLen*nnYLen; pos++) {
+  for(int pos = 0; pos<nnArea; pos++) {
     const double avg = average[pos];
     stdev[pos] = sqrt(max(stdev[pos] - avg * avg, 0.0));
   }
@@ -1939,7 +1941,7 @@ std::vector<double> Search::getAverageTreeOwnership(
 
   for(int y = 0; y < board.y_size; y++) {
     for(int x = 0; x < board.x_size; x++) {
-      int pos = NNPos::xyToPos(x, y, nnXLen);
+      int pos = NNPos::xyToPos(x, y, getNNXLen());
       Loc symLoc = SymmetryHelpers::getSymLoc(x, y, board, symmetry);
       int symPos = Location::getY(symLoc, board.x_size) * board.x_size + Location::getX(symLoc, board.x_size);
       assert(symPos >= 0 && symPos < board.y_size * board.x_size);
@@ -1971,7 +1973,7 @@ std::pair<std::vector<double>,std::vector<double>> Search::getAverageAndStandard
 
   for(int y = 0; y < board.y_size; y++) {
     for(int x = 0; x < board.x_size; x++) {
-      int pos = NNPos::xyToPos(x, y, nnXLen);
+      int pos = NNPos::xyToPos(x, y, getNNXLen());
       Loc symLoc = SymmetryHelpers::getSymLoc(x, y, board, symmetry);
       int symPos = Location::getY(symLoc, board.x_size) * board.x_size + Location::getX(symLoc, board.x_size);
       assert(symPos >= 0 && symPos < board.y_size * board.x_size);
@@ -2176,12 +2178,12 @@ bool Search::getAnalysisJson(
       json policy = json::array();
       for(int y = 0; y < board.y_size; y++) {
         for(int x = 0; x < board.x_size; x++) {
-          int pos = NNPos::xyToPos(x, y, nnXLen);
+          int pos = NNPos::xyToPos(x, y, getNNXLen());
           policy.push_back(Global::roundDynamic(policyProbs[pos],OUTPUT_PRECISION));
         }
       }
 
-      int passPos = NNPos::locToPos(Board::PASS_LOC, board.x_size, nnXLen, nnYLen);
+      int passPos = nnPosGeometry.getPassPos();
       policy.push_back(Global::roundDynamic(policyProbs[passPos],OUTPUT_PRECISION));
       ret["policy"] = policy;
     }
@@ -2191,11 +2193,11 @@ bool Search::getAnalysisJson(
       json policy = json::array();
       for(int y = 0; y < board.y_size; y++) {
         for(int x = 0; x < board.x_size; x++) {
-          int pos = NNPos::xyToPos(x, y, nnXLen);
+          int pos = NNPos::xyToPos(x, y, getNNXLen());
           policy.push_back(Global::roundDynamic(policyProbs[pos],OUTPUT_PRECISION));
         }
       }
-      int passPos = NNPos::locToPos(Board::PASS_LOC, board.x_size, nnXLen, nnYLen);
+      int passPos = nnPosGeometry.getPassPos();
       policy.push_back(Global::roundDynamic(policyProbs[passPos],OUTPUT_PRECISION));
       ret["humanPolicy"] = policy;
     }
