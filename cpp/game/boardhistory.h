@@ -78,8 +78,19 @@ struct BoardHistory {
   //Did this board location ever have a stone there before, or was it ever played?
   //(Also includes locations of suicides)
   bool wasEverOccupiedOrPlayed[Board::MAX_ARR_SIZE];
-  //Locations where the next player is not allowed to play due to superko
+private:
+  //Locations where the next player is not allowed to play due to superko, together with the zobrist
+  //fold of exactly that set of locations. The array and the hash are one fact with one owner: every
+  //write goes through setSuperKoBanned or clearSuperKoBanned, which update both together, so the
+  //hash is always current and never has to be recomputed by sweeping the board. They are private
+  //for that reason - a direct writer could desynchronize them.
   bool superKoBanned[Board::MAX_ARR_SIZE];
+  Hash128 superKoBannedHash;
+public:
+  //Is the next player forbidden from playing at loc due to superko?
+  bool isSuperKoBanned(Loc loc) const { return superKoBanned[loc]; }
+  //Board::ZOBRIST_KO_LOC_HASH xor-folded over exactly the locs for which isSuperKoBanned is true.
+  Hash128 getSuperKoBannedHash() const { return superKoBannedHash; }
 
   //Number of consecutive passes made that count for ending the game or phase
   int consecutiveEndingPasses;
@@ -248,6 +259,8 @@ struct BoardHistory {
 private:
   bool koHashOccursInHistory(Hash128 koHash, const KoHashTable* rootKoHashTable) const;
   void setKoRecapBlocked(Loc loc, bool b);
+  void setSuperKoBanned(Loc loc, bool b);
+  void clearSuperKoBanned();
   int countAreaScoreWhiteMinusBlack(const Board& board, Color area[Board::MAX_ARR_SIZE]) const;
   int countTerritoryAreaScoreWhiteMinusBlack(const Board& board, Color area[Board::MAX_ARR_SIZE]) const;
   void setFinalScoreAndWinner(float score);

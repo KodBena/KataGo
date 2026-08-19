@@ -690,7 +690,7 @@ void SymmetryHelpers::markDuplicateMoveLocs(
     return;
   for(int y = 0; y < board.y_size; y++) {
     for(int x = 0; x < board.x_size; x++) {
-      if(hist.superKoBanned[Location::getLoc(x, y, board.x_size)])
+      if(hist.isSuperKoBanned(Location::getLoc(x, y, board.x_size)))
         return;
     }
   }
@@ -1032,7 +1032,7 @@ void NNInputs::fillRowV3(
     for(int y = 0; y<ySize; y++) {
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
-        if(hist.superKoBanned[loc] && loc != board.ko_loc) {
+        if(hist.isSuperKoBanned(loc) && loc != board.ko_loc) {
           int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
           setRowBin(rowBin,pos,6, 1.0f, posStride, featureStride);
         }
@@ -1045,7 +1045,7 @@ void NNInputs::fillRowV3(
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
         int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
-        if(hist.superKoBanned[loc])
+        if(hist.isSuperKoBanned(loc))
           setRowBin(rowBin,pos,6, 1.0f, posStride, featureStride);
         if(hist.koRecapBlocked[loc])
           setRowBin(rowBin,pos,7, 1.0f, posStride, featureStride);
@@ -1382,7 +1382,7 @@ void NNInputs::fillRowV4(
     for(int y = 0; y<ySize; y++) {
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
-        if(hist.superKoBanned[loc] && loc != board.ko_loc) {
+        if(hist.isSuperKoBanned(loc) && loc != board.ko_loc) {
           int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
           setRowBin(rowBin,pos,6, 1.0f, posStride, featureStride);
         }
@@ -1395,7 +1395,7 @@ void NNInputs::fillRowV4(
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
         int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
-        if(hist.superKoBanned[loc])
+        if(hist.isSuperKoBanned(loc))
           setRowBin(rowBin,pos,6, 1.0f, posStride, featureStride);
         if(hist.koRecapBlocked[loc])
           setRowBin(rowBin,pos,7, 1.0f, posStride, featureStride);
@@ -1714,7 +1714,7 @@ void NNInputs::fillRowV5(
     for(int y = 0; y<ySize; y++) {
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
-        if(hist.superKoBanned[loc] && loc != board.ko_loc) {
+        if(hist.isSuperKoBanned(loc) && loc != board.ko_loc) {
           int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
           setRowBin(rowBin,pos,3, 1.0f, posStride, featureStride);
         }
@@ -1727,7 +1727,7 @@ void NNInputs::fillRowV5(
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
         int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
-        if(hist.superKoBanned[loc])
+        if(hist.isSuperKoBanned(loc))
           setRowBin(rowBin,pos,3, 1.0f, posStride, featureStride);
         if(hist.koRecapBlocked[loc])
           setRowBin(rowBin,pos,4, 1.0f, posStride, featureStride);
@@ -1924,7 +1924,7 @@ void NNInputs::fillRowV6(
     for(int y = 0; y<ySize; y++) {
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
-        if(hist.superKoBanned[loc] && loc != board.ko_loc) {
+        if(hist.isSuperKoBanned(loc) && loc != board.ko_loc) {
           int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
           setRowBin(rowBin,pos,6, 1.0f, posStride, featureStride);
         }
@@ -1937,7 +1937,7 @@ void NNInputs::fillRowV6(
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
         int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
-        if(hist.superKoBanned[loc])
+        if(hist.isSuperKoBanned(loc))
           setRowBin(rowBin,pos,6, 1.0f, posStride, featureStride);
         if(hist.koRecapBlocked[loc])
           setRowBin(rowBin,pos,7, 1.0f, posStride, featureStride);
@@ -2362,7 +2362,7 @@ void NNInputs::fillRowV7(
     for(int y = 0; y<ySize; y++) {
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
-        if(hist.superKoBanned[loc] && loc != board.ko_loc) {
+        if(hist.isSuperKoBanned(loc) && loc != board.ko_loc) {
           int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
           setRowBin(rowBin,pos,6, 1.0f, posStride, featureStride);
         }
@@ -2375,7 +2375,7 @@ void NNInputs::fillRowV7(
       for(int x = 0; x<xSize; x++) {
         Loc loc = Location::getLoc(x,y,xSize);
         int pos = NNPos::locToPos(loc,xSize,nnXLen,nnYLen);
-        if(hist.superKoBanned[loc])
+        if(hist.isSuperKoBanned(loc))
           setRowBin(rowBin,pos,6, 1.0f, posStride, featureStride);
         if(hist.koRecapBlocked[loc])
           setRowBin(rowBin,pos,7, 1.0f, posStride, featureStride);

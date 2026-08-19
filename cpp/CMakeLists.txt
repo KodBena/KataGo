@@ -1021,6 +1021,7 @@ add_executable(katago
   tests/testpassalivesuicide.cpp
   tests/testexcludeterritoryatari.cpp
   tests/testrules.cpp
+  tests/testsuperkohash.cpp
   tests/testscore.cpp
   tests/testsgf.cpp
   tests/testsymmetries.cpp
