@@ -1970,7 +1970,7 @@ static void runMoreV8TestsRandomizedNNEvals(NNEvaluator* nnEval, Logger& logger)
       for(int i = 0; i<500; i++) {
         bot->genMoveSynchronous(nextPla,TimeControls());
         bot->getSearch()->getPolicy(policyProbs);
-        policySamples.insert(policyProbs[NNPos::xyToPos(2,4,bot->getSearch()->nnXLen)]);
+        policySamples.insert(policyProbs[NNPos::xyToPos(2,4,bot->getSearch()->getNNXLen())]);
         wlSamples.insert(bot->getSearch()->getRootValuesRequireSuccess().winLossValue);
         bot->clearSearch();
       }

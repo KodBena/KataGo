@@ -40,6 +40,9 @@ namespace Tests {
   void runSgfTests();
   void runSgfFileTests();
 
+  //testnnposgeometry.cpp
+  void runNNPosGeometryTests();
+
   //testnninputs.cpp
   void runNNInputsV3V4Tests();
   void runExcludeTerritoryAtariNNInputsTests();

@@ -777,8 +777,8 @@ vector<bool> PlayUtils::computeAnticipatedStatusesWithOwnership(
 
   ownershipsBuf = computeOwnership(bot,board,hist,pla,numVisits);
   const vector<double>& ownerships = ownershipsBuf;
-  int nnXLen = bot->nnXLen;
-  int nnYLen = bot->nnYLen;
+  int nnXLen = bot->getNNXLen();
+  int nnYLen = bot->getNNYLen();
 
   //Heuristic:
   //Stones are considered dead if their average ownership is less than 0.2 equity in their own color,
@@ -1175,8 +1175,8 @@ Loc PlayUtils::maybeFriendlyPass(
     cleanBoard.calculateArea(area, nonPassAliveStones, safeBigTerritories, unsafeBigTerritories, isMultiStoneSuicideLegal);
   }
   const double highOwnershipThreshold = 0.75;
-  int nnXLen = bot->nnXLen;
-  int nnYLen = bot->nnYLen;
+  int nnXLen = bot->getNNXLen();
+  int nnYLen = bot->getNNYLen();
   bool foundUnsurroundedSpot = false;
   for(int y = 0; y<board.y_size && !foundUnsurroundedSpot; y++) {
     for(int x = 0; x<board.x_size && !foundUnsurroundedSpot; x++) {

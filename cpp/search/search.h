@@ -14,6 +14,7 @@
 #include "../game/boardhistory.h"
 #include "../game/rules.h"
 #include "../neuralnet/nneval.h"
+#include "../neuralnet/nnposgeometry.h"
 #include "../search/analysisdata.h"
 #include "../search/evalcache.h"
 #include "../search/mutexpool.h"
@@ -153,9 +154,17 @@ struct Search {
   Logger* logger;
   NNEvaluator* nnEvaluator;
   NNEvaluator* humanEvaluator;
-  int nnXLen;
-  int nnYLen;
-  int policySize;
+
+  //================================================================================================================
+  // Derived from the root board and the evaluator, constant for the duration of a search
+  //================================================================================================================
+
+  //The board <-> policy-vector mapping for this search. Owns the board size and the net's spatial
+  //extent as one fact, so a call site names the geometry rather than restating four ints, and the
+  //mapping is a table lookup rather than an integer division per call. Rebuilt by
+  //updateNNPosGeometry() whenever the root board or the evaluator changes; beginSearch checks it
+  //against the live sources so a writer that forgets cannot silently mis-index the policy vector.
+  NNPosGeometry nnPosGeometry;
 
   //================================================================================================================
   // Mutated during search
@@ -218,8 +227,13 @@ struct Search {
   Player getRootPla() const;
   Player getPlayoutDoublingAdvantagePla() const;
 
+  //The neural net's spatial extent and the resulting policy vector length for this search.
+  inline int getNNXLen() const { return nnPosGeometry.getNNXLen(); }
+  inline int getNNYLen() const { return nnPosGeometry.getNNYLen(); }
+  inline int getPolicySize() const { return nnPosGeometry.getPolicySize(); }
+
   //Get the NNPos corresponding to a loc, convenience method
-  inline int getPos(Loc moveLoc) const { return NNPos::locToPos(moveLoc,rootBoard.x_size,nnXLen,nnYLen); }
+  inline int getPos(Loc moveLoc) const { return nnPosGeometry.locToPos(moveLoc); }
 
   //Clear all results of search and sets a new position or something else
   void setPosition(Player pla, const Board& board, const BoardHistory& history);
@@ -245,6 +259,10 @@ struct Search {
   void setCopyOfExternalPatternBonusTable(const std::unique_ptr<PatternBonusTable>& table);
   void setExternalEvalCache(const std::shared_ptr<EvalCacheTable>& cache);
   void setNNEval(NNEvaluator* nnEval);
+
+  //The one writer of nnPosGeometry. Every setter that changes the root board or the evaluator
+  //calls this, so the cached mapping is never derived from a geometry that has moved on.
+  void updateNNPosGeometry();
 
   //If the number of threads is reduced, this can free up some excess threads in the thread pool.
   //Calling this is never necessary, it may just reduce some resource use.

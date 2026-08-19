@@ -3280,7 +3280,7 @@ void Tests::runSekiTrainWriteTests(const string& modelFile) {
       cout << endl;
       for(int y = 0; y<board.y_size; y++) {
         for(int x = 0; x<board.x_size; x++) {
-          int pos = NNPos::xyToPos(x,y,bot->nnXLen);
+          int pos = NNPos::xyToPos(x,y,bot->getNNXLen());
           int ownershipValue = (int)round(100*ownership[pos]);
           string s;
           if(ownershipValue >= 99)
