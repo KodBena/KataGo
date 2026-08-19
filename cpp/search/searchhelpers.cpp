@@ -164,6 +164,8 @@ std::shared_ptr<NNOutput>* Search::maybeAddPolicyNoiseAndTemp(SearchThread& thre
   if(oldNNOutput->noisedPolicyProbs != NULL)
     return NULL;
 
+  const int policySize = getPolicySize();
+
   //Copy nnOutput as we're about to modify its policy to add noise or temperature
   std::shared_ptr<NNOutput>* newNNOutputSharedPtr = new std::shared_ptr<NNOutput>(new NNOutput(*oldNNOutput));
   NNOutput* newNNOutput = newNNOutputSharedPtr->get();
@@ -358,8 +360,8 @@ double Search::getEndingWhiteScoreBonus(const SearchNode& parent, Loc moveLoc) c
 
   bool isAreaIsh = rootHistory.rules.scoringRule == Rules::SCORING_AREA
     || (rootHistory.rules.scoringRule == Rules::SCORING_TERRITORY && rootHistory.encorePhase >= 2);
-  testAssert(nnOutput->nnXLen == nnXLen);
-  testAssert(nnOutput->nnYLen == nnYLen);
+  testAssert(nnOutput->nnXLen == getNNXLen());
+  testAssert(nnOutput->nnYLen == getNNYLen());
   float* whiteOwnerMap = nnOutput->whiteOwnerMap;
 
   const double extreme = 0.95;
@@ -375,7 +377,7 @@ double Search::getEndingWhiteScoreBonus(const SearchNode& parent, Loc moveLoc) c
     //These conditions should still make it so that "cleanup" and dame-filling moves are not discouraged.
     // * When playing button go, very slightly discourage passing - so that if there are an even number of dame, filling a dame is still favored over passing.
     if(moveLoc != Board::PASS_LOC && rootBoard.ko_loc == Board::NULL_LOC) {
-      int pos = NNPos::locToPos(moveLoc,rootBoard.x_size,nnXLen,nnYLen);
+      int pos = getPos(moveLoc);
       double plaOwnership = rootPla == P_WHITE ? whiteOwnerMap[pos] : -whiteOwnerMap[pos];
       if(plaOwnership <= -extreme) {
         if(!rootBoard.wouldBeCapture(moveLoc,rootPla))
@@ -403,7 +405,7 @@ double Search::getEndingWhiteScoreBonus(const SearchNode& parent, Loc moveLoc) c
     if(moveLoc == Board::PASS_LOC)
       extraRootPoints -= searchParams.rootEndingBonusPoints * (2.0/3.0);
     else if(rootBoard.ko_loc == Board::NULL_LOC) {
-      int pos = NNPos::locToPos(moveLoc,rootBoard.x_size,nnXLen,nnYLen);
+      int pos = getPos(moveLoc);
       double plaOwnership = rootPla == P_WHITE ? whiteOwnerMap[pos] : -whiteOwnerMap[pos];
       if(plaOwnership <= -extreme)
         extraRootPoints -= searchParams.rootEndingBonusPoints * ((-extreme - plaOwnership) / tail);
@@ -435,8 +437,8 @@ bool Search::shouldSuppressPass(const SearchNode* n) const {
     return false;
   if(nnOutput->whiteOwnerMap == NULL)
     return false;
-  testAssert(nnOutput->nnXLen == nnXLen);
-  testAssert(nnOutput->nnYLen == nnYLen);
+  testAssert(nnOutput->nnXLen == getNNXLen());
+  testAssert(nnOutput->nnYLen == getNNYLen());
   const float* whiteOwnerMap = nnOutput->whiteOwnerMap;
 
   //Find the pass move
@@ -491,14 +493,14 @@ bool Search::shouldSuppressPass(const SearchNode* n) const {
     Loc moveLoc = childPointer.getMoveLocRelaxed();
     if(moveLoc == Board::PASS_LOC)
       continue;
-    int pos = NNPos::locToPos(moveLoc,rootBoard.x_size,nnXLen,nnYLen);
+    int pos = getPos(moveLoc);
     double plaOwnership = rootPla == P_WHITE ? whiteOwnerMap[pos] : -whiteOwnerMap[pos];
     bool oppOwned = plaOwnership < -extreme;
     bool adjToPlaOwned = false;
     for(int j = 0; j<4; j++) {
       Loc adj = moveLoc + rootBoard.adj_offsets[j];
       if(rootBoard.isOnBoard(adj)) {
-        int adjPos = NNPos::locToPos(adj,rootBoard.x_size,nnXLen,nnYLen);
+        int adjPos = getPos(adj);
         double adjPlaOwnership = rootPla == P_WHITE ? whiteOwnerMap[adjPos] : -whiteOwnerMap[adjPos];
         if(adjPlaOwnership > extreme) {
           adjToPlaOwned = true;

@@ -97,7 +97,7 @@ void TestSearchCommon::runBotOnPosition(AsyncBot* bot, Board board, Player nextP
       std::vector<double> ownershipStdev = std::get<1>(ownershipAndStdev);
       for(int y = 0; y<board.y_size; y++) {
         for(int x = 0; x<board.x_size; x++) {
-          int pos = NNPos::xyToPos(x,y,search->nnXLen);
+          int pos = NNPos::xyToPos(x,y,search->getNNXLen());
           cout << Global::strprintf("%6.1f ", ownership[pos]*100);
         }
         cout << endl;
@@ -105,7 +105,7 @@ void TestSearchCommon::runBotOnPosition(AsyncBot* bot, Board board, Player nextP
       cout << endl;
       for(int y = 0; y<board.y_size; y++) {
         for(int x = 0; x<board.x_size; x++) {
-          int pos = NNPos::xyToPos(x,y,search->nnXLen);
+          int pos = NNPos::xyToPos(x,y,search->getNNXLen());
           cout << Global::strprintf("%6.1f ", ownershipStdev[pos]*100);
         }
         cout << endl;

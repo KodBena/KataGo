@@ -98,9 +98,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    logger(lg),
    nnEvaluator(nnEval),
    humanEvaluator(humanEval),
-   nnXLen(),
-   nnYLen(),
-   policySize(),
+   nnPosGeometry(NNPosGeometry::of(rootBoard,*nnEval)),
    rootNode(NULL),
    nodeTable(NULL),
    mutexPool(NULL),
@@ -113,14 +111,9 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    oldNNOutputsToCleanUp()
 {
   testAssert(logger != NULL);
-  nnXLen = nnEval->getNNXLen();
-  nnYLen = nnEval->getNNYLen();
-  testAssert(nnXLen > 0 && nnXLen <= NNPos::MAX_BOARD_LEN);
-  testAssert(nnYLen > 0 && nnYLen <= NNPos::MAX_BOARD_LEN);
-  policySize = NNPos::getPolicySize(nnXLen,nnYLen);
 
   if(humanEvaluator != NULL) {
-    if(humanEvaluator->getNNXLen() != nnXLen || humanEvaluator->getNNYLen() != nnYLen)
+    if(humanEvaluator->getNNXLen() != getNNXLen() || humanEvaluator->getNNYLen() != getNNYLen())
       throw StringError("Search::init - humanEval has different nnXLen or nnYLen");
   }
 
@@ -211,6 +204,7 @@ void Search::setPosition(Player pla, const Board& board, const BoardHistory& his
   plaThatSearchIsFor = C_EMPTY;
   rootBoard = board;
   rootHistory = history;
+  updateNNPosGeometry();
   applyHistoryModesToRootHistory();
   rootKoHashTable->recompute(rootHistory);
   avoidMoveUntilByLocBlack.clear();
@@ -321,17 +315,17 @@ void Search::setExternalEvalCache(const std::shared_ptr<EvalCacheTable>& cache) 
 void Search::setNNEval(NNEvaluator* nnEval) {
   clearSearch();
   nnEvaluator = nnEval;
-  nnXLen = nnEval->getNNXLen();
-  nnYLen = nnEval->getNNYLen();
-  testAssert(nnXLen > 0 && nnXLen <= NNPos::MAX_BOARD_LEN);
-  testAssert(nnYLen > 0 && nnYLen <= NNPos::MAX_BOARD_LEN);
-  policySize = NNPos::getPolicySize(nnXLen,nnYLen);
+  updateNNPosGeometry();
 
   if(humanEvaluator != NULL) {
-    if(humanEvaluator->getNNXLen() != nnXLen || humanEvaluator->getNNYLen() != nnYLen)
+    if(humanEvaluator->getNNXLen() != getNNXLen() || humanEvaluator->getNNYLen() != getNNYLen())
       throw StringError("Search::setNNEval - humanEval has different nnXLen or nnYLen");
   }
   applyHistoryModesToRootHistory();
+}
+
+void Search::updateNNPosGeometry() {
+  nnPosGeometry = NNPosGeometry::of(rootBoard,*nnEvaluator);
 }
 
 void Search::clearSearch() {
@@ -663,9 +657,14 @@ void Search::runWholeSearch(
 //should reasonably tolerate just continuing. We do NOT want to clear history because we could inadvertently make a move
 //that an external ruleset COULD think violated superko.
 void Search::beginSearch(bool pondering) {
-  if(rootBoard.x_size > nnXLen || rootBoard.y_size > nnYLen)
-    throw StringError("Search got from NNEval nnXLen = " + Global::intToString(nnXLen) +
-                      " nnYLen = " + Global::intToString(nnYLen) + " but was asked to search board with larger x or y size");
+  //The geometry is a cache of the mapping for exactly this board and this evaluator. Compare it
+  //against both live sources: a mismatch means some writer changed one of them without calling
+  //updateNNPosGeometry, and every subsequent lookup would answer about a board that is not there.
+  testAssert(nnPosGeometry.matches(rootBoard,nnEvaluator->getNNXLen(),nnEvaluator->getNNYLen()));
+
+  if(rootBoard.x_size > getNNXLen() || rootBoard.y_size > getNNYLen())
+    throw StringError("Search got from NNEval nnXLen = " + Global::intToString(getNNXLen()) +
+                      " nnYLen = " + Global::intToString(getNNYLen()) + " but was asked to search board with larger x or y size");
 
   //Invariant: every setter that installs or rebuilds rootHistory or changes params/nnEvaluator
   //re-stamps this flag, so it should always be consistent by the time a search begins.

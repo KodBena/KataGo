@@ -941,7 +941,7 @@ struct GTPEngine {
             out << " ";
 
             out << "movesOwnership";
-            int nnXLen = search->nnXLen;
+            int nnXLen = search->getNNXLen();
             for(int y = 0; y<board.y_size; y++) {
               for(int x = 0; x<board.x_size; x++) {
                 int pos = NNPos::xyToPos(x,y,nnXLen);
@@ -953,7 +953,7 @@ struct GTPEngine {
             out << " ";
 
             out << "movesOwnershipStdev";
-            int nnXLen = search->nnXLen;
+            int nnXLen = search->getNNXLen();
             for(int y = 0; y<board.y_size; y++) {
               for(int x = 0; x<board.x_size; x++) {
                 int pos = NNPos::xyToPos(x,y,nnXLen);
@@ -997,7 +997,7 @@ struct GTPEngine {
           out << " ";
 
           out << "ownership";
-          int nnXLen = search->nnXLen;
+          int nnXLen = search->getNNXLen();
           for(int y = 0; y<board.y_size; y++) {
             for(int x = 0; x<board.x_size; x++) {
               int pos = NNPos::xyToPos(x,y,nnXLen);
@@ -1013,7 +1013,7 @@ struct GTPEngine {
           out << " ";
 
           out << "ownershipStdev";
-          int nnXLen = search->nnXLen;
+          int nnXLen = search->getNNXLen();
           for(int y = 0; y<board.y_size; y++) {
             for(int x = 0; x<board.x_size; x++) {
               int pos = NNPos::xyToPos(x,y,nnXLen);
