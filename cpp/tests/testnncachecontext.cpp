@@ -14,6 +14,7 @@
 #include "../neuralnet/nncachecontext.h"
 #include "../neuralnet/nncachecountlog.h"
 #include "../neuralnet/nncachefrozen.h"
+#include "../neuralnet/nncachetwolevel.h"
 #include "../neuralnet/nneval.h"
 #include "../search/search.h"
 #include "../tests/testsearchcommon.h"

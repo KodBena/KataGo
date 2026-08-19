@@ -1,16 +1,205 @@
+#include "../neuralnet/nncachetwolevel.h"
+
+#include <atomic>
 #include <mutex>
+#include <set>
 
 #include "../core/global.h"
-#include "../neuralnet/nncachefrozen.h"
 #include "../search/mutexpool.h"
 
-// The two-level resolution strategy: a frozen level 0 over an ordinary level 1, presented
-// as one NNCacheTable with one hit-count surface across both.
+// The two-level resolution strategy: an ORDERED LIST of frozen level-0 sources over one
+// ordinary level 1, presented as one NNCacheTable with one hit-count surface across all of
+// them.
 //
-// See nncachefrozen.h for the semantics this file implements. The one thing worth
-// restating here, because it is what the file is shaped around: LEVEL 0 IS FROZEN, so the
-// only way a key can move is from level 0 to level 1, once, irreversibly, and it takes its
-// hit count with it. There is no path by which a key comes to be resolvable in both.
+// See nncachetwolevel.h for the semantics this file implements. The two things worth
+// restating here, because they are what the file is shaped around:
+//
+//   LEVEL 0 IS FROZEN, so the only way a key can move is from a level-0 source to level 1,
+//   once, irreversibly, and it takes its hit count with it. There is no path by which a
+//   key comes to be resolvable in both.
+//
+//   THE LIST IS ORDERED AND THE ORDER IS THE PRIORITY. A get returns the first source that
+//   resolves the key. A set, symmetrically, shadows the key in EVERY source that holds it
+//   -- because "at most one level owns any key" is a statement about the whole list, and a
+//   lower-priority source left resolving a superseded key would answer before level 1 ever
+//   got the chance to.
+
+//-------------------------------------------------------------------------------------
+// The ordered resolution list
+//-------------------------------------------------------------------------------------
+
+namespace {
+// Distinct per constructed list, so an id minted by one cache's list is refused by
+// another's rather than silently addressing the source at the same serial.
+std::atomic<uint64_t> nextLevelZeroListId(1);
+}  // namespace
+
+NNCacheLevelZeroSources::NNCacheLevelZeroSources()
+  :listId_(nextLevelZeroListId.fetch_add(1, std::memory_order_relaxed)),
+   nextSerial_(0),
+   entries_()
+{}
+
+NNCacheLevelZeroSources::~NNCacheLevelZeroSources() = default;
+
+NNCacheLevelZeroSourceId NNCacheLevelZeroSources::attach(std::unique_ptr<NNCacheFrozen> source) {
+  if(source == nullptr)
+    throw StringError(
+      "NNCacheLevelZeroSources::attach: no source was supplied. A list with nothing "
+      "attached is a list of length zero, never a list holding a null."
+    );
+  Entry entry;
+  entry.serial = nextSerial_;
+  entry.source = std::move(source);
+  nextSerial_ += 1;
+  entries_.push_back(std::move(entry));
+  // The end of the vector IS the end of the resolution order. Appending is what makes
+  // "attach the strongest first" the whole of the priority mechanism.
+  return NNCacheLevelZeroSourceId(listId_, entries_.back().serial);
+}
+
+std::unique_ptr<NNCacheFrozen> NNCacheLevelZeroSources::detach(const NNCacheLevelZeroSourceId& id) {
+  if(id.listId() != listId_)
+    throw StringError(
+      "NNCacheLevelZeroSources::detach: this id names a source attached to a different "
+      "cache. Spending it here would detach whichever source sits at the same serial in "
+      "this list, which is a different card."
+    );
+  for(size_t i = 0; i < entries_.size(); i++) {
+    if(entries_[i].serial != id.serial())
+      continue;
+    std::unique_ptr<NNCacheFrozen> detached = std::move(entries_[i].source);
+    // erase, not swap-and-pop: the RELATIVE ORDER of everything still attached is the
+    // priority the client asked for, and a detach is not a reordering.
+    entries_.erase(entries_.begin() + (ptrdiff_t)i);
+    return detached;
+  }
+  throw StringError(
+    "NNCacheLevelZeroSources::detach: this source is not attached; serial " +
+    Global::uint64ToString(id.serial()) + " has already been detached, and a serial is "
+    "never reissued, so no other source can ever answer to this id."
+  );
+}
+
+size_t NNCacheLevelZeroSources::size() const { return entries_.size(); }
+
+std::vector<NNCacheLevelZeroSourceId> NNCacheLevelZeroSources::resolutionOrder() const {
+  std::vector<NNCacheLevelZeroSourceId> out;
+  out.reserve(entries_.size());
+  for(size_t i = 0; i < entries_.size(); i++)
+    out.push_back(NNCacheLevelZeroSourceId(listId_, entries_[i].serial));
+  return out;
+}
+
+bool NNCacheLevelZeroSources::get(Hash128 key, std::shared_ptr<NNOutput>& ret) {
+  // FIRST MATCH IN ATTACH ORDER WINS. The loop stops at the first source that resolves the
+  // key, so exactly one source's counter is touched and every later source's entry for the
+  // same key stays untouched and unreached.
+  for(size_t i = 0; i < entries_.size(); i++) {
+    if(entries_[i].source->get(key, ret))
+      return true;
+  }
+  return false;
+}
+
+uint64_t NNCacheLevelZeroSources::shadowAllHolders(Hash128 key) {
+  // EVERY holder, and there is no early exit. See the header: stopping at the first would
+  // leave a lower-priority source resolving a key level 1 now owns.
+  uint64_t transferred = 0;
+  for(size_t i = 0; i < entries_.size(); i++) {
+    const std::optional<uint32_t> fromThis = entries_[i].source->shadow(key);
+    if(fromThis.has_value())
+      transferred += (uint64_t)fromThis.value();
+  }
+  return transferred;
+}
+
+std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvest() const {
+  if(entries_.empty())
+    return std::vector<NNCacheHitCount>();
+  // ONE SOURCE CANNOT COLLIDE WITH ITSELF: a frozen index refuses duplicate keys at build
+  // (SPEC.md 4.1), so the single-source harvest needs no cross-source bookkeeping and does
+  // not pay for any. This is the shape this call had before the list existed and it is
+  // byte-for-byte the same answer.
+  if(entries_.size() == 1)
+    return entries_[0].source->harvest();
+
+  std::vector<NNCacheHitCount> out;
+  // ONE ROW PER KEY, kept by remembering what has already been emitted. The set is built
+  // and thrown away inside this call: harvest is an O(table) between-sessions report and
+  // is never on the get or set path, so the allocation costs nothing that matters, and the
+  // alternative -- a permanent cross-source key index -- would be a second home for a fact
+  // the sources already hold (ADR-0012 P1).
+  std::set<Hash128> emitted;
+  for(size_t i = 0; i < entries_.size(); i++) {
+    const std::vector<NNCacheHitCount> rows = entries_[i].source->harvest();
+    for(size_t j = 0; j < rows.size(); j++) {
+      // The first source in resolution order to offer a key is the one that resolves it,
+      // so its row is the one carrying any hits.
+      if(!emitted.insert(rows[j].key).second) {
+        // THE TRIPWIRE, and the reason it is here rather than a sentence of prose. The
+        // suppressed row is provably zero ONLY because a set shadows every holder at once
+        // (shadowAllHolders) -- an invariant enforced in a different method. If that ever
+        // stops holding, this loop would silently drop retrievals a persistence layer will
+        // never see again, and no honesty counter would move. So the proof is checked where
+        // it is relied on: a suppressed row carrying hits is a broken invariant, not a
+        // recoverable condition, and it is refused loudly rather than dropped (ADR-0002,
+        // ADR-0021 Rule 2 -- the negative claim "no counted row is ever suppressed" becomes
+        // a positive observation whose firing IS the failure).
+        if(rows[j].hits != 0)
+          throw StringError(
+            "NNCacheLevelZeroSources::harvest: source " + Global::uint64ToString((uint64_t)i) +
+            " in resolution order holds key " + rows[j].key.toString() + " with " +
+            Global::uint64ToString((uint64_t)rows[j].hits) + " hits, but an earlier source "
+            "already resolves that key. An unreachable entry cannot accrue hits unless the "
+            "one-owner invariant has been broken, and dropping this row would lose them "
+            "silently."
+          );
+        continue;
+      }
+      out.push_back(rows[j]);
+    }
+  }
+  return out;
+}
+
+int64_t NNCacheLevelZeroSources::numReachableEntries() const {
+  int64_t total = 0;
+  for(size_t i = 0; i < entries_.size(); i++)
+    total += entries_[i].source->numReachableEntries();
+  return total;
+}
+
+int64_t NNCacheLevelZeroSources::reachablePayloadBytes() const {
+  int64_t total = 0;
+  for(size_t i = 0; i < entries_.size(); i++)
+    total += entries_[i].source->reachablePayloadBytes();
+  return total;
+}
+
+int64_t NNCacheLevelZeroSources::shadowedPayloadBytes() const {
+  int64_t total = 0;
+  for(size_t i = 0; i < entries_.size(); i++)
+    total += entries_[i].source->shadowedPayloadBytes();
+  return total;
+}
+
+int64_t NNCacheLevelZeroSources::structureBytes() const {
+  int64_t total = 0;
+  for(size_t i = 0; i < entries_.size(); i++)
+    total += (int64_t)entries_[i].source->structureBytes();
+  return total;
+}
+
+int64_t NNCacheLevelZeroSources::numEntries() const {
+  int64_t total = 0;
+  for(size_t i = 0; i < entries_.size(); i++)
+    total += (int64_t)entries_[i].source->numEntries();
+  return total;
+}
+
+NNCacheTwoLevelTable::NNCacheTwoLevelTable() {}
+NNCacheTwoLevelTable::~NNCacheTwoLevelTable() {}
 
 namespace {
 
@@ -133,7 +322,7 @@ class HitLedger {
 // The table
 //-------------------------------------------------------------------------------------
 
-class NNCacheTableTwoLevel final : public NNCacheTable {
+class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
  public:
   NNCacheTableTwoLevel(
     std::unique_ptr<NNCacheFrozen> levelZero,
@@ -141,16 +330,32 @@ class NNCacheTableTwoLevel final : public NNCacheTable {
     int hitLedgerPowerOfTwo,
     int hitLedgerMutexPowerOfTwo
   )
-    :levelZero_(std::move(levelZero)),
+    :levelZero_(),
      levelOne_(std::move(levelOne)),
      ledger_(hitLedgerPowerOfTwo, hitLedgerMutexPowerOfTwo)
-  {}
+  {
+    // The factory has already refused a null, so this cannot throw; the first source is
+    // attached through the same door every later one goes through, so there is no second
+    // way for a source to enter the list.
+    (void)levelZero_.attach(std::move(levelZero));
+  }
+
+  NNCacheLevelZeroSourceId attachLevelZero(std::unique_ptr<NNCacheFrozen> source) override {
+    return levelZero_.attach(std::move(source));
+  }
+  std::unique_ptr<NNCacheFrozen> detachLevelZero(const NNCacheLevelZeroSourceId& id) override {
+    return levelZero_.detach(id);
+  }
+  size_t numLevelZeroSources() const override { return levelZero_.size(); }
+  std::vector<NNCacheLevelZeroSourceId> levelZeroResolutionOrder() const override {
+    return levelZero_.resolutionOrder();
+  }
 
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
-    // Level 0 first. A hit here counts itself, in the same 32-bit word the lookup's own
-    // entry read already brought into cache, so counting costs the level-0 path nothing
-    // beyond the increment.
-    if(levelZero_->get(nnHash, ret))
+    // The attached sources first, in attach order, first match winning. A hit counts
+    // itself in the same 32-bit word the lookup's own entry read already brought into
+    // cache, so counting costs the level-0 path nothing beyond the increment.
+    if(levelZero_.get(nnHash, ret))
       return true;
     // Fall through. A level-1 hit is counted in the ledger; that is one extra random
     // access on the level-1 hit path, and it is the only place in this design where
@@ -173,9 +378,13 @@ class NNCacheTableTwoLevel final : public NNCacheTable {
     // result. Dropping those sets would leave level 0 answering with an entry the caller
     // has already rejected, forcing a full re-evaluation of that position on every
     // subsequent such query.
-    const std::optional<uint32_t> transferred = levelZero_->shadow(p->nnHash);
-    if(transferred.has_value())
-      ledger_.add(p->nnHash, transferred.value());
+    // EVERY attached source, not the first that holds the key: see
+    // NNCacheLevelZeroSources::shadowAllHolders. The counts they gave up are summed,
+    // because they are all counts of retrievals of THIS key and level 1 is now the one
+    // counter for it.
+    const uint64_t transferred = levelZero_.shadowAllHolders(p->nnHash);
+    if(transferred > 0)
+      ledger_.add(p->nnHash, transferred > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)transferred);
     levelOne_->set(p);
   }
 
@@ -187,29 +396,34 @@ class NNCacheTableTwoLevel final : public NNCacheTable {
   }
 
   NNCacheStats stats() const override {
+    // SUMMED OVER EVERY ATTACHED SOURCE, and an entry held by two sources is counted
+    // twice on purpose: these are memory figures, and two sources holding one key really
+    // do hold two evaluations and pay for both. What is unreachable is not thereby free.
     NNCacheStats s = levelOne_->stats();
-    s.residentEntries += levelZero_->numReachableEntries();
-    s.residentPayloadBytes += levelZero_->reachablePayloadBytes();
-    // Level 0's own structure, the ledger, and -- because it is real memory this table
+    s.residentEntries += levelZero_.numReachableEntries();
+    s.residentPayloadBytes += levelZero_.reachablePayloadBytes();
+    // The sources' own structures, the ledger, and -- because it is real memory this table
     // holds and can no longer hand out -- the evaluations of shadowed entries.
     s.fixedStructureBytes +=
-      (int64_t)levelZero_->structureBytes() +
+      levelZero_.structureBytes() +
       (int64_t)ledger_.structureBytes() +
-      levelZero_->shadowedPayloadBytes();
+      levelZero_.shadowedPayloadBytes();
     // A chained level 1 reports no slot capacity because it is bounded by bytes; adding
     // level 0's fixed count to a zero would fabricate a ratio, so the zero is preserved.
     if(s.capacitySlots != 0)
-      s.capacitySlots += (int64_t)levelZero_->numEntries();
+      s.capacitySlots += levelZero_.numEntries();
     return s;
   }
 
   NNCacheHitLedger harvestHitCounts() const override {
-    // Level 0's unshadowed entries first, in index order 0..n-1, which is the harvest
-    // order SPEC.md 3.4 requires and -- because the input arrived in descending reference
-    // count -- descending-popularity order. Then level 1's keys. No key appears in both
-    // lists: shadowing removes a key from level 0 at the same moment its count arrives in
-    // the ledger.
-    std::vector<NNCacheHitCount> rows = levelZero_->harvest();
+    // The attached sources' unshadowed entries first -- each source in resolution order,
+    // each source's entries in index order 0..n-1, which is the harvest order SPEC.md 3.4
+    // requires and -- because the input arrived in descending reference count --
+    // descending-popularity order within a source. Then level 1's keys. No key appears
+    // twice: a key held by two sources is emitted once by the list (see
+    // NNCacheLevelZeroSources::harvest), and shadowing removes a key from every source at
+    // the same moment its count arrives in the ledger.
+    std::vector<NNCacheHitCount> rows = levelZero_.harvest();
     const std::vector<NNCacheHitCount> levelOneRows = ledger_.harvest();
     rows.insert(rows.end(), levelOneRows.begin(), levelOneRows.end());
     return NNCacheHitLedger::counted(std::move(rows), ledger_.unrecordedHits());
@@ -235,7 +449,7 @@ class NNCacheTableTwoLevel final : public NNCacheTable {
   }
 
  private:
-  std::unique_ptr<NNCacheFrozen> levelZero_;
+  NNCacheLevelZeroSources levelZero_;
   std::unique_ptr<NNCacheTable> levelOne_;
   mutable HitLedger ledger_;
 };
@@ -249,7 +463,7 @@ size_t twoLevelHitLedgerBytes(int hitLedgerPowerOfTwo) {
   return (((size_t)1) << hitLedgerPowerOfTwo) * (sizeof(Hash128) + sizeof(uint32_t) + sizeof(uint32_t));
 }
 
-std::unique_ptr<NNCacheTable> makeTwoLevelNNCacheTable(
+std::unique_ptr<NNCacheTwoLevelTable> makeTwoLevelNNCacheTable(
   std::unique_ptr<NNCacheFrozen> levelZero,
   std::unique_ptr<NNCacheTable> levelOne,
   int hitLedgerPowerOfTwo
@@ -271,7 +485,7 @@ std::unique_ptr<NNCacheTable> makeTwoLevelNNCacheTable(
   // The ledger's mutex pool: enough to keep concurrent level-1 hits off one lock, never
   // more mutexes than rows.
   const int mutexPow = hitLedgerPowerOfTwo < 10 ? hitLedgerPowerOfTwo : 10;
-  return std::unique_ptr<NNCacheTable>(
+  return std::unique_ptr<NNCacheTwoLevelTable>(
     new NNCacheTableTwoLevel(std::move(levelZero), std::move(levelOne), hitLedgerPowerOfTwo, mutexPow)
   );
 }

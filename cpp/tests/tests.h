@@ -159,6 +159,9 @@ namespace Tests {
   //testnncachelevelzero.cpp
   void runNNCacheLevelZeroTests();
 
+  //testnncachetwolevel.cpp
+  void runNNCacheTwoLevelTests();
+
   //testnncachecontext.cpp
   void runNNCacheContextTests();
 
@@ -174,6 +177,9 @@ namespace Tests {
   // Not part of runtests: it is a measurement, not an assertion. Reached by the
   // runnncachebench subcommand.
   void runNNCacheBench();
+  // Not part of runtests: it is a measurement, not an assertion. Reached by the
+  // runnncachetwolevelbench subcommand.
+  void runNNCacheTwoLevelBench();
 }
 
 namespace TestCommon {

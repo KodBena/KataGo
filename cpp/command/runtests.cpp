@@ -66,6 +66,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runNNCacheCountLogTests();
   Tests::runNNEvalContainerTests();
   Tests::runNNCacheLevelZeroTests();
+  Tests::runNNCacheTwoLevelTests();
   Tests::runNNCacheContextTests();
   Tests::runAnalysisModelNameSpaceTests();
 
@@ -99,6 +100,18 @@ int MainCmds::runnncachefrozenbench(const vector<string>& args) {
   Board::initHash();
   ScoreValue::initTables();
   Tests::runNNCacheFrozenBench();
+  ScoreValue::freeTables();
+  return 0;
+}
+
+// What the ordered resolution list costs the level-0 miss path, paired in one process
+// against the single-source shape it replaced. A measurement, so it is not part of
+// runtests, for the same reason the two above are not.
+int MainCmds::runnncachetwolevelbench(const vector<string>& args) {
+  (void)args;
+  Board::initHash();
+  ScoreValue::initTables();
+  Tests::runNNCacheTwoLevelBench();
   ScoreValue::freeTables();
   return 0;
 }
