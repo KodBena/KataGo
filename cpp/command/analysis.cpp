@@ -14,6 +14,8 @@
 #include "../core/test.h"
 #include "../main.h"
 
+#include <optional>
+
 #include "../external/nlohmann_json/json.hpp"
 
 using namespace std;
@@ -393,19 +395,29 @@ int MainCmds::analysis(const vector<string>& args) {
       logger.write("Warning: " + ret.dump());
   };
 
-  //Report analysis for which we don't actually have results. This is used when something is user-terminated before being actually
-  //analyzed properly. Only used outside of search too
-  auto reportNoAnalysis = [&pushToWrite](const AnalyzeRequest* request) {
+  //RENDERING a request's response and EMITTING it are separate acts, and every FINAL response goes
+  //through the render half first. The reason is ordering, not tidiness: a request must be gone from
+  //openRequests BEFORE its final response reaches the write queue. The write queue is FIFO and one
+  //thread drains it, so a response the client has read is a response that was pushed; if the erase
+  //happened before the push, it happened before anything the client could observe of this request.
+  //A client that waits for its query's answer and then sends cache_attach or cache_detach therefore
+  //reads an open-request count that no longer counts the query it just watched finish. Emitting
+  //first and erasing after -- which is what this code used to do -- leaves exactly that window open,
+  //and the refusal those two actions make on a nonzero count fires inside it. Splitting render from
+  //emit is what lets the erase sit between the two.
+
+  //The response for a request we don't actually have results for. This is used when something is
+  //user-terminated before being actually analyzed properly. Only used outside of search too.
+  auto renderNoAnalysis = [](const AnalyzeRequest* request) -> string {
     json ret;
     ret["id"] = request->id;
     ret["turnNumber"] = request->turnNumber;
     ret["isDuringSearch"] = false;
     ret["noResults"] = true;
-    pushToWrite(new string(ret.dump()));
+    return ret.dump();
   };
-
-  //Returns false if no analysis was reportable due to there being no root node or search results.
-  auto reportAnalysis = [&preventEncore,&pushToWrite](const AnalyzeRequest* request, const Search* search, bool isDuringSearch) {
+  //Returns nothing if no analysis was reportable due to there being no root node or search results.
+  auto renderAnalysis = [&preventEncore](const AnalyzeRequest* request, const Search* search, bool isDuringSearch) -> std::optional<string> {
     json ret;
     ret["id"] = request->id;
     ret["turnNumber"] = request->turnNumber;
@@ -421,9 +433,18 @@ int MainCmds::analysis(const vector<string>& args) {
       ret
     );
 
-    if(success)
-      pushToWrite(new string(ret.dump()));
-    return success;
+    if(!success)
+      return std::nullopt;
+    return ret.dump();
+  };
+  //Returns false if no analysis was reportable. The ONLY emit-where-you-render caller left is the
+  //during-search report, which needs no ordering against the erase: the request genuinely IS open
+  //while a during-search report is written, so a count of 1 read after one is exactly truthful.
+  auto reportAnalysis = [&pushToWrite,&renderAnalysis](const AnalyzeRequest* request, const Search* search, bool isDuringSearch) {
+    std::optional<string> rendered = renderAnalysis(request,search,isDuringSearch);
+    if(rendered.has_value())
+      pushToWrite(new string(std::move(rendered.value())));
+    return rendered.has_value();
   };
 
   // Common eval cache for all analysis threads
@@ -438,7 +459,7 @@ int MainCmds::analysis(const vector<string>& args) {
   //under a live search. The thread runs one of its bots at a time, so hosting N models multiplies
   //the idle bots, not the concurrent searches: the thread budget is unchanged.
   auto analysisLoop = [
-    &logger,&toAnalyzeQueue,&reportAnalysis,&reportNoAnalysis,&logSearchInfo,&modelHosts,&openRequestsMutex,&openRequests
+    &logger,&toAnalyzeQueue,&pushToWrite,&reportAnalysis,&renderAnalysis,&renderNoAnalysis,&logSearchInfo,&modelHosts,&openRequestsMutex,&openRequests
   ](BotsByModel* botsByModel, int threadIdx) {
     while(true) {
       std::pair<std::pair<int64_t,int64_t>,AnalyzeRequest*> analysisItem;
@@ -446,6 +467,9 @@ int MainCmds::analysis(const vector<string>& args) {
       if(!suc)
         break;
       AnalyzeRequest* request = analysisItem.second;
+      //Rendered below, emitted after the erase further down. Stays empty on the path where the
+      //request was already terminated in the queue -- the terminate wrote its response then.
+      std::optional<string> finalResponse;
       //The model was resolved when the request was parsed; this is where that resolution is spent.
       AsyncBot* bot = botsByModel->at(request->modelIdx);
       int expected = AnalyzeRequest::STATUS_IN_QUEUE;
@@ -501,13 +525,13 @@ int MainCmds::analysis(const vector<string>& args) {
         {
           const bool isDuringSearch = false;
           const Search* search = bot->getSearch();
-          bool analysisWritten = reportAnalysis(request,search,isDuringSearch);
+          finalResponse = renderAnalysis(request,search,isDuringSearch);
           //If the search didn't have any root or root neural net output, it must have been interrupted and we must be quitting imminently
-          if(!analysisWritten) {
+          if(!finalResponse.has_value()) {
             //If the reason we stopped was because we noticed a terminate, then we will write out a dummy response even if we didn't have
             //enough info to generate a real one, to fulfill a promise in the API docs that we always write something.
             if(request->status.load(std::memory_order_acquire) == AnalyzeRequest::STATUS_TERMINATED)
-              reportNoAnalysis(request);
+              finalResponse = renderNoAnalysis(request);
             //Otherwise, this case is only possible if we're just shutting down
             else
               logger.write("Note: Search quitting due to no visits - this is normal and possible when shutting down but a bug under any other situation.");
@@ -518,11 +542,21 @@ int MainCmds::analysis(const vector<string>& args) {
       //Free up bot resources in case it's a while before we do more search
       bot->clearSearch();
 
-      //This request is no longer open
+      //This request is no longer open, and the erase says so BEFORE the response is queued for
+      //output. That order is the whole point (see renderAnalysis above): a client that has read
+      //this response can send a cache action and be certain this request is not in the count that
+      //action reads.
+      //It is also safe to erase only here and not earlier: every cache lookup and store a request
+      //makes happens inside NNEvaluator::evaluate on a search thread, and genMoveSynchronous* has
+      //already waited for every one of those threads to finish. So the entry's removal strictly
+      //follows the last time this request could touch the list an attach or detach rewrites --
+      //which is why the count can be transiently too HIGH but never too low.
       {
         std::lock_guard<std::mutex> lock(openRequestsMutex);
         openRequests.erase(request->internalId);
       }
+      if(finalResponse.has_value())
+        pushToWrite(new string(std::move(finalResponse.value())));
       delete request;
     }
   };
@@ -552,7 +586,12 @@ int MainCmds::analysis(const vector<string>& args) {
     cerr << "Started, ready to begin handling requests" << endl;
   }
 
-  auto terminateRequest = [&bots,&reportNoAnalysis](AnalyzeRequest* request) {
+  //Returns this request's final response if terminating it is what closed the request out -- that
+  //is, if no analysis thread had claimed it, so none will ever write one. The CALLER emits that
+  //response, and only after erasing the request from openRequests, for the same reason the analysis
+  //loop does: a response the client can see must not name a request the engine still counts as open.
+  //Returns nothing when some analysis thread owns the response instead.
+  auto terminateRequest = [&bots,&renderNoAnalysis](AnalyzeRequest* request) -> std::optional<string> {
     //Firstly, flag the request as terminated
     int prevStatus = request->status.exchange(AnalyzeRequest::STATUS_TERMINATED,std::memory_order_acq_rel);
     //Already terminated? Nothing to do.
@@ -560,7 +599,7 @@ int MainCmds::analysis(const vector<string>& args) {
     {}
     //No thread claimed it, so it's up to us to write the result
     else if(prevStatus == AnalyzeRequest::STATUS_IN_QUEUE) {
-      reportNoAnalysis(request);
+      return renderNoAnalysis(request);
     }
     //A thread popped it. That thread will notice that it's terminated once it tries to put its thread idx in, so we need not do anything.
     else if(prevStatus == AnalyzeRequest::STATUS_POPPED)
@@ -575,6 +614,33 @@ int MainCmds::analysis(const vector<string>& args) {
       //that is the one bot of that thread's pool the request can be running on.
       bots[threadIdx].at(request->modelIdx)->stopWithoutWait();
     }
+    return std::nullopt;
+  };
+
+  //Terminates each of the given requests and returns the responses the CALLER must emit, in order,
+  //once it has released openRequestsMutex.
+  //MUST BE CALLED WITH openRequestsMutex HELD, and the returned responses MUST NOT be emitted until
+  //it is released. Two obligations, one reason each:
+  // - held, because a request this call closes is erased from openRequests here, and that erase has
+  //   to be in the same critical section that found it;
+  // - rendered before release, because the moment the lock is dropped, the analysis thread that
+  //   pops a terminated request is free to erase and DELETE it, so the request is no longer there
+  //   to read from. The responses leave here as strings, already rendered, for exactly that reason.
+  //A request closed here will never be searched -- the analysis thread that pops it sees
+  //STATUS_TERMINATED and skips straight past the search -- so it touches no cache from this point
+  //on, and dropping it from the open count is truthful rather than merely convenient. Dropping it
+  //is also required: its response is about to be emitted, and a client that reads a response for a
+  //request the engine still counts as open is the very thing this ordering exists to prevent.
+  auto closeTerminated = [&terminateRequest,&openRequests](const vector<AnalyzeRequest*>& requests) -> vector<string> {
+    vector<string> closedResponses;
+    for(AnalyzeRequest* request: requests) {
+      std::optional<string> response = terminateRequest(request);
+      if(response.has_value()) {
+        openRequests.erase(request->internalId);
+        closedResponses.push_back(std::move(response.value()));
+      }
+    }
+    return closedResponses;
   };
 
   auto requestLoop = [&]() {
@@ -706,15 +772,21 @@ int MainCmds::analysis(const vector<string>& args) {
             }
           }
 
+          vector<string> closedResponses;
           {
             std::lock_guard<std::mutex> lock(openRequestsMutex);
             std::set<int> turnNumbersSet(turnNumbers.begin(),turnNumbers.end());
+            //Matched first, then terminated, because closing one erases it from the map being walked.
+            vector<AnalyzeRequest*> matched;
             for(auto it = openRequests.begin(); it != openRequests.end(); ++it) {
               AnalyzeRequest* request = it->second;
               if(request->id == terminateId && (!hasTurnNumbers || (turnNumbersSet.find(request->turnNumber) != turnNumbersSet.end())))
-                terminateRequest(request);
+                matched.push_back(request);
             }
+            closedResponses = closeTerminated(matched);
           }
+          for(string& response: closedResponses)
+            pushToWrite(new string(std::move(response)));
           pushToWrite(new string(input.dump()));
         }
         else if(action == "terminate_all") {
@@ -731,15 +803,21 @@ int MainCmds::analysis(const vector<string>& args) {
             }
           }
 
+          vector<string> closedResponses;
           {
             std::lock_guard<std::mutex> lock(openRequestsMutex);
             std::set<int> turnNumbersSet(turnNumbers.begin(),turnNumbers.end());
+            //Matched first, then terminated, because closing one erases it from the map being walked.
+            vector<AnalyzeRequest*> matched;
             for(auto it = openRequests.begin(); it != openRequests.end(); ++it) {
               AnalyzeRequest* request = it->second;
               if(!hasTurnNumbers || (turnNumbersSet.find(request->turnNumber) != turnNumbersSet.end()))
-                terminateRequest(request);
+                matched.push_back(request);
             }
+            closedResponses = closeTerminated(matched);
           }
+          for(string& response: closedResponses)
+            pushToWrite(new string(std::move(response)));
           pushToWrite(new string(input.dump()));
         }
         else if(isCacheAction) {
