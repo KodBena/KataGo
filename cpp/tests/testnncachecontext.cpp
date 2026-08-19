@@ -399,6 +399,73 @@ void testASingleLevelTablesPerContextDumpIsNotCountedRatherThanEmpty() {
   testAssert(perContext.disposition() == NNCacheHitLedgerDisposition::NotCounted);
 }
 
+// THE RELATION THE DEFAULT SIZE CLAIMS, ASSERTED RATHER THAN TRUSTED FROM A COMMENT.
+//
+// The previous version of this code carried a comment justifying its constant by a corpus
+// ceiling the constant did not actually cover -- 2^18 rows against a stated 291,129-key
+// reference -- and a per-row byte figure that was not the row type's real size. Prose is
+// where that drift lived, so the check is here rather than in more prose (ADR-0011 Rule 2):
+// the constant, the reference scale and the load-factor bar are three accessors, and this
+// test asserts the relation between them. A future edit to any one of the three that breaks
+// it fails the suite instead of leaving a comment that lies.
+void testTheDefaultRecorderSizeCoversTheScaleItsRationaleNames() {
+  const int pow = NNCacheAttributionRecorder::defaultPowerOfTwo();
+  const int64_t rows = ((int64_t)1) << pow;
+  const int64_t reference = NNCacheAttributionRecorder::sizingReferenceKeys();
+  const int loadPercent = NNCacheAttributionRecorder::maxLoadFactorPercent();
+
+  // The reference scale must fit under the load factor the bounded probe window is held to --
+  // NOT merely under the row count, which is the test the old comment was implicitly making.
+  testAssert(rows * loadPercent / 100 >= reference);
+  // And the next size down must NOT satisfy it, so the constant is the smallest that does
+  // rather than a round number that happens to be large enough. This is what makes the
+  // rationale load-bearing instead of decorative.
+  testAssert((rows / 2) * loadPercent / 100 < reference);
+
+  cout << "attribution recorder: " << attributionRecorderBytes(pow) << " B at 2^" << pow
+       << " rows of " << NNCacheAttributionRecorder::rowBytes() << " B, "
+       << (100.0 * (double)reference / (double)rows) << "% occupancy at the "
+       << reference << "-key reference scale" << endl;
+}
+
+// THE OVERFLOW COUNTER, EXERCISED. Everything else in this file asserts it is zero, which
+// witnesses that ordinary work does not overflow but never witnesses that the counter can
+// move -- a green that would stay green with the counter wired to a constant. A recorder of
+// one row cannot hold two keys, so the second earning has nowhere to go: it is counted, and
+// it does NOT displace the row already there, which is the half that matters (a recorder that
+// overwrote somebody else's row would report a clean harvest and a wrong context).
+void testAnAttributionThatCannotBeGivenARowIsCountedAndDisplacesNothing() {
+  NNCacheContextSet contexts;
+  const NNCacheContextId card = contexts.attach("card-5455");
+
+  // One row, one mutex: the probe window wraps onto the same row every time.
+  NNCacheAttributionRecorder tiny(0, 0);
+  testAssert(tiny.unrecordedAttributions() == 0);
+
+  tiny.record(nthKey(41), NNCacheAttribution::toContext(card));
+  testAssert(tiny.unrecordedAttributions() == 0);
+  testAssert(tiny.harvest(contexts).size() == 1);
+
+  // Re-recording the SAME key is not an overflow: it finds its own row and wins there.
+  tiny.record(nthKey(41), NNCacheAttribution::toContext(card));
+  testAssert(tiny.unrecordedAttributions() == 0);
+  testAssert(tiny.harvest(contexts).size() == 1);
+
+  // A second, different key has nowhere to go.
+  tiny.record(nthKey(42), NNCacheAttribution::toContext(card));
+  testAssert(tiny.unrecordedAttributions() == 1);
+  const vector<NNCacheAttributionRow> rows = tiny.harvest(contexts);
+  testAssert(rows.size() == 1);
+  testAssert(rows[0].key == nthKey(41));
+  testAssert(tiny.keysFor(card).size() == 1);
+
+  // An unattributable entry never reaches a row at all, so it is never an overflow either --
+  // it lands in its own counter, whatever the recorder's occupancy.
+  tiny.record(nthKey(43), NNCacheAttribution::noAttributableContext());
+  testAssert(tiny.unrecordedAttributions() == 1);
+  testAssert(tiny.noAttributableContextEntries() == 1);
+}
+
 //-------------------------------------------------------------------------------------
 // Stage 4: the plumb, through a real evaluator and a real search
 //-------------------------------------------------------------------------------------
@@ -545,6 +612,8 @@ void Tests::runNNCacheContextTests() {
   testAnAttributionFromAnotherCacheCannotBeSpentHere();
   testACacheWithNoAttachedContextIsExactlyWhatItWasBefore();
   testASingleLevelTablesPerContextDumpIsNotCountedRatherThanEmpty();
+  testTheDefaultRecorderSizeCoversTheScaleItsRationaleNames();
+  testAnAttributionThatCannotBeGivenARowIsCountedAndDisplacesNothing();
   testTheRequestTagReachesTheEvaluatorsSetPathThroughASearch();
 
   cout << "Done" << endl;

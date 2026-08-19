@@ -271,10 +271,14 @@ class NNCacheAttributionRecorder::Impl {
     return out;
   }
 
+  // The row type's own size, exposed so the public rowBytes() reads it from the type rather
+  // than from a second copy of the arithmetic.
+  static size_t rowBytes() { return sizeof(Row); }
+
   int64_t noAttributableContextEntries() const { return noAttributable_.load(std::memory_order_relaxed); }
   int64_t unrecordedAttributions() const { return unrecorded_.load(std::memory_order_relaxed); }
   size_t structureBytes() const {
-    return rows_.size() * sizeof(Row) + ((size_t)mutexMask_ + 1) * sizeof(std::mutex);
+    return rows_.size() * rowBytes() + ((size_t)mutexMask_ + 1) * sizeof(std::mutex);
   }
 
  private:
@@ -294,8 +298,32 @@ class NNCacheAttributionRecorder::Impl {
   std::atomic<int64_t> unrecorded_;
 };
 
+// 2^20 rows. See the header for why this is a working size and not a bound, and for why the
+// load factor rather than the raw row count is what decides it: at sizingReferenceKeys() the
+// structure sits at 1048576 rows against 291129 keys, which is under maxLoadFactorPercent().
+// 2^19 would not be -- 524288 rows against 291129 keys is 55.5% occupancy, past the bar the
+// bounded probe window is held to. The relation is asserted in testnncachecontext.cpp rather
+// than left in this comment to be trusted.
 int NNCacheAttributionRecorder::defaultPowerOfTwo() {
-  return 18;
+  return 20;
+}
+
+// The largest per-card key count in the operator's corpus (cache-corpus-stats.wiki: 251 cards,
+// median 45664, p90 121796, max 291129, over the num_refs > 1 subset a level 0 is built from).
+int64_t NNCacheAttributionRecorder::sizingReferenceKeys() {
+  return 291129;
+}
+
+int NNCacheAttributionRecorder::maxLoadFactorPercent() {
+  return 50;
+}
+
+size_t NNCacheAttributionRecorder::rowBytes() {
+  return Impl::rowBytes();
+}
+
+size_t attributionRecorderBytes(int powerOfTwo) {
+  return (((size_t)1) << powerOfTwo) * NNCacheAttributionRecorder::rowBytes();
 }
 
 NNCacheAttributionRecorder::NNCacheAttributionRecorder(int powerOfTwo, int mutexPoolSizePowerOfTwo)

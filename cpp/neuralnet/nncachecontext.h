@@ -290,14 +290,53 @@ class NNCacheAttributionLedger {
 // no lock and no branch beyond a null test on its set path.
 class NNCacheAttributionRecorder {
  public:
-  // 2^18 rows, 24 bytes each: about 6.3 MB.
+  // The default size, as a power of two rows.
   //
-  // Denominated in the resource that actually runs out -- rows, one per distinct key a
-  // session EARNS -- and sized from the corpus rather than from a round number: the largest
-  // real card in the operator's corpus holds 291,129 keys, and a session cannot earn more
-  // new entries than that without having earned an entire largest-card's worth of positions
-  // it did not already have. Overflow past it is reported, not absorbed.
+  // THIS IS A WORKING SIZE, NOT A PROOF OF SUFFICIENCY, and saying so is the point. The
+  // quantity that fills this structure is the number of DISTINCT KEYS A SESSION EARNS, and no
+  // corpus figure bounds that: a long enough session evaluates arbitrarily many positions it
+  // did not already hold. What makes an unbounded quantity safe here is not the constant, it
+  // is that overflow past it is COUNTED and reported through unrecordedAttributions() rather
+  // than absorbed by overwriting somebody else's row. The constant only decides how far a
+  // real session gets before that counter has anything to say.
+  //
+  // The size is then derived from two facts, both of which are accessors below rather than
+  // arithmetic in this comment, and whose relation is asserted by the test suite rather than
+  // trusted from prose -- an earlier version of this comment named a ceiling the constant did
+  // not actually cover, and named a per-row byte figure that was not the real one:
+  //
+  //   sizingReferenceKeys()   -- the reference scale, the largest real card in the operator's
+  //                              corpus. A session that earned an entire largest-card's worth
+  //                              of positions it did not already have is the working ceiling
+  //                              this is sized for. It is a reference, not a bound.
+  //   maxLoadFactorPercent()  -- the occupancy this must stay under at that scale. This is the
+  //                              fact the earlier comment missed entirely, and it is why "rows
+  //                              at least as many as keys" is the WRONG test: rows are probed
+  //                              in a bounded window (see the class comment), so an insert
+  //                              fails once its window is full, which starts happening well
+  //                              before the table is. Roughly, an insert at occupancy a
+  //                              overflows with probability a^window; at half occupancy with a
+  //                              16-slot window that is about 1.5e-5, and at nine-tenths
+  //                              occupancy it is about 0.19.
+  //
+  // The resulting resident cost is attributionRecorderBytes(defaultPowerOfTwo()), which the
+  // test suite prints. It is the same order as the two-level table's own hit ledger at the
+  // same row count (twoLevelHitLedgerBytes, nncachefrozen.h), and unlike that one it is
+  // allocated only when a context is attached -- so only the deployment that asked for
+  // attribution pays for it.
   static int defaultPowerOfTwo();
+
+  // The corpus scale defaultPowerOfTwo() is sized against: the largest real card in the
+  // operator's corpus, 291,129 keys (audit-reports/cache-corpus-stats.wiki). One home for the
+  // figure, so the constant and its stated basis cannot drift apart silently again.
+  static int64_t sizingReferenceKeys();
+
+  // The occupancy defaultPowerOfTwo() keeps the structure under at sizingReferenceKeys(),
+  // given the bounded probe window. See defaultPowerOfTwo().
+  static int maxLoadFactorPercent();
+
+  // The exact per-row resident cost, read from the row type itself rather than re-typed here.
+  static size_t rowBytes();
 
   NNCacheAttributionRecorder(int powerOfTwo, int mutexPoolSizePowerOfTwo);
   ~NNCacheAttributionRecorder();
@@ -323,5 +362,11 @@ class NNCacheAttributionRecorder {
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// The exact resident cost of the row array a recorder of this size allocates, excluding its
+// mutex pool. Named here so the bound is stated in one place and can be asserted rather than
+// estimated (ADR-0012 P1) -- the same disposition twoLevelHitLedgerBytes has for the hit
+// ledger, adopted because the arithmetic written out in prose instead was wrong.
+size_t attributionRecorderBytes(int powerOfTwo);
 
 #endif  // NEURALNET_NNCACHECONTEXT_H_
