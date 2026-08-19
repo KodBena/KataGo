@@ -492,7 +492,20 @@ class NNCacheLevelZeroSwapPermit {
  private:
   NNCacheLevelZeroSwapPermit() = default;
 
-  friend class NNCacheTable;
+  // ONE MEMBER FUNCTION, NOT THE WHOLE CLASS. NNCacheTable has more than a dozen other methods
+  // and none of them has any business minting a permit; `friend class NNCacheTable` would have
+  // granted every one of them the right, which is wider than this design describes and wider than
+  // the least-privilege argument that rejected friending NNEvaluator wholesale. C++ lets a single
+  // static member be friended by its full signature, and the signature is nameable here --
+  // nncache.h is included above, and it forward-declares NNCacheTwoLevelTable at its own top --
+  // so the narrow form is the one that is used.
+  friend std::unique_ptr<NNCacheTwoLevelTable> NNCacheTable::createWithLevelZeroList(
+    const NNCacheConfig& config
+  );
+  // The other two mints are already at their narrowest: each is a class that exists for nothing
+  // but minting, and each grants onward by name -- AnalysisCacheSwapAuthority's permit() is
+  // private with cacheAttachExecute and cacheDetachExecute as its only friends, and
+  // NNCacheLevelZeroSwapTestSeam is the declared test seam and holds nothing else.
   friend class AnalysisCacheSwapAuthority;
   friend class NNCacheLevelZeroSwapTestSeam;
 };
