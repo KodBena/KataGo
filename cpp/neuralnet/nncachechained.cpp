@@ -148,6 +148,7 @@ class NNCacheTableChained final : public NNCacheTable {
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override;
   void set(const std::shared_ptr<NNOutput>& p) override;
   void clear() override;
+  bool contains(Hash128 nnHash) const override;
   NNCacheStats stats() const override;
 
   // The one definition of what an entry costs the budget. chainedEntryBytes() below
@@ -351,6 +352,23 @@ bool NNCacheTableChained::get(Hash128 nnHash, shared_ptr<NNOutput>& ret) {
       ret = n->ptr;
       return true;
     }
+  }
+  return false;
+}
+
+// THE SAME CHAIN WALK, WITHOUT onSighting. That one call is the whole difference and it is the
+// whole point: under lru it moves the node to the front of its region's recency list and under
+// lfu it raises the node's reference count, both of which are the correct record of a RETRIEVAL
+// and a false record of an ownership question -- and this shape is the one the design recommends
+// for a real session, so it is the one where a get-shaped probe at attach would do the most
+// damage. See NNCacheTable::contains.
+bool NNCacheTableChained::contains(Hash128 nnHash) const {
+  const uint64_t bucket = bucketOf(nnHash);
+  const uint32_t regionIdx = regionOf(bucket);
+  std::lock_guard<std::mutex> lock(mutexPool->getMutex(regionIdx));
+  for(const Node* n = buckets[bucket]; n != NULL; n = n->chainNext) {
+    if(n->hash == nnHash)
+      return true;
   }
   return false;
 }

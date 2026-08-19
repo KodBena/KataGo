@@ -231,6 +231,30 @@ class NNCacheTableProbed final : public NNCacheTable {
     delete mutexPool;
   }
 
+  // THE SAME PROBE WALK, WITHOUT Evict::onHit. That one call is the whole difference and it is
+  // the whole point: under lru or lfu it moves the slot in its region's eviction order, which is
+  // the correct record of a RETRIEVAL and a false record of an ownership question. See
+  // NNCacheTable::contains.
+  bool contains(Hash128 nnHash) const override {
+    const uint64_t home = nnHash.hash0 & tableMask;
+    const uint64_t region = home >> regionShift;
+    const uint64_t base = region << regionShift;
+    const uint64_t within = home & regionMask;
+    const uint32_t tag = tagOf(nnHash);
+
+    std::lock_guard<std::mutex> lock(mutexPool->getMutex((uint32_t)region));
+    for(int j = 0; j < ways; j++) {
+      const Slot& s = slots[base + ((within + Probe::offset(j)) & regionMask)];
+      if constexpr(UseTag) {
+        if(s.tag != tag)
+          continue;
+      }
+      if(s.ptr != nullptr && s.ptr->nnHash == nnHash)
+        return true;
+    }
+    return false;
+  }
+
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
     // Free ret BEFORE locking, to avoid any expensive operations while locked.
     if(ret != nullptr)

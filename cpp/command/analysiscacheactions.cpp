@@ -367,10 +367,7 @@ CacheActionDecode<CacheStatsRequest> decodeCacheStats(const json& request) {
 
 AnalysisCacheAttachments::AnalysisCacheAttachments(size_t numSearchableModels)
   :perModel(numSearchableModels)
-{
-  for(size_t i = 0; i < perModel.size(); i++)
-    perModel[i].requestsAcceptedAtLastCountsDump = 0;
-}
+{}
 
 AnalysisCacheAttachments::PerModel& AnalysisCacheAttachments::at(SearchableModelIdx modelIdx) {
   testAssert(modelIdx.value() < perModel.size());
@@ -437,16 +434,6 @@ void AnalysisCacheAttachments::recordAttach(SearchableModelIdx modelIdx, CacheAt
 
 void AnalysisCacheAttachments::recordDetach(SearchableModelIdx modelIdx, const string& context) {
   at(modelIdx).attached.erase(context);
-}
-
-void AnalysisCacheAttachments::noteCountsDumped(SearchableModelIdx modelIdx, int64_t requestsAcceptedSoFar) {
-  at(modelIdx).requestsAcceptedAtLastCountsDump = requestsAcceptedSoFar;
-}
-
-bool AnalysisCacheAttachments::anyRequestAcceptedSinceCountsDump(
-  SearchableModelIdx modelIdx, int64_t requestsAcceptedSoFar
-) const {
-  return requestsAcceptedSoFar > at(modelIdx).requestsAcceptedAtLastCountsDump;
 }
 
 //-------------------------------------------------------------------------------------
@@ -549,6 +536,11 @@ json sourceToJson(const CacheAttachedSource& source) {
   out["entriesLeftOver"] = source.entriesLeftOver;
   out["payloadBytes"] = source.arenaTotalBytes;
   out["structureBytes"] = source.structureBytes;
+  // What the attach's reconcile against level 1 found and moved. Zero on an ordinary first
+  // attach; nonzero says this session had already superseded that much of the card, and those
+  // entries are resident memory no lookup will reach while this attachment stands.
+  out["entriesLevelOneAlreadyOwned"] = source.entriesLevelOneAlreadyOwned;
+  out["hitsTransferredToLevelOne"] = source.hitsTransferredToLevelOne;
   return out;
 }
 
@@ -610,11 +602,18 @@ json cacheAttachExecute(
       };
       NNCacheLevelZeroLoad load = nnCacheLoadLevelZero(loadRequest);
       const int64_t structureBytes = load.report.levelZeroStructureBytes;
-      const NNCacheLevelZeroSourceId sourceId = eval.attachLevelZeroSource(std::move(load.levelZero));
+      // ATTACHED ON BEHALF OF THIS CONTEXT, including a foreign model's source: it was read for
+      // this card, it serves this card's positions, and it is this card's file its retrievals
+      // are dumped into. The attach reconciles it against level 1 on the way in and reports what
+      // that cost the source, which is a figure a client re-attaching a card it has been
+      // evaluating against needs to see rather than infer.
+      const NNCacheLevelZeroAttachment attachment =
+        eval.attachLevelZeroSource(std::move(load.levelZero), contextId);
       record.sources.push_back(
         CacheAttachedSource{
           sourceEval.getInternalModelName(), load.report.entriesInLevelZero, load.report.entriesLeftOver,
-          load.report.arenaTotalBytes, structureBytes, sourceId
+          load.report.arenaTotalBytes, structureBytes, attachment.entriesLevelOneAlreadyOwned,
+          attachment.hitsTransferredToLevelOne, attachment.id
         }
       );
       totalMilliseconds += load.report.totalMilliseconds;
@@ -716,8 +715,7 @@ json cacheDetachExecute(
   const AnalysisModelHosts& hosts,
   SearchableModelIdx modelIdx,
   AnalysisCacheAttachments& attachments,
-  const CacheDetachRequest& request,
-  const AnalysisEngineCounters& counters
+  const CacheDetachRequest& request
 ) {
   NNEvaluator& eval = *hosts.searchableEval(modelIdx);
   (void)cacheDirectoryOrThrow(eval);
@@ -728,22 +726,25 @@ json cacheDetachExecute(
   // verb that writes. So the refusal wins, and the client that means to throw a session away
   // says so in the request, where the decision is visible in the log (ADR-0002).
   //
-  // THE TWO CHECKS ARE NOT INDEPENDENTLY SOUND AND ARE NOT CLAIMED TO BE. The evaluations half
-  // is exact: unpersistedKeysFor is the recorded truth about which of this context's earned keys
-  // are not on disk. The counts half is a PROXY, and its gap is stated in full at
-  // AnalysisCacheAttachments::anyRequestAcceptedSinceCountsDump -- read it before relying on
-  // this refusal for counts. What has held under every adversarial workload built so far is the
-  // OR of the two, not either alone.
+  // BOTH CHECKS ARE NOW EXACT, AND THE SECOND ONE USED NOT TO BE. The evaluations half has always
+  // been: unpersistedKeysFor is the recorded truth about which of this context's earned keys are
+  // not on disk. The counts half was a PROXY -- whether the engine had accepted any request since
+  // this model last dumped counts -- because no surface could answer "are there unpersisted
+  // counts" without CONSUMING them, and consuming is what makes a delta safe to append. The proxy
+  // under-refused, and its gap was not exotic: a retrieval served entirely out of level 0 calls no
+  // set(), so it earns no key for the first check, and a request already accepted before the last
+  // dump raises no new acceptance for the second -- which is exactly the mature, fully pre-warmed
+  // card this feature exists for. It is replaced, not re-argued, by the non-consuming query
+  // NNCacheTable::hasUnpersistedHitCountsFor, which reads the same counters against the same marks
+  // the per-context take reads and moves none of them.
   const int64_t undumpedEntries = (int64_t)eval.cacheTable().unpersistedKeysFor(record.contextId).size();
-  const bool maybeUndumpedCounts =
-    attachments.anyRequestAcceptedSinceCountsDump(modelIdx, counters.requestsAcceptedSoFar);
-  if(!request.discardUndumped && (undumpedEntries > 0 || maybeUndumpedCounts))
+  const bool undumpedCounts = eval.cacheTable().hasUnpersistedHitCountsFor(record.contextId);
+  if(!request.discardUndumped && (undumpedEntries > 0 || undumpedCounts))
     throw StringError(
       "Refusing to detach context \"" + request.context + "\" from model \"" + eval.getInternalModelName() +
       "\": it holds " + Global::int64ToString(undumpedEntries) + " earned entries that are not on disk" +
-      (maybeUndumpedCounts
-         ? ", and requests have been served since its counts were last dumped, so it may hold "
-           "retrieval counts that are not on disk either"
+      (undumpedCounts
+         ? ", and it holds retrieval counts that have not been dumped either"
          : "") +
       ". Send cache_dump first, or send this detach again with \"discardUndumped\":true to throw that "
       "work away deliberately."
@@ -799,34 +800,21 @@ json cacheDumpExecute(
   out["openRequestsAtDump"] = counters.openRequestCount;
 
   if(wantsCounts) {
-    // THE ONE CASE THIS VERSION REFUSES, and it is a limit of the surface underneath rather
-    // than a policy. The counts a dump may append are the table's UNPERSISTED DELTA, and the
-    // delta surface is whole-table: there is no per-context delta. With one context attached
-    // that is exact, because everything the table earned belongs to that context. With two,
-    // writing the whole table's delta into one context's file would file the other context's
-    // retrievals under this card, and no field of the response would say so. So it is refused
-    // by name, and the evaluations leg -- which IS per context -- still works.
-    const vector<string> attached = attachments.attachedContexts(modelIdx);
-    if(attached.size() > 1) {
-      string message =
-        "Refusing to dump COUNTS for context \"" + request.context + "\" while " +
-        Global::int64ToString((int64_t)attached.size()) + " contexts are attached to model \"" +
-        eval.getInternalModelName() + "\" (";
-      for(size_t i = 0; i < attached.size(); i++)
-        message += (i == 0 ? "" : ", ") + attached[i];
-      throw StringError(
-        message +
-        "). A dump appends the retrievals that have not reached the log yet, and that figure is kept "
-        "per TABLE, not per context -- so with more than one context attached it cannot be divided "
-        "between them, and writing it whole into one context's file would file another context's "
-        "retrievals under this one. Detach the others first, or dump \"evaluations\" only, which is "
-        "per context and unaffected."
-      );
-    }
-
-    const NNCacheCountLogAppendResult appended = log.appendDump(NNCacheHitCountDelta::take(eval.cacheTable()));
+    // PER CONTEXT, WHICH IS WHAT MAKES A SEVERAL-CARDS-AT-ONCE SESSION DUMPABLE AT ALL. The
+    // counts a dump may append are the UNPERSISTED DELTA -- a count log record is an increment,
+    // so a running total appended twice is a record that inflates -- and until the table could
+    // divide that delta by context this action refused outright whenever more than one context
+    // was attached, because writing the whole table's delta into one card's file would file the
+    // other card's retrievals under it and no response field would say so.
+    //
+    // The division is not made here and could not be: a delta row carries a key, and a key names
+    // a position, never a card. It is made where the two facts live -- which level-0 source
+    // serves which context, and which context earned which level-1 key -- which is inside the
+    // table (NNCacheTable::takeUnpersistedHitCountsFor). This call spends the result, and the
+    // marks that advance are exactly those of the rows it is about to write.
+    const NNCacheCountLogAppendResult appended =
+      log.appendDump(NNCacheHitCountDelta::takeFor(eval.cacheTable(), record.contextId));
     const bool compacted = log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple());
-    attachments.noteCountsDumped(modelIdx, counters.requestsAcceptedSoFar);
     json counts;
     counts["bytesAppended"] = appended.bytesAppended;
     counts["tornTailBytesDiscarded"] = appended.tornTailBytesDiscarded;

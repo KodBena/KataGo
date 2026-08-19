@@ -551,7 +551,14 @@ The response echoes the query and adds:
      the evaluations themselves, and the lookup structure over them. Both are returned by `cache_detach`.
    * `levelOneFilled (integer)`, `levelOneFilledBytes (integer)`: what the `level1Fill` admitted.
    * `sources (array of object)`: one entry per attached file, in the order they will be consulted, each
-     with `model`, `entriesInLevelZero`, `entriesLeftOver`, `payloadBytes`, `structureBytes`.
+     with `model`, `entriesInLevelZero`, `entriesLeftOver`, `payloadBytes`, `structureBytes`,
+     `entriesLevelOneAlreadyOwned` and `hitsTransferredToLevelOne`. The last two are what reconciling
+     this file against the live cache did: an attach **shadows every arriving position the live cache
+     already owns**, so a card re-attached after this session has already re-evaluated part of it cannot
+     serve the superseded evaluation, and the retrievals those shadowed entries had accrued are handed to
+     the counter that takes over rather than dropped. Both are `0` on an ordinary first attach; a large
+     `entriesLevelOneAlreadyOwned` says how much of the file you just loaded is resident memory no lookup
+     will reach while this attachment stands.
    * `containerTail`, `countLogTail (string)`: `"intact"`, or `"truncated"` if a previous run was killed
      mid-write. With `containerDiscardedTailBytes` / `countLogDiscardedTailBytes`, the bytes after the
      last complete block. Truncation is not an error - the intact prefix is what a crash left you, and is
@@ -599,29 +606,24 @@ silently dumping it would make `cache_dump` no longer the only action that write
 `cache_dump` first, or send the detach again with `"discardUndumped":true`, where the decision is visible
 in your own log.
 
-The refusal fires on either of two conditions, and the difference between them matters if you are
-relying on it:
+The refusal fires on either of two conditions, and both are exact:
 
-  * **Undumped evaluations** - positions this context earned whose bytes are not in its file. This is
-    exact: the engine records, per position, whether its bytes reached disk.
-  * **Possibly undumped retrieval counts** - the engine has accepted an analysis request since this
-    model's last `cache_dump` of counts. This one is a **proxy, and a known-imperfect one**. Retrieval
-    counts cannot be inspected without consuming them, so the engine cannot ask "are there any"; it asks
-    "could there be", by watching whether a request was *accepted* since the last counts dump. Requests
-    are counted when they are accepted, not when they finish, and a counts dump is legal while requests
-    are open - so a request accepted **before** a dump and still running **after** it keeps earning
-    retrievals the dump did not write, and arms nothing. The proxy is also coarse in the safe direction:
-    a request served by a *different* hosted model arms it, and so does a request that hit nothing.
+  * **Undumped evaluations** - positions this context earned whose bytes are not in its file. The
+    engine records, per position, whether its bytes reached disk.
+  * **Undumped retrieval counts** - retrievals this context has served, by either level, that no
+    `cache_dump` has written. The engine asks this **without consuming them**: the query reads the same
+    counters against the same marks that a dump would advance, and moves none of them.
 
-**What that means for you.** In every workload anyone has managed to construct, a request long enough to
-still be running across a dump also evaluated positions that were not already on disk - so the exact
-evaluations check fired and the detach was refused. The two conditions together have held; the counts
-proxy alone has not been shown to. The shape where it would matter is a fully pre-warmed context
-re-studied with no new positions at all, where the evaluations check legitimately stays at zero. **If
-your client works that way - a mature card it only ever reviews - dump counts explicitly before you
-detach rather than relying on the refusal to remind you.** A dump with nothing to write costs nothing.
-The real fix is a non-consuming "are there unpersisted counts" query inside the cache, which is filed
-work and not yet built.
+**What changed here, if you read the previous version of this section.** The counts condition used to be
+a proxy - whether the engine had *accepted* an analysis request since this model's last counts dump - and
+it was documented as over-refusing and never under-refusing. That was wrong. Requests are counted when
+they are accepted, not when they finish; a counts dump is legal while requests are open; and, more
+simply, a position served out of pre-warmed level-0 content never enters the engine's set path at all, so
+it earns no position for the evaluations condition either. **A fully pre-warmed card, re-studied with no
+new positions - the mature card this feature exists for - could therefore be detached with every one of
+its retrievals unwritten, silently.** It is no longer a proxy: the refusal now reads the retrieval counts
+themselves. You no longer need to dump counts defensively before detaching a card you only reviewed; the
+refusal will tell you.
 
 The response echoes the query and adds:
 
@@ -685,12 +687,19 @@ A dump is legal while analysis requests are open - everything it reads is thread
 path - but the intended posture is to dump at rest, so `openRequestsAtDump` reports how many were open,
 and a client that dumped live can see that it did.
 
-**One limit worth knowing before you design around it.** Dumping `counts` is refused while more than one
-context is attached to the model, naming the attached contexts. Retrieval counts are kept per cache
-table, not per context, so with several attached they cannot be divided between them, and writing them
-whole into one context's file would file another context's retrievals under this one. Dumping
-`evaluations` is per context and is unaffected. If you work several contexts at once and want counts,
-dump and detach them one at a time.
+**What a counts dump does not write.** Retrievals of a position that no context could be attributed
+to - one first computed while several contexts were attached and the request carried no
+`cacheContext` - belong to no card's file and are written by none of them. That is the same
+population the response's `noAttributableContextEntries` counts, so it is a number you can watch
+rather than a silence. Tag your queries with `cacheContext` when more than one context is attached
+and it stays at zero.
+
+**Counts are per context, so several cards can be attached at once.** A dump writes exactly the
+retrievals of the context you named - served by its own pre-warmed level 0 or by positions it earned -
+and advances only those marks, so dumping one attached card leaves every other card's counts whole for
+its own dump. An earlier version of this engine refused `counts` outright whenever more than one context
+was attached, because the retrieval counts it could reach were kept per cache table and could not be
+divided; they are now divided where the facts live, and the refusal is gone.
 
 #### cache_stats
 

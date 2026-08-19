@@ -147,6 +147,15 @@ class NNCacheHitCountDelta {
   // property that makes the result appendable.
   [[nodiscard]] static NNCacheHitCountDelta take(NNCacheTable& table);
 
+  // Takes the counts of exactly `context` that have not reached a count log yet, advancing the
+  // marks of the rows it hands over AND OF NO OTHERS. Consuming, exactly as take() is, and it is
+  // what makes several attached cards dumpable in one session: with two contexts attached, the
+  // whole-table delta cannot be divided by any caller, because a row carries a key and a key
+  // names a position, never a card (NNCacheTable::takeUnpersistedHitCountsFor).
+  //
+  // Throws StringError for a context the table did not attach.
+  [[nodiscard]] static NNCacheHitCountDelta takeFor(NNCacheTable& table, const NNCacheContextId& context);
+
   // A delta the caller already holds as rows. `unrecordedHits` is the honesty residue --
   // retrievals that happened and could not be given a row -- carried whole, exactly as
   // NNCacheHitLedger carries it.

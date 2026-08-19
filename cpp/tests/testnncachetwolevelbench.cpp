@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "../core/timer.h"
@@ -96,6 +97,11 @@ unique_ptr<NNOutput> outputFor(Hash128 hash) {
   return p;
 }
 
+// THE LARGEST REAL CARD IN THE OPERATOR'S CORPUS, for the attach arm: the reconcile is
+// O(entries), so the figure that matters is the one at the size the walk is longest.
+const int LARGEST_CARD_ENTRIES = 291129;
+const int ATTACH_REPS = 5;
+
 unique_ptr<NNCacheFrozen> sourceNumber(int which) {
   vector<unique_ptr<NNOutput>> outputs;
   outputs.reserve((size_t)ENTRIES_PER_SOURCE);
@@ -184,7 +190,7 @@ void Tests::runNNCacheTwoLevelBench() {
     makeTwoLevelNNCacheTable(std::move(built[0]), NNCacheTable::create(NNCacheConfig::statusQuo(16, 2)), 16);
   for(int attached = 1; attached <= MAX_SOURCES; attached++) {
     if(attached > 1)
-      (void)table->attachLevelZero(std::move(built[(size_t)attached - 1]));
+      (void)table->attachLevelZero(std::move(built[(size_t)attached - 1]), std::optional<NNCacheContextId>());
     if((int)table->numLevelZeroSources() != attached)
       throw StringError("bench: the list is not the size this arm says it is");
 
@@ -207,5 +213,82 @@ void Tests::runNNCacheTwoLevelBench() {
     }
     report("arm B  list, " + Global::intToString(attached) + " source(s) miss", missNs);
     report("arm B  list, " + Global::intToString(attached) + " source(s) hit ", hitNs);
+  }
+
+  // ARM C: WHAT ATTACH'S RECONCILE COSTS, which is the one cost the attach contract added.
+  //
+  // Attach asks level 1, through NNCacheTable::contains, about every entry of the arriving
+  // source, and shadows the ones level 1 already owns. So the quantity is per ENTRY and it has
+  // two regimes, and both are measured because the design's own budget was argued from an
+  // estimate of one of them:
+  //
+  //   NOTHING OWNED -- every probe misses. This is the ordinary first attach of a session.
+  //   EVERYTHING OWNED -- every probe hits, shadows, and folds a count into the ledger. This is
+  //   the worst case the contract can produce: a card re-attached after the session has already
+  //   re-evaluated all of it.
+  //
+  // Reported in MILLISECONDS PER ATTACH at the two real card sizes, because that is the currency
+  // the session-boundary budget is stated in, with the per-entry figure beside it. Each rep
+  // builds a fresh source OUTSIDE the timed window -- attach consumes it -- and detaches after,
+  // so the arms do not accumulate sources.
+  {
+    const int sizes[2] = {ENTRIES_PER_SOURCE, LARGEST_CARD_ENTRIES};
+    for(int owned = 0; owned <= 1; owned++) {
+      for(int which = 0; which < 2; which++) {
+        const int n = sizes[which];
+        vector<double> ms;
+        int64_t reconciled = 0;
+        for(int rep = 0; rep < ATTACH_REPS; rep++) {
+          // A fresh key range per rep and per arm, so no rep is served by another's state.
+          const int64_t base = (int64_t)2000000000LL + (int64_t)(owned * 4 + which) * 1000000LL +
+                               (int64_t)rep * 300000LL;
+          vector<unique_ptr<NNOutput>> outputs;
+          outputs.reserve((size_t)n);
+          for(int i = 0; i < n; i++)
+            outputs.push_back(outputFor(keyOf(base + i)));
+          unique_ptr<NNCacheFrozen> source = NNCacheFrozen::build(std::move(outputs));
+          // A level 1 of its own per rep, big enough to hold the whole card without collisions
+          // deciding the answer: what is being measured is the probe, not an eviction policy.
+          unique_ptr<NNCacheTwoLevelTable> attachTable = makeTwoLevelNNCacheTable(
+            NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()),
+            NNCacheTable::create(NNCacheConfig::statusQuo(22, 10)),
+            16
+          );
+          if(owned == 1) {
+            for(int i = 0; i < n; i++) {
+              shared_ptr<NNOutput> p = make_shared<NNOutput>();
+              p->nnHash = keyOf(base + i);
+              p->nnXLen = 19;
+              p->nnYLen = 19;
+              attachTable->set(p);
+            }
+          }
+          ClockTimer timer;
+          const NNCacheLevelZeroAttachment attachment =
+            attachTable->attachLevelZero(std::move(source), std::optional<NNCacheContextId>());
+          ms.push_back(timer.getSeconds() * 1.0e3);
+          // NOT AN EQUALITY on the owned arm: level 1 here is the shipped direct-mapped table, so
+          // a few thousand of the keys offered to it displaced each other and are genuinely not
+          // owned. What the arm needs is that the reconcile really did the work -- almost every
+          // probe hitting, shadowing and folding a count -- and the count it actually reconciled
+          // is printed rather than assumed.
+          reconciled = attachment.entriesLevelOneAlreadyOwned;
+          if(owned == 0 && reconciled != 0)
+            throw StringError("bench: the empty-level-1 arm reconciled something");
+          if(owned == 1 && reconciled < (int64_t)n * 9 / 10)
+            throw StringError("bench: the owned arm did not reconcile the card it had set up");
+        }
+        vector<double> perEntryNs;
+        for(size_t i = 0; i < ms.size(); i++)
+          perEntryNs.push_back(ms[i] * 1.0e6 / (double)n);
+        const string label =
+          string("arm C  attach ") + Global::intToString(n) + " entries, level 1 owns " +
+          (owned == 1 ? "all" : "none");
+        cout << "  " << label << " (" << reconciled << " reconciled): mean " << meanOf(ms) << " ms/attach, sd " << sdOf(ms)
+             << ", min " << *std::min_element(ms.begin(), ms.end())
+             << ", max " << *std::max_element(ms.begin(), ms.end()) << endl;
+        report(label + " (per entry)", perEntryNs);
+      }
+    }
   }
 }

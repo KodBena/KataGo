@@ -76,6 +76,14 @@ class NNCacheTableTracing final : public NNCacheTable {
     inner->set(p);
   }
 
+  // DELEGATED AND DELIBERATELY NOT RECORDED. The trace exists so a replay can re-run this run's
+  // cache operations under a different policy, and a containment probe is not one of them: it
+  // stores nothing, retrieves nothing, and moves nothing in any policy's state, so a replay's
+  // numbers are identical whether it happened or not. Recording it would instead put a
+  // session-boundary act into the stream as though it were a client's lookup, which is the one
+  // thing a trace must not do (ADR-0009).
+  bool contains(Hash128 nnHash) const override { return inner->contains(nnHash); }
+
   void clear() override { inner->clear(); }
   NNCacheStats stats() const override { return inner->stats(); }
 };

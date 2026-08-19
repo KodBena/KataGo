@@ -506,6 +506,14 @@ NNCacheHitCountDelta NNCacheHitCountDelta::take(NNCacheTable& table) {
   return NNCacheHitCountDelta(table.takeUnpersistedHitCounts());
 }
 
+// The same act restricted to one context, through the one door that can perform it. It is a
+// second FACTORY and not a second KIND: what it produces is the same delta type, so a
+// per-context dump reaches appendDump by the same barrier a whole-table one does and there is
+// still no expression that converts an absolute harvest into either.
+NNCacheHitCountDelta NNCacheHitCountDelta::takeFor(NNCacheTable& table, const NNCacheContextId& context) {
+  return NNCacheHitCountDelta(table.takeUnpersistedHitCountsFor(context));
+}
+
 NNCacheHitCountDelta NNCacheHitCountDelta::ofDeltaRows(std::vector<NNCacheHitCount> rows, int64_t unrecordedHits) {
   return NNCacheHitCountDelta(NNCacheHitLedger::counted(std::move(rows), unrecordedHits));
 }

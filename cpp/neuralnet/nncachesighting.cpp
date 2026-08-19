@@ -318,6 +318,19 @@ class NNCacheTableDirectSighting final : public NNCacheTable {
     delete mutexPool;
   }
 
+  // NOT A SIGHTING, AND THAT IS THE WHOLE REASON THIS METHOD EXISTS. A get on this shape counts
+  // a sighting for EVERY key it is handed, present or absent, because the ghost is what the
+  // replacement rule reads -- so a get-shaped ownership probe over an arriving level-0 source
+  // would write a whole card's worth of sightings nobody ever made and change which of two
+  // candidates keeps a slot from then on. This asks the membership question and writes nothing:
+  // no ghost sighting, no Rule::onHit. See NNCacheTable::contains.
+  bool contains(Hash128 nnHash) const override {
+    const uint64_t idx = nnHash.hash0 & tableMask;
+    const Entry& entry = entries[idx];
+    std::lock_guard<std::mutex> lock(mutexPool->getMutex((uint32_t)idx & mutexPoolMask));
+    return entry.ptr != nullptr && entry.ptr->nnHash == nnHash;
+  }
+
   // A get IS a sighting -- that is the whole point of the axis, and it is what makes the
   // count something other than a constant. The ghost update is deliberately OUTSIDE the
   // region lock: it is a lock-free hint, and putting it under the lock would lengthen the

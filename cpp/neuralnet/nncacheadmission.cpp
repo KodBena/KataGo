@@ -74,6 +74,13 @@ class NNCacheTableSecondSighting final : public NNCacheTable {
     return inner->get(nnHash,ret);
   }
 
+  // And a membership question is unaffected twice over: this decorator's own ghost is written by
+  // set() alone, so delegating leaves nothing of this layer's state touched either, and the
+  // no-trace guarantee is exactly the inner table's. See NNCacheTable::contains.
+  bool contains(Hash128 nnHash) const override {
+    return inner->contains(nnHash);
+  }
+
   void set(const std::shared_ptr<NNOutput>& p) override {
     const Hash128 nnHash = p->nnHash;
     const uint64_t idx = nnHash.hash1 & ghostMask;

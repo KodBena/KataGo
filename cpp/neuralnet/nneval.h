@@ -233,7 +233,18 @@ class NNEvaluator {
   //
   // Throws StringError if this evaluator has no level-0 resolution list -- no nnCacheDir --
   // or for a null source.
-  [[nodiscard]] NNCacheLevelZeroSourceId attachLevelZeroSource(std::unique_ptr<NNCacheFrozen> source);
+  // `servesContext` is the context this source was loaded for, and it is REQUIRED at this door:
+  // it is what lets a dump of that context write the retrievals this source serves, which no
+  // key-shaped rule could recover afterwards. It must be a context THIS evaluator's cache
+  // attached, and is refused by name otherwise.
+  //
+  // The returned value carries the handle AND what reconciling the source against level 1 did --
+  // attach shadows every arriving key level 1 already owns, so a source detached across a set
+  // and re-attached cannot serve the evaluation that set superseded
+  // (NNCacheLevelZeroSources::attach).
+  [[nodiscard]] NNCacheLevelZeroAttachment attachLevelZeroSource(
+    std::unique_ptr<NNCacheFrozen> source, const NNCacheContextId& servesContext
+  );
 
   // Removes the source `id` names and HANDS IT BACK, leaving every other source's relative
   // order unchanged. Returning it is what lets the caller release its storage through
