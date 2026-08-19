@@ -634,7 +634,19 @@ const NNCacheContextSet& NNCacheTable::cacheContexts() const {
   return contexts_;
 }
 
+bool NNCacheTable::peek(Hash128 nnHash, shared_ptr<NNOutput>& ret) {
+  // See the header: correct for every shape that counts nothing, which is every shape but
+  // the two-level one, and that one overrides.
+  return get(nnHash, ret);
+}
+
 void NNCacheTable::set(const shared_ptr<NNOutput>& p, const NNCacheAttribution& attribution) {
+  set(p, attribution, NNCacheEntryProvenance::LiveEvaluation);
+}
+
+void NNCacheTable::set(
+  const shared_ptr<NNOutput>& p, const NNCacheAttribution& attribution, NNCacheEntryProvenance provenance
+) {
   if(attribution.isToContext() && !contexts_.owns(attribution.contextId()))
     throw StringError(
       "NNCacheTable::set: this attribution names a context attached to a different cache. "
@@ -646,8 +658,39 @@ void NNCacheTable::set(const shared_ptr<NNOutput>& p, const NNCacheAttribution& 
   // universe of one outcome would be a number with no reading. This is also what keeps the
   // default configuration's set path exactly what it was.
   if(attribution_ != nullptr)
-    attribution_->record(p->nnHash, attribution);
+    attribution_->record(p->nnHash, attribution, provenance);
   set(p);
+}
+
+vector<Hash128> NNCacheTable::unpersistedKeysFor(const NNCacheContextId& context) const {
+  // The same ownership refusal attributedKeysFor makes, from the same one home, so asking
+  // against the wrong cache's context is refused rather than answered with an empty list.
+  if(!contexts_.owns(context))
+    throw StringError(
+      "NNCacheTable: this context is not attached to this cache, so it owes nothing here. "
+      "Asking against the wrong cache's context is refused rather than answered with an "
+      "empty list a caller would read as 'this context has nothing left to dump'."
+    );
+  if(attribution_ == nullptr)
+    return vector<Hash128>();
+  return attribution_->unpersistedKeysFor(context);
+}
+
+int64_t NNCacheTable::markPersisted(const NNCacheContextId& context, const vector<Hash128>& keys) {
+  if(!contexts_.owns(context))
+    throw StringError(
+      "NNCacheTable: this context is not attached to this cache, so nothing here can be "
+      "marked persisted under it."
+    );
+  if(attribution_ == nullptr) {
+    // No context has been attached, so there is no ledger and no key could have been earned
+    // under one -- but contexts_.owns() just said this context IS attached, so the two
+    // disagree and that is a defect in this class, not a caller's doing (ADR-0002).
+    throw StringError(
+      "NNCacheTable::markPersisted: a context is attached but no attribution ledger exists."
+    );
+  }
+  return attribution_->markPersisted(context, keys);
 }
 
 NNCacheAttributionLedger NNCacheTable::harvestAttribution() const {
@@ -726,6 +769,12 @@ int64_t NNCacheHitLedger::unrecordedHits() const {
 // level 0 does. So the default configuration -- no level 0, one ordinary table -- gains no
 // field, no branch and no allocation from this surface existing.
 NNCacheHitLedger NNCacheTable::harvestHitCounts() const {
+  return NNCacheHitLedger::notCounted();
+}
+
+// And the same for the delta surface, for the same reason: a table with no counters has no
+// unpersisted counts either, and saying "counted, zero rows" would be a claim it cannot make.
+NNCacheHitLedger NNCacheTable::takeUnpersistedHitCounts() {
   return NNCacheHitLedger::notCounted();
 }
 

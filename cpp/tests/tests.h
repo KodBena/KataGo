@@ -165,6 +165,9 @@ namespace Tests {
   //testnncachecontext.cpp
   void runNNCacheContextTests();
 
+  //testnncachedump.cpp
+  void runNNCacheDumpTests();
+
   //testanalysismodels.cpp
   void runAnalysisModelNameSpaceTests();
   // Not part of runtests: it is a measurement, not an assertion, and it writes real files.

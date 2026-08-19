@@ -60,6 +60,46 @@ struct NNCacheCountRow {
   uint64_t sessions;
 };
 
+// A MINIMUM RECORDED-LOOKUP COUNT: the one home of the rule "this key has been seen often
+// enough", for every side that asks it.
+//
+// WHY THIS IS A TYPE AND NOT A uint64_t PASSED AROUND. Two independent surfaces apply the
+// same rule to the same fact. The READ side is NNCacheLevelZeroBound::minLookups, which
+// decides what an attach admits into a frozen level 0. The WRITE side is
+// NNCacheDiskAdmission::minLookups, which decides what a dump lets onto disk. They are
+// different decisions -- one is a prefix of a ranked order, the other a per-entry
+// predicate -- but the QUESTION they ask of a key is one question, and a key's recorded
+// lookups are one fact with one home, this log. Written out twice, the two comparisons
+// could drift in the one place drifting is silent: the boundary case below (ADR-0012 P1).
+//
+// THE BOUNDARY CASE, stated once here so neither side restates it. A key the log has never
+// mentioned carries a recorded count of zero, so every threshold ABOVE zero excludes it and
+// a threshold OF zero admits it -- which is right in both directions: "admit everything" must
+// not turn into "admit everything the log happens to know about". An uncounted key is not
+// given a separate check, because there is nothing for one to catch; see
+// NNCacheLevelZeroBound::select, where the same reasoning is already recorded against the
+// read side's own comparison.
+class NNCacheLookupThreshold {
+ public:
+  // Admits a key recorded at `lookups` retrievals or more. of(0) admits every key, counted
+  // or not.
+  static NNCacheLookupThreshold of(uint64_t lookups) { return NNCacheLookupThreshold(lookups); }
+
+  [[nodiscard]] uint64_t lookups() const { return lookups_; }
+
+  // Whether a key the log records `recordedLookups` retrievals for clears this threshold.
+  // A key the log does not mention is passed as zero, by the rule above.
+  [[nodiscard]] bool admits(uint64_t recordedLookups) const { return recordedLookups >= lookups_; }
+
+  // For a report or a refusal: what was asked for, in words, without a caller re-deriving
+  // it from the number.
+  [[nodiscard]] std::string describe() const;
+
+ private:
+  explicit NNCacheLookupThreshold(uint64_t lookups) : lookups_(lookups) {}
+  uint64_t lookups_;
+};
+
 // Whether the file ended on a block boundary, or on bytes a crash left behind.
 //
 // A typed disposition rather than a byte count whose zero has to be read as a meaning

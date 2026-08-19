@@ -205,6 +205,37 @@ class NNCacheContextSet {
 };
 
 //-------------------------------------------------------------------------------------
+// Where an entry came from
+//-------------------------------------------------------------------------------------
+
+// WHERE AN ENTRY OFFERED TO THE CACHE CAME FROM, as a closed two-case disposition.
+//
+// WHY THIS EXISTS AT ALL. A dump writes the entries a context owns in level 1. Some of those
+// entries were never earned: an attach FILLS level 1 from the context's own container with
+// the keys its level-0 selection bound did not take, and those entries are already on disk,
+// byte for byte, in the very file the dump appends to. Writing them again appends the whole
+// filled remainder on every attach-dump cycle -- tens of thousands of duplicate entries per
+// session at the operator's median card -- growing the file forever while adding nothing.
+//
+// WHY IT IS RECORDED AT ADMISSION RATHER THAN RECONSTRUCTED AT DUMP. The alternatives were
+// weighed and rejected. A containment probe against level 0 does NOT answer the question:
+// the selection bound means container membership is strictly LARGER than level-0 membership,
+// and the p99-into-level-0, p50-into-level-1 split is exactly the configuration that
+// separates them, so every filled remainder entry would probe absent and be re-written. A
+// full container key-membership index held for the attachment does answer it, and costs
+// O(container) resident memory for the whole session to answer a question that arises only
+// at dump. Provenance costs one bool per attributed key, in bytes the recorder's row already
+// padded away, and is known for certain at the one moment the entry enters the table.
+enum class NNCacheEntryProvenance {
+  // A network evaluation this session performed, or any other content this process produced.
+  // Its bytes are NOT on disk, so a dump owes them.
+  LiveEvaluation,
+  // Read back from this context's own evaluation container by an attach. Its bytes are
+  // ALREADY on disk, in the file a dump of this context appends to.
+  LoadedFromContainer,
+};
+
+//-------------------------------------------------------------------------------------
 // The harvested attribution surface
 //-------------------------------------------------------------------------------------
 
@@ -343,8 +374,36 @@ class NNCacheAttributionRecorder {
   NNCacheAttributionRecorder(const NNCacheAttributionRecorder&) = delete;
   NNCacheAttributionRecorder& operator=(const NNCacheAttributionRecorder&) = delete;
 
-  // Records that `key` was earned by `attribution`. Thread-safe; on the set path.
+  // Records that `key` was earned by `attribution`, and where the entry came from.
+  // Thread-safe; on the set path.
+  //
+  // THE PROVENANCE IS WRITTEN, NOT MERGED. LoadedFromContainer marks the key persisted --
+  // its bytes are on disk already -- and LiveEvaluation CLEARS that mark, because a live
+  // evaluation replaced whatever was there and the disk copy is no longer the entry the
+  // table holds. That clearing is the whole reason an ownermap upgrade re-persists
+  // correctly: NNEvaluator's ownership-map fall-through re-evaluates a hit that lacked a
+  // requested map and sets the fuller result, which is a live overwrite, which clears the
+  // mark, which puts the fuller entry back in the next dump -- so the store's rule that an
+  // entry without an ownermap never supersedes one with is reached rather than assumed.
+  void record(Hash128 key, const NNCacheAttribution& attribution, NNCacheEntryProvenance provenance);
+
+  // The same at LiveEvaluation, which is what every path but a container fill is. The
+  // two-argument form exists so the ONE caller with a different answer is the one that has to
+  // say so, rather than every ordinary evaluation carrying a word about a case it is not.
   void record(Hash128 key, const NNCacheAttribution& attribution);
+
+  // Records that these keys of `context` are now on disk. Returns how many rows it actually
+  // marked -- a key with no row, because the probe window was full when it was earned, is
+  // counted out rather than silently treated as marked.
+  //
+  // CALLED AFTER THE WRITE SUCCEEDS AND NEVER BEFORE. A mark set before an append that then
+  // throws would drop the entry from every future dump while it was never written.
+  int64_t markPersisted(const NNCacheContextId& context, const std::vector<Hash128>& keys);
+
+  // Exactly the keys attributed to `context` whose bytes are NOT on disk: what a dump of
+  // this context owes. The complement of keysFor(context) that markPersisted and
+  // LoadedFromContainer have marked.
+  [[nodiscard]] std::vector<Hash128> unpersistedKeysFor(const NNCacheContextId& context) const;
 
   // The rows, with each id resolved to its name against the set that minted it. Thread-safe
   // and O(rows): a reporting call taken between sessions, never inside a search.

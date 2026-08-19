@@ -114,6 +114,10 @@ uint32_t NNCacheFrozenIndex::maxEntries() {
   return EMPTY_SLOT - 1;
 }
 
+size_t NNCacheFrozenIndex::recordBytes() {
+  return sizeof(Record);
+}
+
 NNCacheFrozenIndex::NNCacheFrozenIndex()
   :records_(), posTable_(), disp_(), numBuckets_(0), tableSize_(0)
 {}
@@ -430,7 +434,12 @@ std::optional<uint32_t> NNCacheFrozen::shadow(Hash128 key) {
   const uint32_t prev = state.exchange(SHADOW_BIT, std::memory_order_relaxed);
   if((prev & SHADOW_BIT) != 0)
     return std::nullopt;
-  return prev & COUNT_MASK;
+  // What has already been written to the count log stays written; only the remainder moves.
+  // Clearing the mark in the same act keeps a re-read of this retired entry from subtracting
+  // a mark whose counter is gone. See the header for why total-minus-mark and not total.
+  const uint32_t mark = index_.persistedCountAt(idx.value()).exchange(0, std::memory_order_relaxed);
+  const uint32_t total = prev & COUNT_MASK;
+  return total > mark ? total - mark : 0u;
 }
 
 bool NNCacheFrozen::addHits(Hash128 key, uint32_t amount) {
@@ -476,6 +485,27 @@ std::vector<NNCacheHitCount> NNCacheFrozen::harvest() const {
     NNCacheHitCount row;
     row.key = index_.keyAt(i);
     row.hits = state & COUNT_MASK;
+    out.push_back(row);
+  }
+  return out;
+}
+
+std::vector<NNCacheHitCount> NNCacheFrozen::takeUnpersistedHits() {
+  std::vector<NNCacheHitCount> out;
+  const uint32_t n = index_.numEntries();
+  for(uint32_t i = 0; i < n; i++) {
+    const uint32_t state = index_.stateAt(i).load(std::memory_order_relaxed);
+    if((state & SHADOW_BIT) != 0)
+      continue;
+    const uint32_t count = state & COUNT_MASK;
+    const uint32_t mark = index_.persistedCountAt(i).exchange(count, std::memory_order_relaxed);
+    // Nothing accrued since the last take. No row: appendDump would raise this key's
+    // sessions for a dump in which it earned nothing.
+    if(count <= mark)
+      continue;
+    NNCacheHitCount row;
+    row.key = index_.keyAt(i);
+    row.hits = count - mark;
     out.push_back(row);
   }
   return out;

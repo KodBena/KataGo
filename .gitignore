@@ -101,3 +101,4 @@ cpp/external/katagocoreml/proto/
 # runs no destructors, so a red test run does leave one behind.
 tmpnncachecountlog_*
 tmpanalysismodels_*
+tmpnncachedump_*

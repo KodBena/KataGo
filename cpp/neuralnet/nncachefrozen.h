@@ -103,6 +103,13 @@ class NNCacheFrozenIndex {
   // record, key, state and payload arrive together in one 32-byte record, two to a cache
   // line. This class never dereferences it and does not own it.
   NNOutput* payloadAt(uint32_t i) const { return records_[i].payload; }
+
+  // Entry i's PERSISTED MARK: how much of its counter has already been written to the count
+  // log. It lives in the 4 bytes this record has always reserved beside the state word, so
+  // the delta surface costs the structure not one byte and not one extra cache line -- the
+  // mark is in the same 32-byte record the lookup already touched. See
+  // NNCacheFrozen::takeUnpersistedHits.
+  std::atomic<uint32_t>& persistedCountAt(uint32_t i) const { return records_[i].persistedCount; }
   void setPayloadAt(uint32_t i, NNOutput* payload) { records_[i].payload = payload; }
 
   // Every byte this index holds resident, including the key array -- not just the
@@ -117,21 +124,29 @@ class NNCacheFrozenIndex {
   static uint32_t searchBound();
   // The largest key count this implementation's arithmetic supports (SPEC.md 4.4).
   static uint32_t maxEntries();
+  // The exact bytes one entry's record occupies, read from the record type rather than
+  // re-typed. SPEC.md 8's whole two-records-to-a-cache-line argument is a claim about this
+  // number, so it is a number a test can assert against the implementation (ADR-0012 P1).
+  static size_t recordBytes();
 
  private:
   NNCacheFrozenIndex();
 
-  // One record per entry, in entry order: 16 bytes of key, a 4-byte caller state word, 4
-  // reserved, and an 8-byte caller payload pointer. 32 bytes, two to a cache line, so a
-  // resolved lookup gets the key it must compare, the counter it must bump and the payload
-  // it must hand back in ONE access rather than three. That layout is the whole difference
-  // between meeting and missing SPEC.md 8's floor; see stateAt and payloadAt.
+  // One record per entry, in entry order: 16 bytes of key, a 4-byte caller state word, a
+  // 4-byte persisted mark, and an 8-byte caller payload pointer. 32 bytes, two to a cache
+  // line, so a resolved lookup gets the key it must compare, the counter it must bump and
+  // the payload it must hand back in ONE access rather than three. That layout is the whole
+  // difference between meeting and missing SPEC.md 8's floor; see stateAt and payloadAt.
+  //
+  // The persisted mark occupies the 4 bytes this record reserved from the start. It is not a
+  // new cost and it does not change the record's size, which testnncachedump.cpp asserts
+  // against sizeof rather than trusting from here.
   struct Record {
     Hash128 key;
     mutable std::atomic<uint32_t> state;
-    uint32_t reserved;
+    mutable std::atomic<uint32_t> persistedCount;
     NNOutput* payload;
-    Record() : key(), state(0), reserved(0), payload(nullptr) {}
+    Record() : key(), state(0), persistedCount(0), payload(nullptr) {}
   };
 
   std::vector<Record> records_;    // entry order: records_[i] is entry i
@@ -263,10 +278,16 @@ class NNCacheFrozen {
   [[nodiscard]] bool contains(Hash128 key) const;
 
   // Transfers ownership of `key` to level 1: the entry stops resolving, and the hits it
-  // accrued are returned so the caller can fold them into the counter that takes over.
-  // Returns nullopt if this index never held the key, or if it was already shadowed --
-  // in which case nothing is transferred, so a racing second caller cannot duplicate a
-  // count. Idempotent and thread-safe.
+  // accrued AND HAS NOT YET PERSISTED are returned so the caller can fold them into the
+  // counter that takes over. Returns nullopt if this index never held the key, or if it was
+  // already shadowed -- in which case nothing is transferred, so a racing second caller
+  // cannot duplicate a count. Idempotent and thread-safe.
+  //
+  // UNPERSISTED, not total, and the difference is load-bearing. A count that has already
+  // been written to the count log belongs to the log now; handing it to level 1 as though it
+  // were new would put it in the next dump too, and appendDump adds. The two figures are the
+  // same number until a take has happened, which is why nothing observed this distinction
+  // before the delta surface existed.
   [[nodiscard]] std::optional<uint32_t> shadow(Hash128 key);
 
   // Adds `amount` to a key's counter without retrieving its evaluation, for folding in
@@ -288,6 +309,17 @@ class NNCacheFrozen {
   // omitted: they are level 1's keys now and their counts are in level 1's ledger, so
   // including them here would put one key on the surface twice.
   [[nodiscard]] std::vector<NNCacheHitCount> harvest() const;
+
+  // THE HITS THAT HAVE NOT REACHED THE COUNT LOG YET, taking them as it reports them.
+  //
+  // Per unshadowed entry: the counter minus this entry's persisted mark, with the mark then
+  // advanced to the counter. An entry whose delta is zero yields NO ROW -- see
+  // NNCacheTable::takeUnpersistedHitCounts for why a dump must not write a row for a key
+  // with nothing to say, and harvest() above for the surface that deliberately does.
+  //
+  // Not const, and not a reporting call: it MOVES the mark. Take it once per dump, from the
+  // dump path, at rest.
+  [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHits();
 
   // Resident bytes: the index, the counters, the evaluation handles. Not the evaluations
   // themselves -- those are the two payload figures below.
