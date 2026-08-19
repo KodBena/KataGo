@@ -29,6 +29,9 @@ namespace Tests {
   //testrules.cpp
   void runRulesTests();
 
+  //testsuperkohash.cpp
+  void runSuperKoBannedHashTests();
+
   //testpassalivesuicide.cpp
   void runPassAliveSuicideModeTests();
   void runExcludeTerritoryAtariModeTests();

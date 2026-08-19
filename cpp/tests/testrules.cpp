@@ -3405,9 +3405,9 @@ isResignation: 0
       for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
         testAssert(hist.wasEverOccupiedOrPlayed[i] == hist2.wasEverOccupiedOrPlayed[i]);
       for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
-        testAssert(hist.superKoBanned[i] == false);
+        testAssert(hist.isSuperKoBanned((Loc)i) == false);
       for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
-        testAssert(hist2.superKoBanned[i] == false);
+        testAssert(hist2.isSuperKoBanned((Loc)i) == false);
 
       out << hist.consecutiveEndingPasses << " " << hist2.consecutiveEndingPasses << endl;
       out << hist.hashesBeforeBlackPass.size() << " " << hist2.hashesBeforeBlackPass.size() << endl;
