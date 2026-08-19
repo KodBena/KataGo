@@ -458,34 +458,101 @@ void testStatsSumEverySource() {
        << " added structure bytes" << endl;
 }
 
-// THE SUPPRESSED-ROW TRIPWIRE FIRES. harvest() drops the later holder's row for a shared
-// key on the ground that it is provably zero -- a proof that lives in shadowAllHolders, not
-// here. This plants the state that proof forbids and watches the tripwire go off, which is
-// the only way to know the check is live rather than dead code beside a comment (ADR-0021
-// Rule 2: the negative claim "no counted row is ever suppressed" is watched by a probe whose
-// FIRING is the observation, and the probe is proven able to fire).
+// A REORDERED SOURCE'S COUNTS REACH THE HARVEST, AND THE HARVEST DOES NOT REFUSE THEM.
 //
-// addHits is the only door to that state, and that is the point: nothing on the get path can
-// reach it while the invariant holds, so a test that could produce it by ordinary means
-// would be reporting a defect rather than exercising a guard.
-void testASuppressedRowCarryingHitsIsRefusedRatherThanDropped() {
+// THE SEQUENCE IS THE WITNESS, not a proxy for it (ADR-0021 Rule 1). Nothing here pokes a
+// counter: the state is built out of attach, get and detach alone -- the class's own public
+// surface -- because the point in dispute is whether a source sitting behind another can
+// legitimately carry a count for the key they share.
+//
+//   attach A, which holds the key and serves it TWICE;
+//   attach B, which also holds it and therefore serves nothing;
+//   detach A, after which B serves it ONCE;
+//   re-attach A, which goes to the BACK because attach appends.
+//
+// A now sits behind B holding two real retrievals of a key it no longer resolves. The key was
+// retrieved three times this session and the harvest says three. Before 2026-08-19 this call
+// suppressed A's row and THREW on it carrying a count, naming a one-owner invariant this
+// sequence breaks without doing anything wrong -- a refusal firing on a good state.
+void testAReorderedSourcesHarvestIsSummedRatherThanRefused() {
   const Hash128 shared = nthKey(70);
-  unique_ptr<NNCacheFrozen> bOwned = sourceOver({shared, nthKey(71)}, SOURCE_B);
-  NNCacheFrozen* b = bOwned.get();
+  const Hash128 aOnly = nthKey(71);
+  const Hash128 bOnly = nthKey(72);
+  unique_ptr<NNCacheFrozen> aOwned = sourceOver({shared, aOnly}, SOURCE_A);
+  NNCacheFrozen* a = aOwned.get();
   unique_ptr<NNCacheTwoLevelTable> table =
-    makeTwoLevelNNCacheTable(sourceOver({shared, nthKey(72)}, SOURCE_A), defaultLevelOne(8), 8);
+    makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
+  const NNCacheLevelZeroSourceId idA = table->levelZeroResolutionOrder()[0];
+
+  testAssert(served(*table, shared) == SOURCE_A);
+  testAssert(served(*table, shared) == SOURCE_A);   // A has counted two
+
+  const NNCacheLevelZeroSourceId idB = table->attachLevelZero(sourceOver({shared, bOnly}, SOURCE_B));
+  unique_ptr<NNCacheFrozen> aBack = table->detachLevelZero(idA);
+  testAssert(served(*table, shared) == SOURCE_B);   // B resolves it now, and counts one
+  const NNCacheLevelZeroSourceId idA2 = table->attachLevelZero(std::move(aBack));
+
+  // The state under test, observed rather than assumed: A is last, still holds the key
+  // unshadowed, and still carries its two.
+  testAssert(table->levelZeroResolutionOrder() == vector<NNCacheLevelZeroSourceId>({idB, idA2}));
+  testAssert(a->contains(shared));
+  testAssert(a->hitCountAt(a->index().find(shared).value()) == 2);
+
+  // THE OBSERVATION. No throw, one row for the key, and the row carries every retrieval.
+  const NNCacheHitLedger ledger = table->harvestHitCounts();
+  testAssert(ledger.disposition() == NNCacheHitLedgerDisposition::Counted);
+  testAssert(hitsForKeyIn(ledger, shared) == 3);    // B's one plus A's two
+  testAssert(ledger.entries().size() == 3);         // shared, bOnly, aOnly -- once each
+  testAssert(hitsForKeyIn(ledger, bOnly) == 0);
+  testAssert(hitsForKeyIn(ledger, aOnly) == 0);
+  // Row position is the earliest holder's, so B's entries come first now that B is first.
+  testAssert(ledger.entries()[0].key == shared || ledger.entries()[0].key == bOnly);
+  testAssert(ledger.entries()[1].key == shared || ledger.entries()[1].key == bOnly);
+  testAssert(ledger.entries()[2].key == aOnly);
+
+  // And it is a report, not a take: reading it twice reads the same level.
+  testAssert(hitsForKeyIn(table->harvestHitCounts(), shared) == 3);
+
+  cout << "  reordered source, harvest: A served 2 then went behind B which served 1; the "
+       << "harvest carries " << ledger.entries().size() << " rows and "
+       << hitsForKeyIn(ledger, shared) << " hits for the shared key, twice running" << endl;
+}
+
+// THE ONE THING HARVEST STILL REFUSES: a sum that will not fit the row it must be written to.
+//
+// This is a limit of the OUTPUT TYPE rather than an invariant about the list's state, which is
+// why it cannot fire on a legitimate history the way the retired one-owner tripwire could. A
+// count log row's field is 32 bits and a frozen counter is 31, so two holders can never
+// overflow it but three can. Unreachable at any real scale -- the largest lifetime reference
+// count in the operator's whole corpus is 11,997 -- and refused anyway, because the
+// alternative is a wrapped count, which is four billion retrievals lost silently (ADR-0002).
+// Constructed with addHits, the fold-in-counts-from-elsewhere door, because saturating three
+// holders is the only way to reach the branch.
+void testASummedHarvestThatWillNotFitARowIsRefusedByName() {
+  const Hash128 shared = nthKey(75);
+  const uint32_t nearlyFull = 0x7FFFFFFFu;  // NNCacheFrozen's counter is 31 bits
+  unique_ptr<NNCacheFrozen> aOwned = sourceOver({shared}, SOURCE_A);
+  unique_ptr<NNCacheFrozen> bOwned = sourceOver({shared}, SOURCE_B);
+  unique_ptr<NNCacheFrozen> cOwned = sourceOver({shared}, SOURCE_C);
+  NNCacheFrozen* a = aOwned.get();
+  NNCacheFrozen* b = bOwned.get();
+  NNCacheFrozen* c = cOwned.get();
+  unique_ptr<NNCacheTwoLevelTable> table =
+    makeTwoLevelNNCacheTable(std::move(aOwned), defaultLevelOne(8), 8);
   (void)table->attachLevelZero(std::move(bOwned));
+  (void)table->attachLevelZero(std::move(cOwned));
 
-  // Green first: with the invariant intact the suppression is silent and the surface is
-  // three rows, so the tripwire is not merely never-reached-because-nothing-works.
-  testAssert(table->harvestHitCounts().entries().size() == 3);
+  // Two holders at the ceiling still fit: the refusal is about the row, so it must not fire
+  // one addend early.
+  testAssert(a->addHits(shared, nearlyFull));
+  testAssert(b->addHits(shared, nearlyFull));
+  testAssert(hitsForKeyIn(table->harvestHitCounts(), shared) == 0xFFFFFFFEu);
 
-  // Now break it, at the only place it can be broken from outside.
-  testAssert(b->addHits(shared, 4));
-  testAssert(refused([&]() { (void)table->harvestHitCounts(); }, "already resolves that key"));
+  testAssert(c->addHits(shared, nearlyFull));
+  testAssert(refused([&]() { (void)table->harvestHitCounts(); }, "does not fit the 32-bit row"));
 
-  cout << "  suppressed-row tripwire: silent at 3 rows while the invariant holds, refuses "
-       << "by name once a shadowed-out entry is given 4 hits" << endl;
+  cout << "  harvest overflow: two holders at 2^31-1 sum to " << 0xFFFFFFFEu
+       << " and are reported; a third makes the harvest refuse by name rather than wrap" << endl;
 }
 
 // THE EMPTY LIST IS A FULL CITIZEN. Detaching every source leaves a table that reports what
@@ -714,7 +781,8 @@ void Tests::runNNCacheTwoLevelTests() {
   testDetachedSourceIsHandedBackAndReleasable();
   testHarvestEmitsOneRowPerKeyInResolutionOrder();
   testStatsSumEverySource();
-  testASuppressedRowCarryingHitsIsRefusedRatherThanDropped();
+  testAReorderedSourcesHarvestIsSummedRatherThanRefused();
+  testASummedHarvestThatWillNotFitARowIsRefusedByName();
   testAnEmptyListReportsExactlyLevelOne();
   testAFullyShadowedEarlierSourceStillHoldsItsPlace();
   testEverySourceIsTakenFromSoASecondTakeYieldsNothing();

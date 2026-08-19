@@ -33,8 +33,10 @@
 // WHAT AN OVERLAP COSTS, stated rather than left to be discovered: at the ~3.7% cross-card
 // key sharing the corpus actually shows, a key can sit in two attached sources. The first
 // in order serves it and counts it; the second's entry is resident memory that will never
-// be reached (it is reported as such by stats(), which sums what every source holds) and
-// never counted (it is suppressed from the harvest, see NNCacheLevelZeroSources::harvest).
+// be reached while the order stands (it is reported as such by stats(), which sums what every
+// source holds). It is reported ONCE on the count surfaces -- both of them fold every
+// holder's count into one row per key by summing, so a holder that earned its count under an
+// earlier order keeps it (NNCacheLevelZeroSources::harvest).
 //
 // THE MISS COST IS ONE CHD PROBE PER ATTACHED SOURCE, ~40-110 ns at real sizes, against
 // the 2.4-2.8 ms an avoided evaluation costs. Three orders of magnitude of headroom is not
@@ -155,6 +157,20 @@ class NNCacheLevelZeroSources {
   //
   // Throws StringError for a null source: "no source" is represented by this list being
   // shorter, never by it holding a null (ADR-0012 P11).
+  //
+  // KNOWN DEFECT, WITNESSED AND FILED 2026-08-19 -- RE-ATTACHING A SOURCE THAT SAT OUT A SET.
+  // A set shadows the key in every ATTACHED holder (shadowAllHolders); a source detached at
+  // that moment is not one, so it comes back still holding the key unshadowed and resolves it
+  // ahead of the level 1 that now owns it. Witnessed through this surface alone: attach A over
+  // an empty level 1, serve the key, attach B, detach A, serve it from B, set the key, then
+  // re-attach A -- the table serves A's superseded evaluation while level 1 holds the fresh
+  // one, and the key appears on harvestHitCounts TWICE, once from A and once from the level-1
+  // ledger, breaking the one-row-per-key property a dump depends on. NOT FIXED HERE: the cure
+  // is a decision about the attach contract (shadow on re-attach against level 1, or refuse a
+  // source carrying a key level 1 owns), it costs a probe per entry at attach, and it is a
+  // different defect from the harvest folding rule this increment was chartered for. It is
+  // recorded here, at the act that reintroduces the stale holder, rather than narrated
+  // elsewhere and left (ADR-0013 Rule 4).
   [[nodiscard]] NNCacheLevelZeroSourceId attach(std::unique_ptr<NNCacheFrozen> source);
 
   // Removes the source `id` names and HANDS IT BACK, leaving the relative order of every
@@ -198,62 +214,61 @@ class NNCacheLevelZeroSources {
   // Every unshadowed entry of every attached source, each source in resolution order and
   // each source's entries in its own index order, WITH ONE ROW PER KEY.
   //
-  // A key held by two sources appears ONCE, from the source that would resolve it -- the
-  // earlier one. The suppressed row's count is zero and cannot be anything else: the later
-  // source's entry is unreachable while the earlier one resolves, and a set for the key
-  // shadows it in both at once (shadowAllHolders), so no path exists by which it accrues a
-  // hit. Nothing is therefore lost by suppressing it, and what is gained is the one-row-
-  // per-key property a persistence layer must never have to repair.
+  // A key held by several sources yields ONE row, positioned where the EARLIEST holder's
+  // entry falls, carrying the SUM of what every holder counted for it. Summing double-counts
+  // nothing: a get increments exactly one source's counter, every counter starts at zero when
+  // its source is built or loaded, and a set takes the key out of level 0 entirely
+  // (shadowAllHolders), so two holders' counts for one key are disjoint sets of real
+  // retrievals. It is the same rule takeUnpersistedHits below folds by, through the same
+  // function, and the same rule shadowAllHolders already uses at this seam.
   //
-  // KNOWN DIVERGENCE FROM takeUnpersistedHits BELOW, recorded 2026-08-19 rather than left for
-  // the next reader to trip over. The paragraph above is true only while the RESOLUTION ORDER
-  // HAS NOT CHANGED since a source started counting. Detach the first holder of a key, let the
-  // second serve and count it, then re-attach the first -- it goes to the back, and it is now
-  // a suppressed source carrying a non-zero, entirely legitimate count. This function's
-  // tripwire calls that a broken invariant and throws; takeUnpersistedHits sums instead,
-  // because for a conserved flow summing is the only rule that loses nothing. The same
-  // argument says harvest should sum too. It was NOT changed here: it is a ratified,
-  // separately-reviewed semantic with its own test asserting the refusal, nothing is silently
-  // lost either way (a throw is loud), and rewriting it during an integration repair is not
-  // this increment's call. Raised for a decision, not resolved.
+  // WHY A LEVEL SUMS HERE, since a level is normally read off the one entry that owns it, and
+  // this call reports one (this session's running total for a key, where takeUnpersistedHits
+  // reports the flow not yet written). The level is a per-KEY quantity, and its ACCRUAL is
+  // spread across entries the moment the resolution order moves: attach A, let it serve the
+  // key twice, attach B which also holds it, detach A, let B serve it once, re-attach A --
+  // attach appends, so A returns at the BACK holding two real retrievals of a key it no
+  // longer resolves. Read off the resolving entry alone, the level answers 1 for a key that
+  // was retrieved 3 times. An entry is where part of a level is KEPT, not what the level is
+  // ABOUT, so the level is the sum over the entries that kept part of it. Levels de-duplicate
+  // only when they live in one place; this one does not.
   //
-  // THAT PROOF LEANS ON A DIFFERENT METHOD, so it is CHECKED HERE rather than trusted: a
-  // suppressed row carrying a non-zero count means the one-owner invariant has broken
-  // somewhere else, and this throws, naming the key and the count, instead of dropping
-  // retrievals a persistence layer would never see again.
+  // RESOLVED 2026-08-19, closing the KNOWN DIVERGENCE this call carried against
+  // takeUnpersistedHits. It previously emitted the earliest holder's row alone and THREW if a
+  // suppressed row carried a count, on the argument that an unreachable entry can accrue
+  // nothing. The sequence above reaches that state through this class's own public surface
+  // with no poke, so the refusal fired on a legitimate history; the two surfaces now fold by
+  // one rule and the one-owner argument is retired rather than left standing beside a
+  // counter-example.
+  //
+  // THE ONE REFUSAL LEFT is a sum that will not fit the 32-bit row a count log record carries.
+  // That is a limit of the OUTPUT TYPE -- no state of this list is legitimate and also
+  // unrepresentable in the row it must be written to -- so it cannot fire on a good state the
+  // way the one-owner tripwire could, and it is refused rather than wrapped (ADR-0002).
   [[nodiscard]] std::vector<NNCacheHitCount> harvest() const;
 
   // THE HITS THAT HAVE NOT REACHED THE COUNT LOG YET, across every attached source, taking
-  // them as it reports them. The delta twin of harvest() above -- and NOT its mirror image,
-  // which is the one thing to read here before reading anything else.
+  // them as it reports them. The delta twin of harvest() above.
   //
-  // IT SUMS ACROSS HOLDERS. IT DOES NOT SUPPRESS. harvest() emits a shared key ONCE, from the
-  // source that resolves it, and refuses a suppressed row that carries a count. This does the
-  // opposite: a key held by several sources yields ONE row whose hits are the SUM of every
-  // holder's unpersisted delta. The two rules differ because the two quantities differ in
-  // kind, and the distinction is worth stating in one line: harvest reports a LEVEL (this
-  // session's running total for a key), and a level is read off the one entry that owns it;
-  // this reports a FLOW (the retrievals not yet written to the count log), and a flow is
-  // CONSERVED -- appendDump ADDS each row's lookups to the key's running total, so a delta
-  // dropped here is retrievals gone from the record forever, with no honesty counter to show
-  // it. Levels de-duplicate; flows add.
+  // IT FOLDS BY THE SAME RULE, through the same function: a key held by several sources yields
+  // ONE row whose hits are the SUM of every holder's unpersisted delta. What differs is the
+  // QUANTITY, not the folding -- this reports a FLOW (the retrievals not yet written to the
+  // count log) where harvest reports a LEVEL (the session's running total), and a flow is
+  // CONSERVED: appendDump ADDS each row's lookups to the key's running total, so a delta
+  // dropped here is retrievals gone from the record forever with no honesty counter to show
+  // it. (Recorded 2026-08-19: harvest used to suppress-and-refuse instead, and the divergence
+  // noted here is closed -- see harvest's own comment for the sequence that closed it.)
   //
-  // WHEN THE TWO RULES ACTUALLY DIVERGE, since under a static order they do not. A source
-  // that has never resolved a key has a zero counter and therefore no delta to report, so a
-  // shared key normally reaches this loop from ONE holder and summing is the same as
-  // suppressing. They part company when the ORDER CHANGES: attach A, let it serve and count
-  // a key, detach it, let B serve and count the same key, then re-attach A -- which goes to
-  // the BACK, behind B. A now holds real, unwritten retrievals of a key it no longer
-  // resolves. That is a legitimate history reachable through this class's own public
-  // interface, not a broken invariant, and summing is the only rule that keeps those
-  // retrievals. It is also the rule this codebase already uses at the same seam:
-  // shadowAllHolders sums what every holder gives up into one level-1 ledger row.
+  // THE TWO REAL DIFFERENCES, both about what this call DOES rather than how it folds:
   //
-  // EVERY SOURCE IS TAKEN FROM, including one whose rows merge into an earlier source's.
-  // This call is CONSUMING -- it advances each entry's persisted mark -- so a source skipped
-  // for being "already covered" would keep its mark behind and re-report the same delta on
-  // the next take. There is therefore no early exit anywhere in it, and the single-source
-  // fast path harvest() has is deliberately absent here.
+  //   EVERY SOURCE IS TAKEN FROM, including one whose rows merge into an earlier source's.
+  //   This call is CONSUMING -- it advances each entry's persisted mark -- so a source skipped
+  //   for being "already covered" would keep its mark behind and re-report the same delta on
+  //   the next take. There is no early exit anywhere in it, and the single-source fast path
+  //   harvest() has is deliberately absent here.
+  //
+  //   A KEY WITH NOTHING TO SAY YIELDS NO ROW, where harvest() deliberately reports a
+  //   pre-warmed entry that earned nothing as a zero. See NNCacheTable::takeUnpersistedHitCounts.
   //
   // Not const, and not a reporting call: it MOVES the marks. Take it once per dump, at rest.
   [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHits();

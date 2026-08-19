@@ -3,7 +3,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
-#include <set>
+#include <string>
 
 #include "../core/global.h"
 #include "../search/mutexpool.h"
@@ -115,6 +115,47 @@ uint64_t NNCacheLevelZeroSources::shadowAllHolders(Hash128 key) {
   return transferred;
 }
 
+namespace {
+// HOW PER-SOURCE ROWS BECOME ONE ROW PER KEY, in the one place both aggregating surfaces
+// read it from. Two callers folding rows by two rules is the divergence this file already
+// paid for once, and the rule is one fact, so it has one home (ADR-0012 P1).
+//
+// The row's POSITION is set by the first source in resolution order to say anything about
+// the key; a later holder's count is SUMMED into it. Summing double-counts nothing: a get
+// increments exactly one source's counter, every counter starts at zero when its source is
+// built or loaded, and a set takes the key out of level 0 entirely (shadowAllHolders), so
+// two holders' counts for one key are disjoint sets of real retrievals.
+//
+// The one refusal: a sum that will not fit the 32-bit row a count log record carries. That
+// is a limit of the OUTPUT TYPE, not an invariant a legitimate state could violate, and it
+// is refused rather than wrapped -- a wrapped count is four billion retrievals lost with
+// nothing to show for it (ADR-0002). `consequence` is what the caller must know about what
+// has already happened when it fires.
+void foldByKey(
+  const NNCacheHitCount& row,
+  std::map<Hash128,size_t>& rowFor,
+  std::vector<NNCacheHitCount>& out,
+  const char* caller,
+  const char* consequence
+) {
+  const std::map<Hash128,size_t>::const_iterator found = rowFor.find(row.key);
+  if(found == rowFor.end()) {
+    rowFor[row.key] = out.size();
+    out.push_back(row);
+    return;
+  }
+  NNCacheHitCount& into = out[found->second];
+  const uint64_t summed = (uint64_t)into.hits + (uint64_t)row.hits;
+  if(summed > 0xFFFFFFFFull)
+    throw StringError(
+      std::string(caller) + ": the hit counts for key " + row.key.toString() + " sum to " +
+      Global::uint64ToString(summed) + " across attached sources, which does not fit the "
+      "32-bit row a count log dump writes. " + std::string(consequence)
+    );
+  into.hits = (uint32_t)summed;
+}
+}  // namespace
+
 std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvest() const {
   if(entries_.empty())
     return std::vector<NNCacheHitCount>();
@@ -126,40 +167,21 @@ std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvest() const {
     return entries_[0].source->harvest();
 
   std::vector<NNCacheHitCount> out;
-  // ONE ROW PER KEY, kept by remembering what has already been emitted. The set is built
-  // and thrown away inside this call: harvest is an O(table) between-sessions report and
-  // is never on the get or set path, so the allocation costs nothing that matters, and the
-  // alternative -- a permanent cross-source key index -- would be a second home for a fact
-  // the sources already hold (ADR-0012 P1).
-  std::set<Hash128> emitted;
+  // ONE ROW PER KEY, by folding every holder's count into the first holder's row -- the same
+  // rule takeUnpersistedHits below folds by, through the same function. The map is built and
+  // thrown away inside this call: harvest is an O(table) between-sessions report and is never
+  // on the get or set path, so the allocation costs nothing that matters, and the alternative
+  // -- a permanent cross-source key index -- would be a second home for a fact the sources
+  // already hold (ADR-0012 P1).
+  std::map<Hash128,size_t> rowFor;
   for(size_t i = 0; i < entries_.size(); i++) {
     const std::vector<NNCacheHitCount> rows = entries_[i].source->harvest();
-    for(size_t j = 0; j < rows.size(); j++) {
-      // The first source in resolution order to offer a key is the one that resolves it,
-      // so its row is the one carrying any hits.
-      if(!emitted.insert(rows[j].key).second) {
-        // THE TRIPWIRE, and the reason it is here rather than a sentence of prose. The
-        // suppressed row is provably zero ONLY because a set shadows every holder at once
-        // (shadowAllHolders) -- an invariant enforced in a different method. If that ever
-        // stops holding, this loop would silently drop retrievals a persistence layer will
-        // never see again, and no honesty counter would move. So the proof is checked where
-        // it is relied on: a suppressed row carrying hits is a broken invariant, not a
-        // recoverable condition, and it is refused loudly rather than dropped (ADR-0002,
-        // ADR-0021 Rule 2 -- the negative claim "no counted row is ever suppressed" becomes
-        // a positive observation whose firing IS the failure).
-        if(rows[j].hits != 0)
-          throw StringError(
-            "NNCacheLevelZeroSources::harvest: source " + Global::uint64ToString((uint64_t)i) +
-            " in resolution order holds key " + rows[j].key.toString() + " with " +
-            Global::uint64ToString((uint64_t)rows[j].hits) + " hits, but an earlier source "
-            "already resolves that key. An unreachable entry cannot accrue hits unless the "
-            "one-owner invariant has been broken, and dropping this row would lose them "
-            "silently."
-          );
-        continue;
-      }
-      out.push_back(rows[j]);
-    }
+    for(size_t j = 0; j < rows.size(); j++)
+      foldByKey(
+        rows[j], rowFor, out,
+        "NNCacheLevelZeroSources::harvest",
+        "This call reports without taking, so nothing has been consumed and no mark has moved."
+      );
   }
   return out;
 }
@@ -173,36 +195,13 @@ std::vector<NNCacheHitCount> NNCacheLevelZeroSources::takeUnpersistedHits() {
   std::map<Hash128, size_t> rowFor;
   for(size_t i = 0; i < entries_.size(); i++) {
     const std::vector<NNCacheHitCount> rows = entries_[i].source->takeUnpersistedHits();
-    for(size_t j = 0; j < rows.size(); j++) {
-      const std::map<Hash128, size_t>::const_iterator found = rowFor.find(rows[j].key);
-      if(found == rowFor.end()) {
-        // First holder in resolution order to have anything to say about this key sets the
-        // row's POSITION, so the output keeps resolution order and, within a source, the
-        // descending-popularity order the input arrived in.
-        rowFor[rows[j].key] = out.size();
-        out.push_back(rows[j]);
-        continue;
-      }
-      // SUMMED, NOT SUPPRESSED -- see the header for why a flow adds where a level does not.
-      // Every retrieval counted here happened against whichever source was resolving the key
-      // at the time, and at most one source resolves a key at any instant, so the addends are
-      // disjoint sets of real retrievals and the sum double-counts nothing.
-      NNCacheHitCount& row = out[found->second];
-      const uint64_t summed = (uint64_t)row.hits + (uint64_t)rows[j].hits;
-      // A row is a uint32 and the sum of several 31-bit counters is not. Unreachable at any
-      // real scale -- the largest lifetime reference count in the operator's whole corpus is
-      // 11,997 -- and refused rather than wrapped, because a wrapped delta is a count log
-      // silently losing four billion retrievals (ADR-0002).
-      if(summed > 0xFFFFFFFFull)
-        throw StringError(
-          "NNCacheLevelZeroSources::takeUnpersistedHits: the unpersisted deltas for key " +
-          rows[j].key.toString() + " sum to " + Global::uint64ToString(summed) +
-          " across attached sources, which does not fit the 32-bit row a count log dump "
-          "writes. The marks of every source visited so far have already advanced, so this "
-          "take must not be retried against the same attachment."
-        );
-      row.hits = (uint32_t)summed;
-    }
+    for(size_t j = 0; j < rows.size(); j++)
+      foldByKey(
+        rows[j], rowFor, out,
+        "NNCacheLevelZeroSources::takeUnpersistedHits",
+        "The marks of every source visited so far have already advanced, so this take must "
+        "not be retried against the same attachment."
+      );
   }
   return out;
 }
@@ -504,21 +503,24 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable {
     // The attached sources' unshadowed entries first -- each source in resolution order,
     // each source's entries in index order 0..n-1, which is the harvest order SPEC.md 3.4
     // requires and -- because the input arrived in descending reference count --
-    // descending-popularity order within a source. Then level 1's keys. No key appears
-    // twice: a key held by two sources is emitted once by the list (see
-    // NNCacheLevelZeroSources::harvest), and shadowing removes a key from every source at
-    // the same moment its count arrives in the ledger.
+    // descending-popularity order within a source. Then level 1's keys. A key held by
+    // several sources is emitted once, with their counts summed, by the list (see
+    // NNCacheLevelZeroSources::harvest); and a set shadows the key in every ATTACHED source
+    // at the same moment its count arrives in the ledger, so level 0 and level 1 do not both
+    // report it -- EXCEPT after a source has been detached across a set and re-attached, the
+    // known defect filed on NNCacheLevelZeroSources::attach, which is the one way a key can
+    // still reach this surface twice.
     std::vector<NNCacheHitCount> rows = levelZero_.harvest();
     const std::vector<NNCacheHitCount> levelOneRows = ledger_.harvest();
     rows.insert(rows.end(), levelOneRows.begin(), levelOneRows.end());
     return NNCacheHitLedger::counted(std::move(rows), ledger_.unrecordedHits());
   }
 
-  // The delta twin of harvestHitCounts above, composed from the same two owners and in the
-  // same order. See NNCacheTable::takeUnpersistedHitCounts for what it is for, and
-  // NNCacheLevelZeroSources::takeUnpersistedHits for the one rule it does NOT share with its
-  // twin: across several attached sources a shared key's deltas are SUMMED into one row, not
-  // de-duplicated, because a delta is a conserved flow and a level is not.
+  // The delta twin of harvestHitCounts above, composed from the same two owners, in the same
+  // order, and folding by the same rule -- across several attached sources a shared key's
+  // deltas are SUMMED into one row. See NNCacheTable::takeUnpersistedHitCounts for what it is
+  // for, and NNCacheLevelZeroSources::takeUnpersistedHits for what it does that its twin does
+  // not: it consumes, and it omits a key with nothing to say.
   //
   // unrecordedHits is reported WHOLE rather than as a delta, and that is deliberate: it is a
   // count of hits whose KEY was lost, so there is no row to hold a mark against and no way to
