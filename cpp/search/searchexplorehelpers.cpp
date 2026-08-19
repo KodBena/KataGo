@@ -552,7 +552,10 @@ void Search::selectBestChildToDescend(
   //Try the new child with the best policy value
   Loc bestNewMoveLoc = Board::NULL_LOC;
   float bestNewNNPolicyProb = -1.0f;
-  for(int movePos = 0; movePos<policySize; movePos++) {
+  //A descent never resizes the board, so the geometry built for the root board is the geometry of
+  //the board this thread is looking at. Checked here rather than assumed, at the site that relies on it.
+  assert(nnPosGeometry.matchesBoardSize(thread.board));
+  for(int movePos = 0; movePos<getPolicySize(); movePos++) {
     bool alreadyTried = posesWithChildBuf[movePos];
     if(alreadyTried)
       continue;
@@ -562,7 +565,7 @@ void Search::selectBestChildToDescend(
     if(nnPolicyProb < 0)
       continue;
 
-    Loc moveLoc = NNPos::posToLoc(movePos,thread.board.x_size,thread.board.y_size,nnXLen,nnYLen);
+    Loc moveLoc = nnPosGeometry.posToLoc(movePos);
     if(moveLoc == Board::NULL_LOC)
       continue;
 
