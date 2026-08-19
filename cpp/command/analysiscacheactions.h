@@ -298,6 +298,32 @@ struct AnalysisEngineCounters {
   int64_t openRequestCount;
 };
 
+// THIS LAYER'S MINT FOR THE LEVEL-0 SWAP PERMIT, and it mints for exactly two functions.
+//
+// NNCacheLevelZeroSwapPermit is the key to NNEvaluator::attachLevelZeroSource and
+// detachLevelZeroSource; without one those calls do not compile. This class is the reason the
+// protocol layer can still make them, and it grants that power to cacheAttachExecute and
+// cacheDetachExecute BY NAME rather than to whoever includes this header: permit() is private and
+// those two functions are its only friends. The precondition the permit stands for is established
+// one layer up, in the request loop, which refuses cache_attach and cache_detach while any request
+// is open (cacheSwapConcurrencyRefusal) -- these two verbs are what it calls once it has.
+class AnalysisCacheSwapAuthority {
+ private:
+  friend nlohmann::json cacheAttachExecute(
+    const AnalysisModelHosts& hosts,
+    SearchableModelIdx modelIdx,
+    AnalysisCacheAttachments& attachments,
+    const CacheAttachRequest& request
+  );
+  friend nlohmann::json cacheDetachExecute(
+    const AnalysisModelHosts& hosts,
+    SearchableModelIdx modelIdx,
+    AnalysisCacheAttachments& attachments,
+    const CacheDetachRequest& request
+  );
+  [[nodiscard]] static NNCacheLevelZeroSwapPermit permit() { return NNCacheLevelZeroSwapPermit(); }
+};
+
 // Reads the context's container and count log, builds one frozen level 0 per source, attaches
 // them in the order the request named, and optionally fills level 1 with the remainder.
 [[nodiscard]] nlohmann::json cacheAttachExecute(

@@ -242,6 +242,18 @@ class NNCacheLevelZeroSources {
   // one-owner invariant, rather than joining it broken and being repaired later by something
   // that might not run.
   //
+  // ALL-OR-NOTHING: a throw from anywhere in the reconcile leaves this list, the arriving source
+  // and level 1's counters exactly as they were, and the source is not attached. The walk that
+  // can fail -- asking level 1 about each arriving key -- mutates nothing; everything that
+  // mutates runs afterwards and cannot fail. So there is no observable state in which some of
+  // the arriving keys are shadowed and the attach did not happen, which is what a client is
+  // entitled to reason about at a session boundary. REJECTED: accepting a partial reconcile and
+  // making the leftover state self-describing so a later attach or harvest could finish it --
+  // that turns one bounded boundary act into an obligation distributed across every future
+  // operation, and "as if it never happened" is a contract a client already understands where
+  // "partially applied but detectable" is one it must be taught. ALSO REJECTED: an undo path
+  // that un-shadows and claws the transferred counts back, because the undo can itself fail.
+  //
   // WHY THIS, AND NOT THE TWO ALTERNATIVES (both weighed, both rejected, 2026-08-19). Checking
   // level 1 first on every get would cure it too, and would put a permanent tax on the hot path
   // for a problem that exists only at a session boundary. Refusing to attach a source that
@@ -415,12 +427,87 @@ class NNCacheLevelZeroSources {
     std::unique_ptr<NNCacheFrozen> source;
   };
 
+  // THE SECOND PHASE OF attach, SPLIT OUT SO ITS INFALLIBILITY IS A DECLARATION AND NOT A
+  // COMMENT. The survey half of attach may throw and mutates nothing; this half mutates and is
+  // noexcept, so there is no state in which some of the arriving source's keys are shadowed and
+  // the source is not on the list. See the definition for why not-mutating-yet beats an undo
+  // path. Takes the entry by value with its slot on entries_ already reserved by the caller.
+  [[nodiscard]] NNCacheLevelZeroAttachment commitAttach(
+    Entry entry,
+    const std::vector<Hash128>& ownedByLevelOne,
+    NNCacheLevelOneOwner& levelOne
+  ) noexcept;
+
   uint64_t listId_;
   // Only ever increases. A detach does not give a serial back, which is what makes a stale
   // id permanently harmless rather than dangerous once the list has churned.
   uint64_t nextSerial_;
   // In resolution order. The single home of "which source answers first".
   std::vector<Entry> entries_;
+};
+
+//-------------------------------------------------------------------------------------
+// The permit that closes the level-0 swap door
+//-------------------------------------------------------------------------------------
+
+// THE KEY TO attachLevelZero AND detachLevelZero, AND THERE IS NO WAY TO MAKE ONE FROM OUTSIDE
+// THE THREE PLACES NAMED BELOW.
+//
+// WHY A TYPE AND NOT A CHECK. A get walks the resolution list LOCK-FREE, and attach and detach
+// mutate the vector that walk reads: a detach can free the structure a concurrent get is mid-probe
+// on, which is a use-after-free rather than a stale read. The always-on guard is the protocol
+// layer's refusal -- cache_attach and cache_detach are refused while any request is open
+// (cacheSwapConcurrencyRefusal) -- and that guard is only as good as it is UNBYPASSABLE. A caller
+// holding an NNEvaluator& could reach NNEvaluator::attachLevelZeroSource directly, and a caller
+// holding an NNCacheTable& could dynamic_cast to this type and reach attachLevelZero directly;
+// both bypasses were reachable, both were guarded only by an assertion the release build compiles
+// out. An assertion still costs a check and still fires only AFTER the forbidden call has been
+// made. THIS TYPE MAKES THE FORBIDDEN CALL UNWRITABLE: without a permit the call does not name a
+// viable overload, so it does not compile, and the check disappears rather than getting cheaper
+// (ADR-0000 Rule 2a -- the type that makes the class unrepresentable, at construction-time
+// loudness, the top of ADR-0002's hierarchy).
+//
+// THE THREE HOLDERS OF THE MINT, and each is named rather than implied:
+//   - NNCacheTable, whose createWithLevelZeroList builds a table and takes its own placeholder
+//     source straight back off the list, at an instant when the table does not yet exist outside
+//     the factory;
+//   - AnalysisCacheSwapAuthority (cpp/command/analysiscacheactions.h), which mints for
+//     cacheAttachExecute and cacheDetachExecute alone -- the two verbs the request loop calls
+//     only after refusing them while any request is open;
+//   - NNCacheLevelZeroSwapTestSeam (cpp/tests/testcacheswapseam.h), the declared test seam.
+//
+// WHAT THIS DOES NOT CLOSE, named rather than left silent: a production translation unit that
+// #includes the test seam header can mint. That is one greppable line in a file that has no
+// business including a tests/ header, which is a review surface, not an accident -- unlike the
+// bypasses above, which were ordinary-looking calls on an ordinary public method.
+class NNCacheLevelZeroSwapPermit {
+ public:
+  // Copyable so a permitted caller can pass its own permit down the layer it already owns --
+  // NNEvaluator::attachLevelZeroSource forwards the one it was handed to the table. Copying an
+  // existing permit is not a bypass: you must first HAVE one, and only the three below can make
+  // the first.
+  NNCacheLevelZeroSwapPermit(const NNCacheLevelZeroSwapPermit&) = default;
+  NNCacheLevelZeroSwapPermit& operator=(const NNCacheLevelZeroSwapPermit&) = default;
+
+ private:
+  NNCacheLevelZeroSwapPermit() = default;
+
+  // ONE MEMBER FUNCTION, NOT THE WHOLE CLASS. NNCacheTable has more than a dozen other methods
+  // and none of them has any business minting a permit; `friend class NNCacheTable` would have
+  // granted every one of them the right, which is wider than this design describes and wider than
+  // the least-privilege argument that rejected friending NNEvaluator wholesale. C++ lets a single
+  // static member be friended by its full signature, and the signature is nameable here --
+  // nncache.h is included above, and it forward-declares NNCacheTwoLevelTable at its own top --
+  // so the narrow form is the one that is used.
+  friend std::unique_ptr<NNCacheTwoLevelTable> NNCacheTable::createWithLevelZeroList(
+    const NNCacheConfig& config
+  );
+  // The other two mints are already at their narrowest: each is a class that exists for nothing
+  // but minting, and each grants onward by name -- AnalysisCacheSwapAuthority's permit() is
+  // private with cacheAttachExecute and cacheDetachExecute as its only friends, and
+  // NNCacheLevelZeroSwapTestSeam is the declared test seam and holds nothing else.
+  friend class AnalysisCacheSwapAuthority;
+  friend class NNCacheLevelZeroSwapTestSeam;
 };
 
 //-------------------------------------------------------------------------------------
@@ -447,11 +534,19 @@ class NNCacheTwoLevelTable : public NNCacheTable {
   // refused by name otherwise, exactly as an attribution is: spending another cache's id here
   // would file this source's retrievals under whichever context sits at the same position in
   // this table's own name space.
+  //
+  // THE PERMIT IS THE DOOR. Both mutating acts take one, and it cannot be constructed outside
+  // the three places NNCacheLevelZeroSwapPermit names, so a caller that reaches this type by
+  // dynamic_cast on an NNCacheTable& still cannot write the call. See that type.
   [[nodiscard]] virtual NNCacheLevelZeroAttachment attachLevelZero(
+    NNCacheLevelZeroSwapPermit permit,
     std::unique_ptr<NNCacheFrozen> source,
     const std::optional<NNCacheContextId>& servesContext
   ) = 0;
-  [[nodiscard]] virtual std::unique_ptr<NNCacheFrozen> detachLevelZero(const NNCacheLevelZeroSourceId& id) = 0;
+  [[nodiscard]] virtual std::unique_ptr<NNCacheFrozen> detachLevelZero(
+    NNCacheLevelZeroSwapPermit permit,
+    const NNCacheLevelZeroSourceId& id
+  ) = 0;
   [[nodiscard]] virtual size_t numLevelZeroSources() const = 0;
   [[nodiscard]] virtual std::vector<NNCacheLevelZeroSourceId> levelZeroResolutionOrder() const = 0;
 

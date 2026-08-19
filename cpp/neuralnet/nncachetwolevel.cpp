@@ -63,6 +63,24 @@ NNCacheLevelZeroAttachment NNCacheLevelZeroSources::attach(
   // reconcile after the push would leave exactly that window open, and the whole point of doing
   // this at attach rather than at the next get is that no window exists at all.
   //
+  // AND IT IS ALL-OR-NOTHING, WHICH IS WHY IT IS TWO PHASES AND NOT ONE LOOP. The walk asks
+  // level 1 about every arriving key, and asking is the only step here that can fail: it is a
+  // virtual call onto whatever table shape the operator configured. A single loop that asked and
+  // shadowed in the same pass would, on a throw at entry k, leave the first k keys shadowed and
+  // the rest not -- the operation whose whole purpose is restoring "at most one level owns any
+  // key" leaving the invariant HALF-restored, with the arriving source's evaluations retired for
+  // an attach that never happened and the retrievals they carried already moved into level 1's
+  // ledger, where nothing records that they came from a source that was thrown away.
+  //
+  // So: SURVEY, which may throw and mutates nothing, then COMMIT, which mutates and cannot
+  // throw. The plan the survey returns is a value -- the arriving keys level 1 owns -- and until
+  // that value exists in full, not one entry has been touched. This is the "do not mutate until
+  // the walk has succeeded" answer rather than the undo-path answer, and deliberately: an undo
+  // would have to un-shadow entries and claw hit counts back out of level 1's ledger, and both
+  // of those steps can themselves fail, which leaves the atomicity guarantee resting on a
+  // recovery path that is never exercised (ADR-0012 P5 -- the band-aid stacked on the band-aid).
+  // Not mutating has no recovery path to get wrong.
+  //
   // ASKED OF EVERY ENTRY, in index order, through contains() -- the surface that answers
   // membership without recording a retrieval. What level 1 OWNS is what level 1 HOLDS: an entry
   // it can still serve is one that would be served after this source, wrongly, if this source
@@ -72,13 +90,44 @@ NNCacheLevelZeroAttachment NNCacheLevelZeroSources::attach(
   // appear on both halves of the composed count surface, which is closed at the other seam, by
   // the fold in NNCacheTableTwoLevel::harvestHitCounts (ADR-0000's closure statement: the axis
   // this reconcile does not cover is named, and covered elsewhere, rather than left silent).
-  NNCacheLevelZeroAttachment attachment{NNCacheLevelZeroSourceId(listId_, nextSerial_), 0, 0};
+  std::vector<Hash128> ownedByLevelOne;
   const uint32_t numEntries = source->index().numEntries();
   for(uint32_t i = 0; i < numEntries; i++) {
     const Hash128 key = source->index().keyAt(i);
-    if(!levelOne.ownsKeyForResolution(key))
-      continue;
-    const std::optional<uint32_t> transferred = source->shadow(key);
+    if(levelOne.ownsKeyForResolution(key))
+      ownedByLevelOne.push_back(key);
+  }
+
+  // THE LAST ALLOCATION THE COMMIT COULD HAVE NEEDED, made here where a throw is still free.
+  // With the slot reserved, the push_back below moves a nothrow-movable Entry into space that
+  // already exists, so the commit phase has nothing left in it that can fail.
+  entries_.reserve(entries_.size() + 1);
+
+  Entry entry;
+  entry.serial = nextSerial_;
+  entry.servesContext = servesContext;
+  entry.source = std::move(source);
+
+  return commitAttach(std::move(entry), ownedByLevelOne, levelOne);
+}
+
+// THE COMMIT, AND IT IS noexcept BY DECLARATION RATHER THAN BY COMMENT. Every step below is one
+// the survey has already made infallible: shadow() is an atomic exchange over an index probe,
+// absorbTransferredHits() is a bounded probe under a lock, and the push_back moves into capacity
+// reserved by the caller. Marking the function noexcept is what makes that claim CHECKED rather
+// than asserted -- if any of those three ever grows a throw, this terminates at the point of the
+// violation instead of silently resurrecting the half-applied state the two phases exist to
+// foreclose. That is the sanctioned disposition for a genuine invariant violation, which is what
+// a throw from here would be (ADR-0012 P9 rule 5), and it is louder than any recovery.
+NNCacheLevelZeroAttachment NNCacheLevelZeroSources::commitAttach(
+  Entry entry,
+  const std::vector<Hash128>& ownedByLevelOne,
+  NNCacheLevelOneOwner& levelOne
+) noexcept {
+  NNCacheLevelZeroAttachment attachment{NNCacheLevelZeroSourceId(listId_, nextSerial_), 0, 0};
+  for(size_t i = 0; i < ownedByLevelOne.size(); i++) {
+    const Hash128 key = ownedByLevelOne[i];
+    const std::optional<uint32_t> transferred = entry.source->shadow(key);
     // nullopt only if this source's own entry was already shadowed, which a freshly loaded
     // source's is not and a re-attached one's may well be; either way there is nothing to move.
     if(!transferred.has_value())
@@ -93,10 +142,6 @@ NNCacheLevelZeroAttachment NNCacheLevelZeroSources::attach(
     }
   }
 
-  Entry entry;
-  entry.serial = nextSerial_;
-  entry.servesContext = servesContext;
-  entry.source = std::move(source);
   nextSerial_ += 1;
   entries_.push_back(std::move(entry));
   // The end of the vector IS the end of the resolution order. Appending is what makes
@@ -609,9 +654,13 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
   // entry of the arriving source, which for the default direct-mapped level 1 is a mask, a lock
   // and a 128-bit comparison.
   NNCacheLevelZeroAttachment attachLevelZero(
+    NNCacheLevelZeroSwapPermit permit,
     std::unique_ptr<NNCacheFrozen> source,
     const std::optional<NNCacheContextId>& servesContext
   ) override {
+    // The permit's whole work is done by the time control reaches here: it was spent at the call
+    // site, by a caller that could name a mint. See NNCacheLevelZeroSwapPermit.
+    (void)permit;
     if(servesContext.has_value() && !cacheContexts().owns(servesContext.value()))
       throw StringError(
         "NNCacheTwoLevelTable::attachLevelZero: this context is attached to a different cache. "
@@ -620,7 +669,11 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
       );
     return levelZero_.attach(std::move(source), servesContext, *this);
   }
-  std::unique_ptr<NNCacheFrozen> detachLevelZero(const NNCacheLevelZeroSourceId& id) override {
+  std::unique_ptr<NNCacheFrozen> detachLevelZero(
+    NNCacheLevelZeroSwapPermit permit,
+    const NNCacheLevelZeroSourceId& id
+  ) override {
+    (void)permit;
     return levelZero_.detach(id);
   }
   size_t numLevelZeroSources() const override { return levelZero_.size(); }

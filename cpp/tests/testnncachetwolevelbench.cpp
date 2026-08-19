@@ -11,8 +11,13 @@
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncachefrozen.h"
 #include "../neuralnet/nncachetwolevel.h"
+#include "../tests/testcacheswapseam.h"
 
 using namespace std;
+
+// The declared test seam for the level-0 swap door; see tests/testcacheswapseam.h. One permit,
+// minted once for this file, spent at every attach and detach below.
+static const NNCacheLevelZeroSwapPermit SWAP_PERMIT = NNCacheLevelZeroSwapTestSeam::permit();
 
 // WHAT THE ORDERED RESOLUTION LIST COSTS THE MISS PATH, measured rather than argued.
 //
@@ -190,7 +195,7 @@ void Tests::runNNCacheTwoLevelBench() {
     makeTwoLevelNNCacheTable(std::move(built[0]), NNCacheTable::create(NNCacheConfig::statusQuo(16, 2)), 16);
   for(int attached = 1; attached <= MAX_SOURCES; attached++) {
     if(attached > 1)
-      (void)table->attachLevelZero(std::move(built[(size_t)attached - 1]), std::optional<NNCacheContextId>());
+      (void)table->attachLevelZero(SWAP_PERMIT, std::move(built[(size_t)attached - 1]), std::optional<NNCacheContextId>());
     if((int)table->numLevelZeroSources() != attached)
       throw StringError("bench: the list is not the size this arm says it is");
 
@@ -265,7 +270,7 @@ void Tests::runNNCacheTwoLevelBench() {
           }
           ClockTimer timer;
           const NNCacheLevelZeroAttachment attachment =
-            attachTable->attachLevelZero(std::move(source), std::optional<NNCacheContextId>());
+            attachTable->attachLevelZero(SWAP_PERMIT, std::move(source), std::optional<NNCacheContextId>());
           ms.push_back(timer.getSeconds() * 1.0e3);
           // NOT AN EQUALITY on the owned arm: level 1 here is the shipped direct-mapped table, so
           // a few thousand of the keys offered to it displaced each other and are genuinely not

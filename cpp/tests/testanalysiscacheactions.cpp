@@ -3,6 +3,7 @@
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <type_traits>
 
 #include "../command/analysiscacheactions.h"
 #include "../core/config_parser.h"
@@ -906,68 +907,41 @@ void testStatsReportsWhatIsResidentAndWhatIsAttached(RealEngineCache& engine) {
   (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, true});
 }
 
-// THE DEBUG TRIPWIRE, EXERCISED BY BYPASSING THE PROTOCOL LAYER ON PURPOSE.
+// THE DEBUG TRIPWIRE THAT STOOD HERE IS GONE, AND SO IS THE BYPASS IT WITNESSED.
 //
-// The protocol refuses cache_attach and cache_detach while any request is open, which is what
-// keeps a lock-free resolution walk off a vector that is being mutated. That refusal lives in the
-// engine's request loop, so a caller reaching NNEvaluator directly walks straight past it -- and
-// what it would corrupt is memory, silently, later. So a debug build asserts the same property AT
-// THE SITE, and this is the leg that trips it.
+// It attached a level-0 source through NNEvaluator directly, with an evaluation in flight on
+// another thread, and expected a debug-build assertion to kill the process. That leg no longer
+// compiles, which is the whole of the change it is recording: NNEvaluator::attachLevelZeroSource
+// now takes an NNCacheLevelZeroSwapPermit, and a caller that cannot name one of that type's three
+// mints cannot write the call. The bypass is not caught -- it is unwritable, and unwritable is
+// what the assertion was standing in for in the one build configuration (debug) where it existed
+// at all. See the note above NNEvaluator::attachLevelZeroSource's definition for why the
+// assertion was removed rather than kept beside the type.
 //
-// IT IS FATAL BY DESIGN and therefore cannot run inside an ordinary test process: the assertion
-// calls Global::fatalError, which does not return. It is gated behind an environment variable and
-// witnessed by running the binary twice -- once without it, where the suite passes, and once with
-// it, where the process dies at the assertion with its message on stderr. A release build compiles
-// the whole thing out and this leg finds nothing to trip, which the message below says out loud
-// rather than passing silently.
-//
-//   KATAGO_WITNESS_CACHE_SWAP_TRIPWIRE=1 ./build/katago runtests
-//
-// The observation point is the act itself, not a downstream symptom: an evaluation really is in
-// flight on another thread, and the attach really is the call that fires (ADR-0021 Rules 1-2).
-void testTheDebugTripwireFiresWhenTheProtocolLayerIsBypassed(RealEngineCache& engine) {
-  const char* env = getenv("KATAGO_WITNESS_CACHE_SWAP_TRIPWIRE");
-  if(env == NULL || env[0] == '\0' || string(env) == "0")
-    return;
-
-  NNEvaluator& eval = *engine.hosts->searchableEval(AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX);
-#ifdef NDEBUG
-  cout << "  KATAGO_WITNESS_CACHE_SWAP_TRIPWIRE is set, but this is a RELEASE build (NDEBUG): the "
-          "attach/detach tripwire is compiled out and there is nothing here to fire. Rebuild with "
-          "assertions (-UNDEBUG) to witness it." << endl;
-  (void)eval;
-  return;
-#else
-  cout << "  KATAGO_WITNESS_CACHE_SWAP_TRIPWIRE is set: bypassing the protocol layer, an evaluation "
-          "in flight, expecting a FATAL ERROR from the attach below." << endl;
-  cout.flush();
-
-  std::atomic<bool> stop(false);
-  std::thread evaluator([&]() {
-    Board board(5, 5);
-    BoardHistory hist(board, P_BLACK, Rules::getTrompTaylorish(), 0, BoardHistoryModes());
-    MiscNNInputParams params;
-    while(!stop.load(std::memory_order_acquire)) {
-      NNResultBuf buf;
-      // skipCache, so every iteration is a real forward pass and the thread is inside evaluate()
-      // essentially all of the time rather than being served from the cache.
-      eval.evaluate(board, hist, P_BLACK, params, buf, true, false);
-    }
-  });
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  // The bypass. In a debug build this does not return.
-  const NNCacheContextId tripwireContext = eval.attachCacheContext("card-tripwire");
-  const NNCacheLevelZeroAttachment attachment =
-    eval.attachLevelZeroSource(NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()), tripwireContext);
-  (void)attachment;
-
-  stop.store(true, std::memory_order_release);
-  evaluator.join();
-  cout << "  the tripwire did NOT fire: the attach returned while an evaluation was in flight, "
-          "which is the thing it exists to catch." << endl;
-  testAssert(false);
-#endif
+// WHAT STILL WITNESSES THE PROPERTY, in this file and in the compiler:
+//   - testTheSwapPermitCannotBeMintedHere below, a static_assert in a translation unit that is
+//     not one of the three mints: it fails the BUILD if the permit ever becomes constructible
+//     from an ordinary caller (ADR-0021 Rule 2 -- a tripwire whose firing is the observation,
+//     here at compile time);
+//   - the request loop's own refusal while a request is open, which is always on, is not
+//     compiled out of anything, and is what the permit's holders spend a permit AFTER checking.
+void testTheSwapPermitCannotBeMintedHere() {
+  // This translation unit is not NNCacheTable, not AnalysisCacheSwapAuthority, and does not
+  // include tests/testcacheswapseam.h. So the permit's constructor is inaccessible here, and the
+  // door is closed against exactly the caller shape the deleted leg above used to embody.
+  static_assert(
+    !std::is_default_constructible<NNCacheLevelZeroSwapPermit>::value,
+    "NNCacheLevelZeroSwapPermit became constructible from an ordinary caller: the level-0 swap "
+    "door is open again, and NNEvaluator::attachLevelZeroSource can be reached past the protocol "
+    "layer's open-request refusal."
+  );
+  // Copy-construction stays available on purpose -- a permitted caller forwards its own permit
+  // down a layer -- and is not a way to obtain a first one.
+  static_assert(
+    std::is_copy_constructible<NNCacheLevelZeroSwapPermit>::value,
+    "A permitted caller can no longer forward the permit it holds."
+  );
+  cout << "  the level-0 swap permit is not constructible in this translation unit (compile-time)" << endl;
 }
 
 // Every act says the same thing about an engine started without nnCacheDir, rather than one of
@@ -1024,8 +998,8 @@ void Tests::runAnalysisCacheActionTests() {
     testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(engine);
     testForeignModelSourcesResolveAgainstTheLoadedModels(engine);
     testStatsReportsWhatIsResidentAndWhatIsAttached(engine);
-    testTheDebugTripwireFiresWhenTheProtocolLayerIsBypassed(engine);
   }
+  testTheSwapPermitCannotBeMintedHere();
   testAnEngineWithoutACacheDirectoryRefusesEveryAct();
   cout << "Done" << endl;
 }

@@ -225,11 +225,11 @@ class NNEvaluator {
   // than a caution: a get walks the resolution list lock-free, and this mutates the vector it
   // walks, so a concurrent get can read freed memory. The protocol layer forecloses it by
   // refusing attach and detach while any request is open (docs/Analysis_Engine.md,
-  // "cache_attach"), and a DEBUG BUILD ASSERTS IT HERE so a caller that reached past the
-  // protocol trips loudly at the moment it does rather than corrupting silently later
-  // (ADR-0021 Rule 2: the tripwire's firing is the observation). The assertion is compiled
-  // out of a release build, where it would cost the evaluation path an atomic it does not
-  // otherwise need.
+  // "cache_attach"), AND THAT REFUSAL IS THE ONLY DOOR: this act takes an
+  // NNCacheLevelZeroSwapPermit, which cannot be constructed outside the three places that type
+  // names, so a caller holding an NNEvaluator& and no permit cannot write this call at all. It
+  // is not refused at run time; it does not compile. See NNCacheLevelZeroSwapPermit for why a
+  // type replaced the release-compiled-out assertion that used to sit here.
   //
   // Throws StringError if this evaluator has no level-0 resolution list -- no nnCacheDir --
   // or for a null source.
@@ -243,7 +243,9 @@ class NNEvaluator {
   // and re-attached cannot serve the evaluation that set superseded
   // (NNCacheLevelZeroSources::attach).
   [[nodiscard]] NNCacheLevelZeroAttachment attachLevelZeroSource(
-    std::unique_ptr<NNCacheFrozen> source, const NNCacheContextId& servesContext
+    NNCacheLevelZeroSwapPermit permit,
+    std::unique_ptr<NNCacheFrozen> source,
+    const NNCacheContextId& servesContext
   );
 
   // Removes the source `id` names and HANDS IT BACK, leaving every other source's relative
@@ -251,10 +253,13 @@ class NNEvaluator {
   // nnCacheReleaseLevelZero, which OBSERVES whether the arena actually went rather than
   // assuming the destructor ran.
   //
-  // Carries the same concurrency contract and the same debug assertion as
-  // attachLevelZeroSource. Throws StringError for an id this cache did not mint, for one
-  // already detached, and when there is no level-0 resolution list at all.
-  [[nodiscard]] std::unique_ptr<NNCacheFrozen> detachLevelZeroSource(const NNCacheLevelZeroSourceId& id);
+  // Carries the same concurrency contract, and the same permit, as attachLevelZeroSource.
+  // Throws StringError for an id this cache did not mint, for one already detached, and when
+  // there is no level-0 resolution list at all.
+  [[nodiscard]] std::unique_ptr<NNCacheFrozen> detachLevelZeroSource(
+    NNCacheLevelZeroSwapPermit permit,
+    const NNCacheLevelZeroSourceId& id
+  );
 
   // How many level-0 sources are attached right now. Zero for a freshly started engine.
   // Throws StringError when there is no level-0 resolution list at all.
@@ -334,28 +339,6 @@ class NNEvaluator {
   // The one home of "this evaluator was built with a level-0 resolution list", so the three
   // public level-0 surfaces refuse in the same words.
   [[nodiscard]] NNCacheTwoLevelTable& levelZeroTableOrThrow() const;
-  // The debug tripwire attachLevelZeroSource and detachLevelZeroSource both carry. See
-  // attachLevelZeroSource. A no-op in a release build.
-  void assertNoEvaluationInFlightForLevelZeroSwap(const char* act) const;
-
-#ifndef NDEBUG
-  // Marks one evaluation as in flight for as long as it is. A type rather than a pair of
-  // statements because an evaluate() that returns early -- and it returns early on every
-  // cache hit -- would otherwise leave the counter above zero forever, which turns the
-  // tripwire into a permanent false alarm.
-  class InFlightEvaluationMark {
-   public:
-    explicit InFlightEvaluationMark(std::atomic<int>& counter) : counter_(counter) {
-      counter_.fetch_add(1, std::memory_order_release);
-    }
-    ~InFlightEvaluationMark() { counter_.fetch_sub(1, std::memory_order_release); }
-    InFlightEvaluationMark(const InFlightEvaluationMark&) = delete;
-    InFlightEvaluationMark& operator=(const InFlightEvaluationMark&) = delete;
-
-   private:
-    std::atomic<int>& counter_;
-  };
-#endif
 
   const std::string modelName;
   const std::string modelFileName;
@@ -380,13 +363,6 @@ class NNEvaluator {
   // one place and cannot come apart.
   NNCacheTwoLevelTable* nnCacheLevelZeroTable;
   std::optional<std::string> nnCacheDirectory;
-#ifndef NDEBUG
-  // Evaluations currently inside evaluate(), and therefore possibly inside a lock-free walk
-  // of the level-0 resolution list. Debug builds only: it exists to make the attach/detach
-  // concurrency contract trip loudly when a caller bypasses the protocol layer, and a release
-  // build pays nothing for it.
-  std::atomic<int> nnCacheEvaluationsInFlight;
-#endif
   Logger* logger;
 
   std::string internalModelName;

@@ -608,7 +608,7 @@ json cacheAttachExecute(
       // that cost the source, which is a figure a client re-attaching a card it has been
       // evaluating against needs to see rather than infer.
       const NNCacheLevelZeroAttachment attachment =
-        eval.attachLevelZeroSource(std::move(load.levelZero), contextId);
+        eval.attachLevelZeroSource(AnalysisCacheSwapAuthority::permit(), std::move(load.levelZero), contextId);
       record.sources.push_back(
         CacheAttachedSource{
           sourceEval.getInternalModelName(), load.report.entriesInLevelZero, load.report.entriesLeftOver,
@@ -674,7 +674,8 @@ json cacheAttachExecute(
     // would serve keys the client never asked to have attached, and no response field would
     // say so. Take back exactly what this call put on, then let the refusal through.
     for(size_t i = record.sources.size(); i > 0; i--) {
-      const unique_ptr<NNCacheFrozen> taken = eval.detachLevelZeroSource(record.sources[i - 1].sourceId);
+      const unique_ptr<NNCacheFrozen> taken =
+        eval.detachLevelZeroSource(AnalysisCacheSwapAuthority::permit(), record.sources[i - 1].sourceId);
       (void)taken;
     }
     throw;
@@ -752,12 +753,14 @@ json cacheDetachExecute(
 
   // Detached in reverse attach order, so the resolution list shrinks from the end and no
   // surviving source's position moves under a concurrent reader. (There is no concurrent
-  // reader: the protocol refuses this while any request is open, and a debug build asserts it.)
+  // reader: the protocol refuses this while any request is open, and that refusal is the ONLY
+  // door -- NNEvaluator::detachLevelZeroSource takes a permit no other layer can mint.)
   int64_t sourcesDetached = 0;
   int64_t sourcesWhoseStorageWentBack = 0;
   NNCacheHeapReclaim reclaim = NNCacheHeapReclaim::NothingToTrim;
   for(size_t i = record.sources.size(); i > 0; i--) {
-    unique_ptr<NNCacheFrozen> taken = eval.detachLevelZeroSource(record.sources[i - 1].sourceId);
+    unique_ptr<NNCacheFrozen> taken =
+      eval.detachLevelZeroSource(AnalysisCacheSwapAuthority::permit(), record.sources[i - 1].sourceId);
     const NNCacheLevelZeroRelease release = nnCacheReleaseLevelZero(std::move(taken));
     sourcesDetached += 1;
     if(release.storageReleased)
