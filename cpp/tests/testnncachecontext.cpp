@@ -64,6 +64,19 @@ namespace {
 
 const char* const TMP_DIR_PREFIX = "tmpnncachecontext";
 
+// The per-context hit surface, as the delta type appendDump takes.
+//
+// harvestHitCountsFor reports a context's RUNNING TOTAL, and appendDump takes a DELTA -- two
+// different quantities, which is why the type refuses the conversion and this helper has to
+// say what it is doing. The tests below each dump ONCE per context, into a log with no prior
+// block, so the running total IS the delta and the two coincide exactly. That coincidence is
+// what makes the conversion honest here and nowhere else: there is no per-context delta
+// surface, so a second dump of the same context through this route would double-count, and no
+// test below takes one.
+NNCacheHitCountDelta asDelta(const NNCacheHitLedger& perContextTotals) {
+  return NNCacheHitCountDelta::ofDeltaRows(perContextTotals.entries(), perContextTotals.unrecordedHits());
+}
+
 // A distinct key per serial, spread over both halves.
 Hash128 nthKey(int serial) {
   return Hash128(
@@ -271,8 +284,8 @@ void testEachContextsEarningsReachThatContextsCountLogAndNoOthers() {
 
   const NNCacheCountLog logA = NNCacheCountLog::forContext(dir.path(), "card-5455");
   const NNCacheCountLog logB = NNCacheCountLog::forContext(dir.path(), "card-9001");
-  logA.appendDump(table->harvestHitCountsFor(cardA));
-  logB.appendDump(table->harvestHitCountsFor(cardB));
+  logA.appendDump(asDelta(table->harvestHitCountsFor(cardA)));
+  logB.appendDump(asDelta(table->harvestHitCountsFor(cardB)));
 
   const NNCacheCountLogContents contentsA = logA.load();
   const NNCacheCountLogContents contentsB = logB.load();
@@ -343,8 +356,8 @@ void testAnEntryWithNoAttributableContextIsCountedAndNotGuessedIntoOne() {
   // And the same, observed on the files a dump actually writes: neither card's log carries it.
   const NNCacheCountLog logA = NNCacheCountLog::forContext(dir.path(), "card-5455");
   const NNCacheCountLog logB = NNCacheCountLog::forContext(dir.path(), "card-9001");
-  logA.appendDump(table->harvestHitCountsFor(cardA));
-  logB.appendDump(table->harvestHitCountsFor(cardB));
+  logA.appendDump(asDelta(table->harvestHitCountsFor(cardA)));
+  logB.appendDump(asDelta(table->harvestHitCountsFor(cardB)));
   testAssert(!logHasKey(logA.load(), orphan));
   testAssert(!logHasKey(logB.load(), orphan));
   testAssert(logHasKey(logA.load(), attributed));

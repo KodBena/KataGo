@@ -11,6 +11,8 @@
 #include "../game/board.h"
 #include "../game/boardhistory.h"
 #include "../neuralnet/nncache.h"
+#include "../neuralnet/nncachefrozen.h"
+#include "../neuralnet/nncachetwolevel.h"
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/sgfmetadata.h"
 #include "../neuralnet/nninterface.h"
@@ -194,6 +196,59 @@ class NNEvaluator {
   // there is no cache, or for a context this evaluator did not attach.
   [[nodiscard]] NNCacheHitLedger harvestCacheHitCountsFor(const NNCacheContextId& context) const;
 
+  //-----------------------------------------------------------------------------------
+  // The persisted cache (see nncachelevelzero.h, nnevalcontainer.h, nncachedump.h)
+  //-----------------------------------------------------------------------------------
+
+  // WHERE THIS MODEL'S PERSISTED CACHE LIVES: the directory holding <context>.nncounts and
+  // <context>.<model>.nnevals, present exactly when the operator set nnCacheDir -- and
+  // therefore exactly when this evaluator's cache can attach a level-0 source at all. The
+  // two are one configuration decision, so they are one field here as they are one field in
+  // NNCacheConfig, and there is no state in which an engine has a directory it cannot attach
+  // from or an attach surface with nowhere to read.
+  [[nodiscard]] const std::optional<std::string>& getCacheDirectory() const;
+
+  // THIS EVALUATOR'S CACHE TABLE, for the protocol layer that persists and reports on it --
+  // the harvest, attribution, dump-planning and stats surfaces NNCacheTable already carries.
+  //
+  // A reference rather than a pointer, and a throw rather than a null, so a caller cannot
+  // hold "maybe there is a cache" as a value it might forget to test (ADR-0012 P9 rule 1).
+  // Throws StringError, saying so, when this evaluator has no cache configured.
+  [[nodiscard]] NNCacheTable& cacheTable() const;
+
+  // ATTACHES ONE PRE-WARMED LEVEL-0 SOURCE at the END of this cache's resolution order, and
+  // returns the only kind of value that can address it. Last attached is last tried, which
+  // is the whole of the cross-model priority mechanism: a client that wants a source to win
+  // a key attaches it earlier.
+  //
+  // NOT SAFE AGAINST A CONCURRENT EVALUATION, and that is a property of the structure rather
+  // than a caution: a get walks the resolution list lock-free, and this mutates the vector it
+  // walks, so a concurrent get can read freed memory. The protocol layer forecloses it by
+  // refusing attach and detach while any request is open (docs/Analysis_Engine.md,
+  // "cache_attach"), and a DEBUG BUILD ASSERTS IT HERE so a caller that reached past the
+  // protocol trips loudly at the moment it does rather than corrupting silently later
+  // (ADR-0021 Rule 2: the tripwire's firing is the observation). The assertion is compiled
+  // out of a release build, where it would cost the evaluation path an atomic it does not
+  // otherwise need.
+  //
+  // Throws StringError if this evaluator has no level-0 resolution list -- no nnCacheDir --
+  // or for a null source.
+  [[nodiscard]] NNCacheLevelZeroSourceId attachLevelZeroSource(std::unique_ptr<NNCacheFrozen> source);
+
+  // Removes the source `id` names and HANDS IT BACK, leaving every other source's relative
+  // order unchanged. Returning it is what lets the caller release its storage through
+  // nnCacheReleaseLevelZero, which OBSERVES whether the arena actually went rather than
+  // assuming the destructor ran.
+  //
+  // Carries the same concurrency contract and the same debug assertion as
+  // attachLevelZeroSource. Throws StringError for an id this cache did not mint, for one
+  // already detached, and when there is no level-0 resolution list at all.
+  [[nodiscard]] std::unique_ptr<NNCacheFrozen> detachLevelZeroSource(const NNCacheLevelZeroSourceId& id);
+
+  // How many level-0 sources are attached right now. Zero for a freshly started engine.
+  // Throws StringError when there is no level-0 resolution list at all.
+  [[nodiscard]] size_t numLevelZeroSources() const;
+
   // Queue a position for the next neural net batch evaluation and wait for it. Upon evaluation, result
   // will be supplied in NNResultBuf& buf, the shared_ptr there can grabbed via std::move if desired.
   // logStream is for some error logging, can be NULL.
@@ -265,6 +320,32 @@ class NNEvaluator {
   void clearStats();
 
  private:
+  // The one home of "this evaluator was built with a level-0 resolution list", so the three
+  // public level-0 surfaces refuse in the same words.
+  [[nodiscard]] NNCacheTwoLevelTable& levelZeroTableOrThrow() const;
+  // The debug tripwire attachLevelZeroSource and detachLevelZeroSource both carry. See
+  // attachLevelZeroSource. A no-op in a release build.
+  void assertNoEvaluationInFlightForLevelZeroSwap(const char* act) const;
+
+#ifndef NDEBUG
+  // Marks one evaluation as in flight for as long as it is. A type rather than a pair of
+  // statements because an evaluate() that returns early -- and it returns early on every
+  // cache hit -- would otherwise leave the counter above zero forever, which turns the
+  // tripwire into a permanent false alarm.
+  class InFlightEvaluationMark {
+   public:
+    explicit InFlightEvaluationMark(std::atomic<int>& counter) : counter_(counter) {
+      counter_.fetch_add(1, std::memory_order_release);
+    }
+    ~InFlightEvaluationMark() { counter_.fetch_sub(1, std::memory_order_release); }
+    InFlightEvaluationMark(const InFlightEvaluationMark&) = delete;
+    InFlightEvaluationMark& operator=(const InFlightEvaluationMark&) = delete;
+
+   private:
+    std::atomic<int>& counter_;
+  };
+#endif
+
   const std::string modelName;
   const std::string modelFileName;
   const int nnXLen;
@@ -282,6 +363,19 @@ class NNEvaluator {
   ComputeContext* computeContext;
   LoadedModel* loadedModel;
   std::unique_ptr<NNCacheTable> nnCacheTable;
+  // The same table as nnCacheTable when this evaluator was built with a level-0 resolution
+  // list, and null otherwise. NOT OWNED -- nnCacheTable owns it -- and set once at
+  // construction beside it, so "has a directory" and "has an attach surface" are decided in
+  // one place and cannot come apart.
+  NNCacheTwoLevelTable* nnCacheLevelZeroTable;
+  std::optional<std::string> nnCacheDirectory;
+#ifndef NDEBUG
+  // Evaluations currently inside evaluate(), and therefore possibly inside a lock-free walk
+  // of the level-0 resolution list. Debug builds only: it exists to make the attach/detach
+  // concurrency contract trip loudly when a caller bypasses the protocol layer, and a release
+  // build pays nothing for it.
+  std::atomic<int> nnCacheEvaluationsInFlight;
+#endif
   Logger* logger;
 
   std::string internalModelName;

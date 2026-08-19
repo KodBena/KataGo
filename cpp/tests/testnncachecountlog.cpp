@@ -41,7 +41,9 @@ Hash128 nthKey(int serial) {
   );
 }
 
-NNCacheHitLedger ledgerOf(const vector<pair<int,uint32_t>>& serialAndHits, int64_t unrecorded) {
+// The rows of one DUMP, as the delta type appendDump takes. These are hand-built deltas --
+// what a session accrued since its last dump -- which is what ofDeltaRows is named for.
+NNCacheHitCountDelta deltaOf(const vector<pair<int,uint32_t>>& serialAndHits, int64_t unrecorded) {
   vector<NNCacheHitCount> rows;
   for(size_t i = 0; i < serialAndHits.size(); i++) {
     NNCacheHitCount row;
@@ -49,7 +51,7 @@ NNCacheHitLedger ledgerOf(const vector<pair<int,uint32_t>>& serialAndHits, int64
     row.hits = serialAndHits[i].second;
     rows.push_back(row);
   }
-  return NNCacheHitLedger::counted(std::move(rows), unrecorded);
+  return NNCacheHitCountDelta::ofDeltaRows(std::move(rows), unrecorded);
 }
 
 // The one row for `serial`. Asserts there is exactly one -- so "one row per key" is
@@ -126,7 +128,7 @@ void testCountLogRoundTripsCountsExactly() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "roundtrip");
 
-  const NNCacheCountLogAppendResult appended = log.appendDump(ledgerOf({{1, 7}, {2, 0}, {3, 4000000000u}}, 0));
+  const NNCacheCountLogAppendResult appended = log.appendDump(deltaOf({{1, 7}, {2, 0}, {3, 4000000000u}}, 0));
   testAssert(appended.tornTailBytesDiscarded == 0);
   testAssert(appended.rewroteTheFile == false);
   // A first dump writes the file header too; the block itself is the framing plus the rows.
@@ -159,9 +161,9 @@ void testCountLogAccumulatesAcrossDumps() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "accumulate");
 
-  log.appendDump(ledgerOf({{1, 3}, {2, 5}}, 0));
-  log.appendDump(ledgerOf({{1, 4}, {3, 9}}, 2));
-  log.appendDump(ledgerOf({{1, 1}}, 3));
+  log.appendDump(deltaOf({{1, 3}, {2, 5}}, 0));
+  log.appendDump(deltaOf({{1, 4}, {3, 9}}, 2));
+  log.appendDump(deltaOf({{1, 1}}, 3));
 
   const NNCacheCountLogContents contents = log.load();
   testAssert(contents.blocksApplied() == 3);
@@ -181,14 +183,14 @@ void testCountLogTornTailIsDiscardedAndThePrefixSurvives() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "torn");
 
-  log.appendDump(ledgerOf({{1, 10}, {2, 20}}, 0));
-  log.appendDump(ledgerOf({{1, 5}, {3, 30}}, 0));
+  log.appendDump(deltaOf({{1, 10}, {2, 20}}, 0));
+  log.appendDump(deltaOf({{1, 5}, {3, 30}}, 0));
   const int64_t sizeAfterTwoDumps = sizeOf(log.path());
 
   // The third dump names a key no earlier dump did, so its survival or absence is directly
   // observable rather than hidden inside a sum (ADR-0021 Rule 1: observe the property at
   // the site of the claim).
-  log.appendDump(ledgerOf({{1, 100}, {4, 400}, {5, 500}}, 7));
+  log.appendDump(deltaOf({{1, 100}, {4, 400}, {5, 500}}, 7));
   const int64_t sizeAfterThreeDumps = sizeOf(log.path());
   testAssert(sizeAfterThreeDumps == sizeAfterTwoDumps + NNCacheCountLog::bytesForDumpOf(3));
 
@@ -242,9 +244,9 @@ void testCountLogAWholeButCorruptBlockIsRejectedByItsChecksum() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "corrupt");
 
-  log.appendDump(ledgerOf({{1, 11}}, 0));
+  log.appendDump(deltaOf({{1, 11}}, 0));
   const int64_t sizeAfterOneDump = sizeOf(log.path());
-  log.appendDump(ledgerOf({{2, 22}}, 0));
+  log.appendDump(deltaOf({{2, 22}}, 0));
 
   // Zero out eight bytes inside the SECOND block's single record: the file length is
   // unchanged, every offset still lines up, and only the payload checksum can tell.
@@ -265,9 +267,9 @@ void testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "badlen");
 
-  log.appendDump(ledgerOf({{1, 11}}, 0));
+  log.appendDump(deltaOf({{1, 11}}, 0));
   const int64_t sizeAfterOneDump = sizeOf(log.path());
-  log.appendDump(ledgerOf({{2, 22}}, 0));
+  log.appendDump(deltaOf({{2, 22}}, 0));
 
   // Overwrite the second block's record count with 0xFFFFFFFF. If the header checksum were
   // not checked first, the loader would be handed a four-billion-record length.
@@ -288,9 +290,9 @@ void testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved() {
   // fabricated unattributed count.
   {
     const NNCacheCountLog log2 = NNCacheCountLog::forContext(dir.path(), "badhdr");
-    log2.appendDump(ledgerOf({{1, 11}}, 0));
+    log2.appendDump(deltaOf({{1, 11}}, 0));
     const int64_t sizeAfterFirst = sizeOf(log2.path());
-    log2.appendDump(ledgerOf({{2, 22}}, 5));
+    log2.appendDump(deltaOf({{2, 22}}, 5));
     overwriteBytesAt(log2.path(), sizeAfterFirst + 8, vector<uint8_t>{7, 7, 7, 7, 7, 7, 7, 7});
 
     const NNCacheCountLogContents contents2 = log2.load();
@@ -307,13 +309,13 @@ void testCountLogTornTailIsRepairedBeforeTheNextAppend() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "repair");
 
-  log.appendDump(ledgerOf({{1, 10}, {2, 20}}, 0));
+  log.appendDump(deltaOf({{1, 10}, {2, 20}}, 0));
   const int64_t sizeAfterOneDump = sizeOf(log.path());
-  log.appendDump(ledgerOf({{3, 30}}, 0));
+  log.appendDump(deltaOf({{3, 30}}, 0));
   truncateTo(log.path(), sizeOf(log.path()) - 5);
   const int64_t tornBytes = sizeOf(log.path()) - sizeAfterOneDump;
 
-  const NNCacheCountLogAppendResult appended = log.appendDump(ledgerOf({{4, 40}}, 0));
+  const NNCacheCountLogAppendResult appended = log.appendDump(deltaOf({{4, 40}}, 0));
   testAssert(appended.tornTailBytesDiscarded == tornBytes);
   testAssert(appended.rewroteTheFile == true);
 
@@ -336,7 +338,7 @@ void testCountLogCompactionPreservesTotalsAndSurvivesACrash() {
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "compact");
 
   for(int i = 0; i < 10; i++)
-    log.appendDump(ledgerOf({{1, 2}, {2, 3}}, 1));
+    log.appendDump(deltaOf({{1, 2}, {2, 3}}, 1));
   const NNCacheCountLogContents before = log.load();
   const int64_t sizeBefore = sizeOf(log.path());
   testAssert(before.recordsApplied() == 20);
@@ -387,9 +389,9 @@ void testCountLogOrdersByLookupsAndNotBySessions() {
 
   // Key 1: one dump, many lookups. Key 2: many dumps, few lookups each. The two orderings
   // disagree, which is the whole point of the fixture.
-  log.appendDump(ledgerOf({{1, 100}, {2, 1}}, 0));
+  log.appendDump(deltaOf({{1, 100}, {2, 1}}, 0));
   for(int i = 0; i < 5; i++)
-    log.appendDump(ledgerOf({{2, 1}}, 0));
+    log.appendDump(deltaOf({{2, 1}}, 0));
 
   const NNCacheCountLogContents contents = log.load();
   testAssert(rowFor(contents, 1).lookups == 100 && rowFor(contents, 1).sessions == 1);
@@ -430,7 +432,7 @@ void testCountLogRefusesWhatItCannotHonor() {
     const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "notcounted");
     string message;
     bool refused = false;
-    try { log.appendDump(NNCacheHitLedger::notCounted()); }
+    try { log.appendDump(NNCacheHitCountDelta::notCounted()); }
     catch(const StringError& e) { refused = true; message = e.what(); }
     testAssert(refused);
     testAssert(!FileUtils::exists(log.path()));
@@ -471,7 +473,7 @@ void testCountLogRefusesWhatItCannotHonor() {
   // are different facts about different key sets.
   {
     const NNCacheCountLog one = NNCacheCountLog::forContext(dir.path(), "ctxone");
-    one.appendDump(ledgerOf({{1, 1}}, 0));
+    one.appendDump(deltaOf({{1, 1}}, 0));
     const NNCacheCountLog two = NNCacheCountLog::forContext(dir.path(), "ctxtwo");
     gfs::copy_file(gfs::u8path(one.path()), gfs::u8path(two.path()));
     testAssert(loadIsRefused(two));
@@ -480,7 +482,7 @@ void testCountLogRefusesWhatItCannotHonor() {
   // A bumped version byte is refused, which is what the magic and version are for.
   {
     const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "version");
-    log.appendDump(ledgerOf({{1, 1}}, 0));
+    log.appendDump(deltaOf({{1, 1}}, 0));
     overwriteBytesAt(log.path(), 8, vector<uint8_t>{99, 0, 0, 0});
     testAssert(loadIsRefused(log));
   }

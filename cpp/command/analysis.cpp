@@ -9,6 +9,7 @@
 #include "../program/playutils.h"
 #include "../program/play.h"
 #include "../command/commandline.h"
+#include "../command/analysiscacheactions.h"
 #include "../command/analysismodels.h"
 #include "../core/test.h"
 #include "../main.h"
@@ -362,6 +363,10 @@ int MainCmds::analysis(const vector<string>& args) {
   std::mutex openRequestsMutex;
   std::map<int64_t, AnalyzeRequest*> openRequests;
 
+  //What the cache actions have attached to each hosted model. Read and written ONLY on the request
+  //loop below, which is a single thread, so it takes no lock; see AnalysisCacheAttachments.
+  AnalysisCacheAttachments cacheAttachments(modelHosts.numSearchable());
+
   auto reportError = [&pushToWrite,&logger,&logErrorsAndWarnings](const string& s) {
     json ret;
     ret["error"] = s;
@@ -607,21 +612,25 @@ int MainCmds::analysis(const vector<string>& args) {
       //Special actions
       if(input.find("action") != input.end() && input["action"].is_string()) {
         string action = input["action"].get<string>();
-        //"model" selects which model analyzes a QUERY. No action reads it, and an action that
-        //accepted it and then did the same thing regardless would be a field the receiver cannot
-        //honor -- so it is refused here rather than ignored, and refused for every action at once,
-        //which is the honest state until an action exists that means something by it.
-        if(input.find("model") != input.end()) {
-          reportErrorForId(rbase.id, "model", "The \"model\" field selects which model analyzes a query and is not supported on an action query");
+        //The cache actions are the ones that DO mean something by "model": it selects whose cache
+        //-- and therefore whose files -- the action addresses. Every other action is unchanged.
+        const bool isCacheAction =
+          action == "cache_attach" || action == "cache_detach" ||
+          action == "cache_dump" || action == "cache_stats";
+        //"model" selects which model analyzes a QUERY. The non-cache actions read it nowhere, and
+        //an action that accepted it and then did the same thing regardless would be a field the
+        //receiver cannot honor -- so it is refused here rather than ignored.
+        if(!isCacheAction && input.find("model") != input.end()) {
+          reportErrorForId(rbase.id, "model", "The \"model\" field selects which model analyzes a query and is not supported on this action; the cache actions take it to select whose cache they address");
           continue;
         }
         //Same disposition, same reason: "cacheContext" says which attached context a QUERY's new
-        //evaluations are earned by, no action reads it, and an action that accepted it and then
-        //did the same thing regardless would be a field the receiver cannot honor. The cache
-        //actions that will mean something by a context carry it as their own named field when
-        //they exist; until then this is refused rather than silently ignored.
+        //evaluations are earned by. No action reads it -- the cache actions name their context in
+        //their own "context" field, which is a different question (which body of persisted content
+        //this act is ABOUT, not which one a query's earnings belong to) -- so it is refused here for
+        //every action rather than silently ignored.
         if(input.find("cacheContext") != input.end()) {
-          reportErrorForId(rbase.id, "cacheContext", "The \"cacheContext\" field attributes a query's new cache entries and is not supported on an action query");
+          reportErrorForId(rbase.id, "cacheContext", "The \"cacheContext\" field attributes a query's new cache entries and is not supported on an action query; the cache actions name the context they act on in their own \"context\" field");
           continue;
         }
         if(action == "query_version") {
@@ -733,8 +742,100 @@ int MainCmds::analysis(const vector<string>& args) {
           }
           pushToWrite(new string(input.dump()));
         }
+        else if(isCacheAction) {
+          //Which model's cache. The same translate-and-validate Port a query's "model" field goes
+          //through, and for a sharper reason: a cache action names the FILES it reads and writes, so
+          //coercing an unknown name to the primary model would read or write another model's
+          //container under this one's name, with nothing in the response to say it happened.
+          SearchableModelIdx modelIdx = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+          bool modelResolved = true;
+          if(input.find("model") != input.end()) {
+            if(!input["model"].is_string()) {
+              reportErrorForId(rbase.id, "model", "Must be a string, the \"internalName\" of a loaded model as the query_models action reports it");
+              modelResolved = false;
+            }
+            else {
+              const ModelResolution resolution = modelHosts.resolve(input["model"].get<string>());
+              if(!resolution.searchableIdx().has_value()) {
+                reportErrorForId(rbase.id, "model", resolution.refusal().value());
+                modelResolved = false;
+              }
+              else
+                modelIdx = resolution.searchableIdx().value();
+            }
+          }
+          if(!modelResolved)
+            continue;
+
+          int64_t openRequestCount = 0;
+          {
+            std::lock_guard<std::mutex> lock(openRequestsMutex);
+            openRequestCount = (int64_t)openRequests.size();
+          }
+          const AnalysisEngineCounters counters{numRequestsSoFar, openRequestCount};
+
+          //The decode's refusal is reported before the concurrency one deliberately: a client with a
+          //typo'd field learns about the typo rather than being told to try again later and hitting
+          //the same wall.
+          try {
+            bool handled = false;
+            json result;
+            if(action == "cache_attach") {
+              const CacheActionDecode<CacheAttachRequest> decoded = decodeCacheAttach(input);
+              if(decoded.refusal().has_value())
+                reportErrorForId(rbase.id, decoded.refusal().value().field, decoded.refusal().value().message);
+              else if(openRequestCount > 0)
+                reportErrorForId(rbase.id, "action", cacheSwapConcurrencyRefusal("cache_attach", openRequestCount));
+              else {
+                result = cacheAttachExecute(modelHosts, modelIdx, cacheAttachments, decoded.value().value());
+                handled = true;
+              }
+            }
+            else if(action == "cache_detach") {
+              const CacheActionDecode<CacheDetachRequest> decoded = decodeCacheDetach(input);
+              if(decoded.refusal().has_value())
+                reportErrorForId(rbase.id, decoded.refusal().value().field, decoded.refusal().value().message);
+              else if(openRequestCount > 0)
+                reportErrorForId(rbase.id, "action", cacheSwapConcurrencyRefusal("cache_detach", openRequestCount));
+              else {
+                result = cacheDetachExecute(modelHosts, modelIdx, cacheAttachments, decoded.value().value(), counters);
+                handled = true;
+              }
+            }
+            else if(action == "cache_dump") {
+              //Legal while requests are open -- every structure a dump reads is thread-safe and off
+              //the get/set path -- so there is no refusal here. The response carries the open-request
+              //count at dump time, so a client that dumped live can see that it did.
+              const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(input);
+              if(decoded.refusal().has_value())
+                reportErrorForId(rbase.id, decoded.refusal().value().field, decoded.refusal().value().message);
+              else {
+                result = cacheDumpExecute(modelHosts, modelIdx, cacheAttachments, decoded.value().value(), counters);
+                handled = true;
+              }
+            }
+            else {
+              testAssert(action == "cache_stats");
+              const CacheActionDecode<CacheStatsRequest> decoded = decodeCacheStats(input);
+              if(decoded.refusal().has_value())
+                reportErrorForId(rbase.id, decoded.refusal().value().field, decoded.refusal().value().message);
+              else {
+                result = cacheStatsExecute(modelHosts, modelIdx, cacheAttachments);
+                handled = true;
+              }
+            }
+            if(handled) {
+              for(json::const_iterator it = result.begin(); it != result.end(); ++it)
+                input[it.key()] = it.value();
+              pushToWrite(new string(input.dump()));
+            }
+          }
+          catch(const StringError& e) {
+            reportErrorForId(rbase.id, "action", e.what());
+          }
+        }
         else {
-          reportError("'action' field must be 'query_version' or 'query_models' or 'clear_cache' or 'terminate' or 'terminate_all'");
+          reportError("'action' field must be 'query_version' or 'query_models' or 'clear_cache' or 'cache_attach' or 'cache_detach' or 'cache_dump' or 'cache_stats' or 'terminate' or 'terminate_all'");
         }
 
         continue;

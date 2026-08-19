@@ -53,10 +53,23 @@ struct NNCacheCountRow {
   Hash128 key;
   // Total retrievals recorded for this key, summed over every dump in the log.
   uint64_t lookups;
-  // How many DUMPS this key appeared in. Named "sessions" in the operator's own schema and
-  // kept under that name, but the honest definition is the one stated here: if an operator
-  // dumps twice inside one engine run, a key present in both rises by two. The log has no
-  // way to tell two dumps in one run from two runs and does not pretend to.
+  // HOW MANY DUMPS THIS KEY EARNED A RETRIEVAL IN. Named "sessions" in the operator's own
+  // schema and kept under that name; the definition is the one stated here.
+  //
+  // A dump appends the DELTA since the last one (NNCacheHitCountDelta below), and the delta
+  // surface omits a key with nothing to say -- so this rises by one per dump in which the
+  // key was actually looked up, and a pre-warmed key a whole session never touched does not
+  // rise at all. That is what an additive log of deltas necessarily produces, and it is the
+  // reading a client wants: in how many study sessions did this position come up.
+  //
+  // NOT "how many dumps carried this key through", which an earlier statement of this field
+  // implied. Whether an entry is still being carried is a fact about CACHE RETENTION -- it
+  // is answered by the entry still being in the container -- and not a fact about how often
+  // the position was needed. The two readings agreed only while nothing marked which counts
+  // had already been persisted; the persisted mark is what separates them.
+  //
+  // The log still cannot tell two dumps in one engine run from two runs, and does not
+  // pretend to: it counts dumps, which is what a dump can observe.
   uint64_t sessions;
 };
 
@@ -98,6 +111,57 @@ class NNCacheLookupThreshold {
  private:
   explicit NNCacheLookupThreshold(uint64_t lookups) : lookups_(lookups) {}
   uint64_t lookups_;
+};
+
+// THE ONLY THING A DUMP MAY APPEND: a table's UNPERSISTED DELTA, as a type that only the
+// delta surface can produce.
+//
+// WHY THIS IS A TYPE AND NOT A SENTENCE IN appendDump's COMMENT. A block is a set of
+// INCREMENTS -- the reader ADDS each record's lookups to that key's running total and its
+// sessions to that key's dump count (see the format description above NNCacheCountLog). So
+// the only sound thing to append is what has accrued since the last dump, which is
+// NNCacheTable::takeUnpersistedHitCounts. Beside it sits NNCacheTable::harvestHitCounts,
+// which reports this session's RUNNING TOTAL for every key: a legitimate answer to a
+// different question -- a one-shot report such as the cache_stats action -- and a double
+// count the instant it reaches an additive reader.
+//
+// Both surfaces return NNCacheHitLedger. So while appendDump took a ledger, the unsound
+// composition read exactly as well as the sound one, and the only thing standing between
+// them was a reviewer noticing. Choosing correctly once does not stop the next caller
+// choosing wrong, so the fix is the one ADR-0000 Rule 2a asks for: appendDump takes a type
+// the absolute surface cannot produce, and `log.appendDump(table.harvestHitCounts())`
+// stops compiling instead of stopping at review. This is the same move SearchableModelIdx
+// (command/analysismodels.h) makes for a wrong-axis subscript, in the delta-versus-absolute
+// register.
+//
+// THE TWO DOORS, and why neither of them lets an absolute through. take() consumes a live
+// table's delta and is the production path. ofDeltaRows takes ROWS and never a ledger, for
+// a caller that assembled the delta itself -- a test's synthetic dump, a fixture -- so
+// there is no expression that converts a harvest into one of these; unwrapping a harvest's
+// rows and re-wrapping them under a name that says "delta" is a deliberate act with the
+// wrong word written at the call site, not a plausible-looking one-liner.
+class NNCacheHitCountDelta {
+ public:
+  // Takes `table`'s counts that have not reached a count log yet, advancing its persisted
+  // marks. CONSUMING: the same retrievals are never reported twice, which is exactly the
+  // property that makes the result appendable.
+  [[nodiscard]] static NNCacheHitCountDelta take(NNCacheTable& table);
+
+  // A delta the caller already holds as rows. `unrecordedHits` is the honesty residue --
+  // retrievals that happened and could not be given a row -- carried whole, exactly as
+  // NNCacheHitLedger carries it.
+  [[nodiscard]] static NNCacheHitCountDelta ofDeltaRows(std::vector<NNCacheHitCount> rows, int64_t unrecordedHits);
+
+  // A delta from a table that keeps no per-key counts. Distinct from a delta of zero rows,
+  // and appendDump refuses it by name: see appendDump.
+  [[nodiscard]] static NNCacheHitCountDelta notCounted();
+
+  // The rows and the residue, as the ledger type the rest of the cache already speaks.
+  [[nodiscard]] const NNCacheHitLedger& ledger() const { return ledger_; }
+
+ private:
+  explicit NNCacheHitCountDelta(NNCacheHitLedger ledger);
+  NNCacheHitLedger ledger_;
 };
 
 // Whether the file ended on a block boundary, or on bytes a crash left behind.
@@ -277,20 +341,26 @@ class NNCacheCountLog {
   // Appends one dump, then fsyncs, so that when this returns the bytes are on the device
   // rather than in a page cache.
   //
-  // Takes the LEDGER rather than a row vector, because the ledger's disposition is the
-  // whole point of that type: a NotCounted ledger is REFUSED here, naming that a
-  // single-level table keeps no per-key counts, rather than being written as a dump of zero
-  // rows that a later reader would take for "this session hit nothing". Every row's lookups
-  // is added to that key's total and every row present contributes 1 to its sessions,
-  // including rows whose hits are zero -- a pre-warmed entry that earned nothing this
-  // session is exactly the fact that says to stop carrying it.
+  // TAKES A DELTA, AND THE TYPE IS WHAT SAYS SO. A record is an increment, so what this
+  // appends must be what has accrued since the last dump; NNCacheHitCountDelta is the type
+  // only the delta surface can produce, and handing this an absolute harvest is a compile
+  // error rather than a silent double count. The reasoning is above that type.
+  //
+  // Every row's lookups is added to that key's running total and every row present adds 1
+  // to that key's sessions. The delta surface omits a key with nothing to say, so a
+  // pre-warmed entry a session never touched contributes no record and its sessions does
+  // not rise -- see NNCacheCountRow::sessions, which states that reading in full.
+  //
+  // A delta whose disposition is NotCounted is REFUSED here, naming that a single-level
+  // table keeps no per-key counts, rather than being written as a dump of zero rows that a
+  // later reader would take for "this session hit nothing".
   //
   // Repairs a torn tail first, if there is one, and reports it in the result. Creates the
   // file, with its header, if it does not exist.
   //
-  // Throws StringError if the ledger is NotCounted, if any file operation fails, or if a
+  // Throws StringError if the delta is NotCounted, if any file operation fails, or if a
   // repair would produce a total that does not fit a record.
-  NNCacheCountLogAppendResult appendDump(const NNCacheHitLedger& ledger) const;
+  NNCacheCountLogAppendResult appendDump(const NNCacheHitCountDelta& delta) const;
 
   // Reads the whole log. A missing file is not an error: it reads as zero rows, Intact --
   // "no dump has happened here yet" is a normal answer.

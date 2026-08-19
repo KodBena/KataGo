@@ -55,7 +55,7 @@ int64_t writeBytesSoFar() {
   return (int64_t)strtoll(p + strlen("write_bytes:"), NULL, 10);
 }
 
-NNCacheHitLedger ledgerOfSize(int64_t numRows, int64_t serialBase) {
+NNCacheHitCountDelta deltaOfSize(int64_t numRows, int64_t serialBase) {
   vector<NNCacheHitCount> rows;
   rows.reserve((size_t)numRows);
   for(int64_t i = 0; i < numRows; i++) {
@@ -67,13 +67,13 @@ NNCacheHitLedger ledgerOfSize(int64_t numRows, int64_t serialBase) {
     row.hits = (uint32_t)(1 + (i % 97));
     rows.push_back(row);
   }
-  return NNCacheHitLedger::counted(std::move(rows), 0);
+  return NNCacheHitCountDelta::ofDeltaRows(std::move(rows), 0);
 }
 
 void measureOneDumpSize(const string& dir, int64_t numRows, int serial) {
   const string context = "bench" + Global::intToString(serial);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir, context);
-  const NNCacheHitLedger ledger = ledgerOfSize(numRows, 1);
+  const NNCacheHitCountDelta ledger = deltaOfSize(numRows, 1);
 
   const int64_t before = writeBytesSoFar();
   const NNCacheCountLogAppendResult appended = log.appendDump(ledger);
@@ -97,9 +97,9 @@ void measureOneDumpSize(const string& dir, int64_t numRows, int serial) {
 // where nothing but the changed set is written.
 void measureSecondDumpOntoAnExistingLog(const string& dir, int64_t numRows) {
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir, "benchsecond");
-  log.appendDump(ledgerOfSize(numRows, 1));
+  log.appendDump(deltaOfSize(numRows, 1));
 
-  const NNCacheHitLedger ledger = ledgerOfSize(numRows, 1);
+  const NNCacheHitCountDelta ledger = deltaOfSize(numRows, 1);
   const int64_t before = writeBytesSoFar();
   const NNCacheCountLogAppendResult appended = log.appendDump(ledger);
   const int64_t after = writeBytesSoFar();

@@ -498,8 +498,25 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   return true;
 }
 
-NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheHitLedger& ledger) const {
-  // A NotCounted ledger is refused here rather than written as a dump of zero rows. That is
+NNCacheHitCountDelta::NNCacheHitCountDelta(NNCacheHitLedger ledger)
+  :ledger_(std::move(ledger))
+{}
+
+NNCacheHitCountDelta NNCacheHitCountDelta::take(NNCacheTable& table) {
+  return NNCacheHitCountDelta(table.takeUnpersistedHitCounts());
+}
+
+NNCacheHitCountDelta NNCacheHitCountDelta::ofDeltaRows(std::vector<NNCacheHitCount> rows, int64_t unrecordedHits) {
+  return NNCacheHitCountDelta(NNCacheHitLedger::counted(std::move(rows), unrecordedHits));
+}
+
+NNCacheHitCountDelta NNCacheHitCountDelta::notCounted() {
+  return NNCacheHitCountDelta(NNCacheHitLedger::notCounted());
+}
+
+NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheHitCountDelta& delta) const {
+  const NNCacheHitLedger& ledger = delta.ledger();
+  // A NotCounted delta is refused here rather than written as a dump of zero rows. That is
   // the entire reason the disposition is typed: "this table keeps no counts" and "this
   // session hit nothing" are different facts, and persisting the first as the second would
   // quietly record that a whole session found nothing worth caching (ADR-0002).
@@ -525,10 +542,10 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheHitLedger& 
     result.rewroteTheFile = true;
   }
 
-  // Every row this dump has something to say about, including rows whose hits are zero: a
-  // pre-warmed entry that earned nothing this session is the fact that says to stop
-  // carrying it, and dropping it here would make "never asked for" indistinguishable from
-  // "not present".
+  // Every row the delta carries, including a row whose hits are zero. The delta surface
+  // already omits a key with nothing to say, so a zero row here is a key the caller
+  // deliberately has something to say about, and dropping it would make "never asked for"
+  // indistinguishable from "not present".
   const std::vector<NNCacheHitCount>& entries = ledger.entries();
   std::vector<NNCacheCountRow> rows;
   rows.reserve(entries.size());
