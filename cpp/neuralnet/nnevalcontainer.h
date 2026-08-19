@@ -118,6 +118,90 @@ class NNEvalContainerContents {
   int64_t entriesApplied_;
 };
 
+// WHERE ONE ENTRY SITS IN A CONTAINER, and what shape it decodes to -- everything about an
+// entry except its numbers.
+//
+// This is what the gathered entry-header array is FOR. A caller that wants a container's key
+// set -- to order it, to select part of it, to cost it, or to answer "is this key already on
+// disk" -- reads 32 bytes per entry and no payload at all: 1.46 MB at the operator's median
+// card against the ~69 MB of payload those headers index. The level-0 loader is that caller:
+// it orders the whole key set against the count log and then reads only the payloads its
+// selection bound kept, so an attach that takes the top 10,000 keys of a 45,664-key card
+// reads a tenth of the payload rather than all of it and then throwing nine tenths away.
+struct NNEvalContainerEntryLocation {
+  Hash128 key;
+  int nnXLen;
+  int nnYLen;
+  bool hasOwnerMap;
+  // Absolute offsets in this container's file, of the entry's 32-byte header and of its
+  // payload. Absolute rather than block-relative because a caller reads entries in an order
+  // of its own choosing across blocks and has no business knowing where blocks begin.
+  int64_t headerFileOffset;
+  int64_t payloadFileOffset;
+  int64_t payloadBytes;
+};
+
+// A container's merged key set with each key's location: the same merge load() applies, over
+// the same blocks, without a payload byte read.
+class NNEvalContainerIndex {
+ public:
+  // Throws StringError if tail and discardedTailBytes disagree, exactly as
+  // NNEvalContainerContents does and for the same reason.
+  static NNEvalContainerIndex of(
+    std::vector<NNEvalContainerEntryLocation> entries,
+    NNEvalContainerTail tail,
+    int64_t discardedTailBytes,
+    int64_t blocksApplied,
+    int64_t entriesApplied
+  );
+
+  // One location per distinct key, after merging, in first-appearance order of the key --
+  // the same order and the same live set load() would produce.
+  const std::vector<NNEvalContainerEntryLocation>& entries() const { return entries_; }
+
+  NNEvalContainerTail tail() const { return tail_; }
+  int64_t discardedTailBytes() const { return discardedTailBytes_; }
+  int64_t blocksApplied() const { return blocksApplied_; }
+  int64_t entriesApplied() const { return entriesApplied_; }
+
+  // The payload bytes of the whole live set, and the ownership-map floats within them --
+  // what an arena has to reserve to hold a selection, summed from the headers rather than
+  // estimated from a per-entry average.
+  int64_t totalPayloadBytes() const;
+
+ private:
+  NNEvalContainerIndex(
+    std::vector<NNEvalContainerEntryLocation> entries,
+    NNEvalContainerTail tail,
+    int64_t discardedTailBytes,
+    int64_t blocksApplied,
+    int64_t entriesApplied
+  );
+
+  std::vector<NNEvalContainerEntryLocation> entries_;
+  NNEvalContainerTail tail_;
+  int64_t discardedTailBytes_;
+  int64_t blocksApplied_;
+  int64_t entriesApplied_;
+};
+
+// WHERE A READ ENTRY IS PUT. readEntriesInto decodes into storage the caller supplies rather
+// than allocating and handing back, because the caller is the only one who knows how the
+// storage must be destroyed: the ordinary path wants a new[] ownership map that ~NNOutput
+// will delete[], and the level-0 loader wants one carved out of an arena that ~NNOutput must
+// never touch. A reader that allocated on the caller's behalf would have to guess.
+class NNEvalContainerEntrySink {
+ public:
+  virtual ~NNEvalContainerEntrySink();
+
+  // The NNOutput the i'th requested entry is decoded into, where i indexes the locations
+  // vector as the caller passed it -- NOT the order the file is read in.
+  virtual NNOutput& outputFor(size_t i) = 0;
+  // Storage for the i'th requested entry's ownership map: exactly `numFloats` floats, whose
+  // lifetime the sink owns. Called only for an entry whose header says it carries one.
+  virtual float* ownerMapFor(size_t i, size_t numFloats) = 0;
+};
+
 // What one appendBlock did.
 struct NNEvalContainerAppendResult {
   // Bytes this call added to the file, framing included.
@@ -291,6 +375,28 @@ class NNEvalContainer {
   // Throws StringError only for a file that exists and is not this container: see the
   // refusal-versus-torn-tail paragraph above.
   [[nodiscard]] NNEvalContainerContents load() const;
+
+  // Reads the container's KEY SET AND NOTHING ELSE: the file header, every block header,
+  // and every block's gathered entry-header array, with the same merge and the same
+  // torn-tail contract load() applies. No payload byte is decoded and none is held.
+  //
+  // A block's bytes are still STREAMED through the checksum before its headers are believed,
+  // exactly as in load(), so this reads the whole file even though it retains 32 bytes per
+  // entry of it. Verifying less would mean trusting lengths a crash may have chosen.
+  [[nodiscard]] NNEvalContainerIndex loadIndex() const;
+
+  // Decodes exactly the entries at `locations` into `sink`, filling sink slot i from
+  // locations[i]. The file is read in ASCENDING OFFSET ORDER whatever order the locations
+  // arrive in, so a selection scattered across the file is still one forward pass.
+  //
+  // Throws StringError if the file is not this container (the same boundary load() applies:
+  // wrong magic, wrong version, wrong context, WRONG MODEL), or if an entry's header on disk
+  // no longer says what its location says -- which means the file changed under the caller
+  // between loadIndex and here, and is refused rather than read as if it had not.
+  void readEntriesInto(
+    const std::vector<NNEvalContainerEntryLocation>& locations,
+    NNEvalContainerEntrySink& sink
+  ) const;
 
   // Rewrites the container as its header plus one block holding the merged live set, via a
   // temp file and an atomic rename. Repairs a torn tail as a side effect, since it writes

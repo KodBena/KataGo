@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <utility>
 
 #include "../core/fileutils.h"
@@ -308,85 +309,120 @@ void encodePayload(std::vector<uint8_t>& buf, const NNOutput& out, int64_t paylo
   }
 }
 
-// Decodes one entry from its already-checksum-verified bytes.
+// EVERYTHING ONE 32-BYTE ENTRY HEADER SAYS, verified. The one place an entry header is
+// read, so the key-set scan and the payload decode cannot come to different conclusions
+// about the same 32 bytes (ADR-0012 P1).
 //
 // Every refusal below is judged only AFTER the block's checksum has proven these are the
 // bytes the writer wrote, so a refusal here means the file is genuinely not one this build
 // can read -- never that a crash happened.
-std::unique_ptr<NNOutput> decodeEntry(
-  const uint8_t* header,
-  const uint8_t* payload,
-  int64_t payloadBytes,
-  int64_t expectedPayloadOffset,
-  const std::string& path
-) {
-  const Hash128 key(get64(header + 0), get64(header + 8));
+struct DecodedEntryHeader {
+  Hash128 key;
+  int nnXLen;
+  int nnYLen;
+  bool hasOwnerMap;
+  int64_t payloadBytes;
+  // The offset this header states for its payload within its block's payload region. It is
+  // a DERIVED quantity -- the running sum of the preceding payload sizes -- and is checked
+  // against that sum by whoever owns the sum, which is the block walk, not this function.
+  int64_t payloadOffset;
+};
+
+DecodedEntryHeader decodeEntryHeader(const uint8_t* header, const std::string& path) {
+  DecodedEntryHeader h;
+  h.key = Hash128(get64(header + 0), get64(header + 8));
   const uint16_t flags = (uint16_t)((uint16_t)header[16] | ((uint16_t)header[17] << 8));
   if((flags & (uint16_t)~(uint16_t)FLAG_HAS_OWNERMAP) != 0)
     throw StringError(
-      "NNEvalContainer: " + path + ": entry " + key.toString() + " sets flag bits this build "
+      "NNEvalContainer: " + path + ": entry " + h.key.toString() + " sets flag bits this build "
       "does not define. It was written by a later version of this format."
     );
-  // The stored payload offset is a DERIVED quantity -- the running sum of the preceding
-  // payload sizes -- so it is recomputed by the caller and checked here rather than trusted.
-  // A second statement of a fact is only safe while something refuses to let the two
-  // disagree (ADR-0012 P1).
-  const uint64_t storedOffset = get64(header + 24);
-  if(storedOffset != (uint64_t)expectedPayloadOffset)
-    throw StringError(
-      "NNEvalContainer: " + path + ": entry " + key.toString() + " places its payload at offset " +
-      Global::uint64ToString(storedOffset) + " and the entries before it end at " +
-      Global::int64ToString(expectedPayloadOffset) + "."
-    );
-  const int nnXLen = (int)header[18];
-  const int nnYLen = (int)header[19];
-  verifyShape(nnXLen, nnYLen, path + ": entry " + key.toString());
+  h.hasOwnerMap = (flags & FLAG_HAS_OWNERMAP) != 0;
+  h.nnXLen = (int)header[18];
+  h.nnYLen = (int)header[19];
+  verifyShape(h.nnXLen, h.nnYLen, path + ": entry " + h.key.toString());
+  h.payloadBytes = (int64_t)get32(header + 20);
+  h.payloadOffset = (int64_t)get64(header + 24);
 
-  const bool hasOwnerMap = (flags & FLAG_HAS_OWNERMAP) != 0;
-  const int64_t area = (int64_t)nnXLen * (int64_t)nnYLen;
-  const int64_t expected = payloadBytesOf(nnXLen, nnYLen, hasOwnerMap);
-  if(payloadBytes != expected)
+  const int64_t expected = payloadBytesOf(h.nnXLen, h.nnYLen, h.hasOwnerMap);
+  if(h.payloadBytes != expected)
     throw StringError(
-      "NNEvalContainer: " + path + ": entry " + key.toString() + " declares " +
-      Global::int64ToString(payloadBytes) + " payload bytes but its " +
-      Global::intToString(nnXLen) + "x" + Global::intToString(nnYLen) + " shape" +
-      (hasOwnerMap ? " with an ownership map" : " without an ownership map") + " is " +
+      "NNEvalContainer: " + path + ": entry " + h.key.toString() + " declares " +
+      Global::int64ToString(h.payloadBytes) + " payload bytes but its " +
+      Global::intToString(h.nnXLen) + "x" + Global::intToString(h.nnYLen) + " shape" +
+      (h.hasOwnerMap ? " with an ownership map" : " without an ownership map") + " is " +
       Global::int64ToString(expected) + " bytes."
     );
+  return h;
+}
 
-  std::unique_ptr<NNOutput> out(new NNOutput());
-  out->nnHash = key;
+// Fills `out` from one entry's verified header and its verified payload bytes.
+//
+// THE OWNERSHIP-MAP STORAGE IS THE CALLER'S, and this function refuses to proceed if the
+// caller did not supply exactly what the header says is needed. The two callers allocate it
+// in incompatible ways -- the ordinary read path with new[], which ~NNOutput will delete[],
+// and the level-0 loader from a contiguous arena block, which ~NNOutput must NEVER touch --
+// so a reader that allocated on the caller's behalf would have to guess which, and a wrong
+// guess is a free of memory the allocator never issued.
+void decodePayloadInto(
+  NNOutput& out,
+  const DecodedEntryHeader& h,
+  const uint8_t* payload,
+  const std::string& path
+) {
+  if(h.hasOwnerMap != (out.whiteOwnerMap != NULL))
+    throw StringError(
+      "NNEvalContainer: " + path + ": entry " + h.key.toString() +
+      (h.hasOwnerMap ? " carries an ownership map and no storage was supplied for it."
+                     : " carries no ownership map and storage was supplied for one.")
+    );
+
+  const int64_t area = (int64_t)h.nnXLen * (int64_t)h.nnYLen;
+  out.nnHash = h.key;
   const uint8_t* v = payload;
-  out->whiteWinProb = getF32(v + 0);
-  out->whiteLossProb = getF32(v + 4);
-  out->whiteNoResultProb = getF32(v + 8);
-  out->whiteScoreMean = getF32(v + 12);
-  out->whiteScoreMeanSq = getF32(v + 16);
-  out->whiteLead = getF32(v + 20);
-  out->varTimeLeft = getF32(v + 24);
-  out->shorttermWinlossError = getF32(v + 28);
-  out->shorttermScoreError = getF32(v + 32);
-  out->policyOptimismUsed = getF32(v + 36);
+  out.whiteWinProb = getF32(v + 0);
+  out.whiteLossProb = getF32(v + 4);
+  out.whiteNoResultProb = getF32(v + 8);
+  out.whiteScoreMean = getF32(v + 12);
+  out.whiteScoreMeanSq = getF32(v + 16);
+  out.whiteLead = getF32(v + 20);
+  out.varTimeLeft = getF32(v + 24);
+  out.shorttermWinlossError = getF32(v + 28);
+  out.shorttermScoreError = getF32(v + 32);
+  out.policyOptimismUsed = getF32(v + 36);
   v += NUM_SCALARS * 4;
 
-  out->nnXLen = nnXLen;
-  out->nnYLen = nnYLen;
+  out.nnXLen = h.nnXLen;
+  out.nnYLen = h.nnYLen;
   // The slots past the board are ZEROED rather than left as whatever the allocation held.
   // They are not a fact the file carries, and an uninitialised slot is exactly the kind of
   // value that reads as plausible later.
   for(int i = 0; i < NNPos::MAX_NN_POLICY_SIZE; i++)
-    out->policyProbs[i] = 0.0f;
+    out.policyProbs[i] = 0.0f;
   for(int64_t i = 0; i <= area; i++)
-    out->policyProbs[i] = getF32(v + (size_t)i * 4);
+    out.policyProbs[i] = getF32(v + (size_t)i * 4);
   v += (size_t)(area + 1) * 4;
 
-  if(hasOwnerMap) {
-    // ~NNOutput delete[]s this, so it is allocated with new[] and with nothing else.
-    out->whiteOwnerMap = new float[(size_t)area];
+  if(h.hasOwnerMap) {
     for(int64_t i = 0; i < area; i++)
-      out->whiteOwnerMap[i] = getF32(v + (size_t)i * 4);
+      out.whiteOwnerMap[i] = getF32(v + (size_t)i * 4);
   }
-  out->noisedPolicyProbs = NULL;
+  // A file cannot carry search-time noise, so a decoded entry never has any.
+  out.noisedPolicyProbs = NULL;
+}
+
+// The ordinary read path's decode: a heap NNOutput with a new[] ownership map that
+// ~NNOutput owns from the moment it is attached, so a throw between here and the caller
+// frees it.
+std::unique_ptr<NNOutput> decodeEntryToHeap(
+  const DecodedEntryHeader& h,
+  const uint8_t* payload,
+  const std::string& path
+) {
+  std::unique_ptr<NNOutput> out(new NNOutput());
+  if(h.hasOwnerMap)
+    out->whiteOwnerMap = new float[(size_t)h.nnXLen * (size_t)h.nnYLen];
+  decodePayloadInto(*out, h, payload, path);
   return out;
 }
 
@@ -396,28 +432,82 @@ std::unique_ptr<NNOutput> decodeEntry(
 
 typedef std::map<std::pair<uint64_t,uint64_t>, size_t> KeyIndex;
 
+// What the merge rule says to do with an incoming entry.
+enum class MergeAction { Append, ReplaceExisting, Drop };
+
 // LAST-WINS PER KEY, EXCEPT THAT AN ENTRY WITHOUT AN OWNERSHIP MAP NEVER SUPERSEDES ONE
 // WITH. The exception is the store-side face of the live supersession rule: an entry lacking
 // a requested ownership map costs a full re-evaluation on every hit, so letting a later
 // ownermap-less re-evaluation overwrite an ownermap-carrying one would turn a restored level
-// 0 into a bleed-out. There is exactly one implementation of this rule and both the reader
-// and compaction go through it (ADR-0012 P1).
+// 0 into a bleed-out.
+//
+// THIS IS THE ONLY STATEMENT OF THE RULE. The full read, the key-set scan and compaction all
+// route through it, so a live set assembled by one of them is the live set the others would
+// assemble (ADR-0012 P1) -- which matters more here than tidiness, because the loader
+// selects from the key-set scan's live set and then reads payloads the full read's live set
+// would have to agree with.
+MergeAction mergeActionFor(bool keyIsNew, bool existingHasOwnerMap, bool incomingHasOwnerMap) {
+  if(keyIsNew)
+    return MergeAction::Append;
+  if(existingHasOwnerMap && !incomingHasOwnerMap)
+    return MergeAction::Drop;  // the fuller entry stands
+  return MergeAction::ReplaceExisting;
+}
+
+// Applies the rule to a vector of anything, given how to read an element's key and whether
+// it has an ownership map. Returns the index the incoming element belongs at, or nullopt to
+// drop it.
+std::optional<size_t> mergeSlotFor(KeyIndex& indexOfKey, Hash128 key, bool incomingHasOwnerMap,
+                                   size_t currentSize, bool existingHasOwnerMap) {
+  const std::pair<uint64_t,uint64_t> mapKey(key.hash0, key.hash1);
+  const KeyIndex::iterator it = indexOfKey.find(mapKey);
+  const bool keyIsNew = it == indexOfKey.end();
+  const MergeAction action = mergeActionFor(keyIsNew, existingHasOwnerMap, incomingHasOwnerMap);
+  if(action == MergeAction::Drop)
+    return std::nullopt;
+  if(action == MergeAction::Append) {
+    indexOfKey[mapKey] = currentSize;
+    return currentSize;
+  }
+  return it->second;
+}
+
 void applyEntry(
   std::vector<std::unique_ptr<NNOutput>>& entries,
   KeyIndex& indexOfKey,
   std::unique_ptr<NNOutput> incoming
 ) {
   const std::pair<uint64_t,uint64_t> mapKey(incoming->nnHash.hash0, incoming->nnHash.hash1);
-  const KeyIndex::iterator it = indexOfKey.find(mapKey);
-  if(it == indexOfKey.end()) {
-    indexOfKey[mapKey] = entries.size();
-    entries.push_back(std::move(incoming));
+  const KeyIndex::const_iterator it = indexOfKey.find(mapKey);
+  const bool existingHasOwnerMap =
+    it != indexOfKey.end() && entries[it->second]->whiteOwnerMap != NULL;
+  const std::optional<size_t> slot = mergeSlotFor(
+    indexOfKey, incoming->nnHash, incoming->whiteOwnerMap != NULL, entries.size(), existingHasOwnerMap);
+  if(!slot.has_value())
     return;
-  }
-  const NNOutput& existing = *entries[it->second];
-  if(existing.whiteOwnerMap != NULL && incoming->whiteOwnerMap == NULL)
-    return;  // the fuller entry stands
-  entries[it->second] = std::move(incoming);
+  if(slot.value() == entries.size())
+    entries.push_back(std::move(incoming));
+  else
+    entries[slot.value()] = std::move(incoming);
+}
+
+void applyLocation(
+  std::vector<NNEvalContainerEntryLocation>& locations,
+  KeyIndex& indexOfKey,
+  const NNEvalContainerEntryLocation& incoming
+) {
+  const std::pair<uint64_t,uint64_t> mapKey(incoming.key.hash0, incoming.key.hash1);
+  const KeyIndex::const_iterator it = indexOfKey.find(mapKey);
+  const bool existingHasOwnerMap =
+    it != indexOfKey.end() && locations[it->second].hasOwnerMap;
+  const std::optional<size_t> slot = mergeSlotFor(
+    indexOfKey, incoming.key, incoming.hasOwnerMap, locations.size(), existingHasOwnerMap);
+  if(!slot.has_value())
+    return;
+  if(slot.value() == locations.size())
+    locations.push_back(incoming);
+  else
+    locations[slot.value()] = incoming;
 }
 
 //-------------------------------------------------------------------------------------
@@ -427,7 +517,6 @@ void applyEntry(
 // One pass over a container. Both load() and appendBlock() go through this, so there is
 // exactly one implementation of "where does the intact part of this file end" (ADR-0012 P1).
 struct ScanResult {
-  std::vector<std::unique_ptr<NNOutput>> entries;
   int64_t blocksApplied = 0;
   int64_t entriesApplied = 0;
   // Byte offset one past the last intact block. Equal to the file size when the tail is
@@ -436,6 +525,47 @@ struct ScanResult {
   int64_t tornTailBytes = 0;
   bool fileExists = false;
 };
+
+// Walks a block's gathered header array in order, decoding each 32-byte header and checking
+// the two facts only the walk can check: that each entry's payload fits in what is left of
+// the block's declared payload region, and that the offset the header STATES for its payload
+// is the running sum of the preceding payload sizes. That sum has one authority -- this walk
+// -- so the stored offset is recomputed and refused on disagreement rather than trusted
+// (ADR-0012 P1).
+//
+// `onEntry(i, header, decodedHeader, payloadOffset)` is called per entry, in file order.
+template<typename OnEntry>
+void walkBlockHeaderArray(
+  const uint8_t* headerArray,
+  uint32_t entryCount,
+  uint64_t totalPayloadBytes,
+  const std::string& path,
+  OnEntry onEntry
+) {
+  int64_t payloadOffset = 0;
+  for(uint32_t i = 0; i < entryCount; i++) {
+    const uint8_t* entryHeader = headerArray + (size_t)i * ENTRY_HEADER_BYTES;
+    const DecodedEntryHeader h = decodeEntryHeader(entryHeader, path);
+    if(h.payloadBytes > (int64_t)totalPayloadBytes - payloadOffset)
+      throw StringError(
+        "NNEvalContainer: " + path + ": an entry declares " + Global::int64ToString(h.payloadBytes) +
+        " payload bytes that run past the payload region its block declares."
+      );
+    if(h.payloadOffset != payloadOffset)
+      throw StringError(
+        "NNEvalContainer: " + path + ": entry " + h.key.toString() + " places its payload at offset " +
+        Global::uint64ToString((uint64_t)h.payloadOffset) + " and the entries before it end at " +
+        Global::int64ToString(payloadOffset) + "."
+      );
+    onEntry(i, h, payloadOffset);
+    payloadOffset += h.payloadBytes;
+  }
+  if(payloadOffset != (int64_t)totalPayloadBytes)
+    throw StringError(
+      "NNEvalContainer: " + path + ": a block's payloads occupy " + Global::int64ToString(payloadOffset) +
+      " bytes and its header declares a payload region of " + Global::uint64ToString(totalPayloadBytes) + "."
+    );
+}
 
 // Streams `regionBytes` bytes from the current position through a bounded buffer and returns
 // their checksum, or false if the file was short. Nothing is retained: this is how a 69 MB
@@ -455,12 +585,19 @@ bool checksumRegion(std::FILE* f, int64_t regionBytes, uint64_t seed, uint64_t& 
   return true;
 }
 
+// One pass over a container's framing. What is MADE of each verified block is the visitor's
+// business; where the intact part of the file ends is this function's, and is stated once
+// (ADR-0012 P1). `onBlock(f, headerArray, entryCount, headerArrayFileOffset,
+// payloadRegionFileOffset, totalPayloadBytes)` is called with the file positioned at the
+// start of the payload region and may seek freely; the scan repositions itself afterwards.
+template<typename OnBlock>
 ScanResult scanContainer(
   const std::string& path,
   const std::string& context,
   uint64_t contextHash,
   const std::string& modelInternalName,
-  int modelVersion
+  int modelVersion,
+  OnBlock onBlock
 ) {
   ScanResult result;
 
@@ -524,9 +661,7 @@ ScanResult scanContainer(
   int64_t offset = headerBytes;
   result.intactEndOffset = offset;
 
-  KeyIndex indexOfKey;
   std::vector<uint8_t> headerArray;
-  std::vector<uint8_t> entryPayload;
 
   while(true) {
     const int64_t remaining = fileSize - offset;
@@ -584,36 +719,93 @@ ScanResult scanContainer(
        std::fread(headerArray.data(), 1, (size_t)headersBytes, f.get()) != (size_t)headersBytes)
       throw StringError("NNEvalContainer: could not re-read a verified block key index of " + path + ".");
 
-    int64_t payloadOffset = 0;
-    for(uint32_t i = 0; i < entryCount; i++) {
-      const uint8_t* entryHeader = headerArray.data() + (size_t)i * ENTRY_HEADER_BYTES;
-      const int64_t payloadBytes = (int64_t)get32(entryHeader + 20);
-      if(payloadBytes > (int64_t)totalPayloadBytes - payloadOffset)
-        throw StringError(
-          "NNEvalContainer: " + path + ": an entry declares " + Global::int64ToString(payloadBytes) +
-          " payload bytes that run past the payload region its block declares."
-        );
-      entryPayload.resize((size_t)payloadBytes);
-      if(payloadBytes > 0 && std::fread(entryPayload.data(), 1, (size_t)payloadBytes, f.get()) != (size_t)payloadBytes)
-        throw StringError("NNEvalContainer: could not re-read a verified entry payload of " + path + ".");
-      applyEntry(result.entries, indexOfKey,
-                 decodeEntry(entryHeader, entryPayload.data(), payloadBytes, payloadOffset, path));
-      payloadOffset += payloadBytes;
-    }
-    if(payloadOffset != (int64_t)totalPayloadBytes)
-      throw StringError(
-        "NNEvalContainer: " + path + ": a block's payloads occupy " + Global::int64ToString(payloadOffset) +
-        " bytes and its header declares a payload region of " + Global::uint64ToString(totalPayloadBytes) + "."
-      );
+    onBlock(f.get(), headerArray.data(), entryCount, regionStart, regionStart + headersBytes, totalPayloadBytes);
 
     result.blocksApplied += 1;
     result.entriesApplied += (int64_t)entryCount;
     offset += (int64_t)BLOCK_HEADER_BYTES + regionBytes;
     result.intactEndOffset = offset;
+    // The visitor was free to seek; the next block header is read from where the framing
+    // says it is, never from wherever the visitor left the handle.
+    if(!seekTo(f.get(), offset))
+      throw StringError("NNEvalContainer: could not seek within " + path + ".");
   }
 
   result.tornTailBytes = fileSize - result.intactEndOffset;
   return result;
+}
+
+// The FULL read: every verified block's payloads decoded and merged into one live set.
+struct ScannedEntries {
+  std::vector<std::unique_ptr<NNOutput>> entries;
+  ScanResult scan;
+};
+
+ScannedEntries scanEntries(
+  const std::string& path,
+  const std::string& context,
+  uint64_t contextHash,
+  const std::string& modelInternalName,
+  int modelVersion
+) {
+  ScannedEntries out;
+  KeyIndex indexOfKey;
+  std::vector<uint8_t> entryPayload;
+  out.scan = scanContainer(
+    path, context, contextHash, modelInternalName, modelVersion,
+    [&](std::FILE* f, const uint8_t* headerArray, uint32_t entryCount,
+        int64_t /*headerArrayFileOffset*/, int64_t /*payloadRegionFileOffset*/, uint64_t totalPayloadBytes) {
+      walkBlockHeaderArray(
+        headerArray, entryCount, totalPayloadBytes, path,
+        [&](uint32_t /*i*/, const DecodedEntryHeader& h, int64_t /*payloadOffset*/) {
+          entryPayload.resize((size_t)h.payloadBytes);
+          if(h.payloadBytes > 0 &&
+             std::fread(entryPayload.data(), 1, (size_t)h.payloadBytes, f) != (size_t)h.payloadBytes)
+            throw StringError("NNEvalContainer: could not re-read a verified entry payload of " + path + ".");
+          applyEntry(out.entries, indexOfKey, decodeEntryToHeap(h, entryPayload.data(), path));
+        }
+      );
+    }
+  );
+  return out;
+}
+
+// The KEY-SET read: 32 bytes per entry, no payload decoded and none held.
+struct ScannedLocations {
+  std::vector<NNEvalContainerEntryLocation> locations;
+  ScanResult scan;
+};
+
+ScannedLocations scanLocations(
+  const std::string& path,
+  const std::string& context,
+  uint64_t contextHash,
+  const std::string& modelInternalName,
+  int modelVersion
+) {
+  ScannedLocations out;
+  KeyIndex indexOfKey;
+  out.scan = scanContainer(
+    path, context, contextHash, modelInternalName, modelVersion,
+    [&](std::FILE* /*f*/, const uint8_t* headerArray, uint32_t entryCount,
+        int64_t headerArrayFileOffset, int64_t payloadRegionFileOffset, uint64_t totalPayloadBytes) {
+      walkBlockHeaderArray(
+        headerArray, entryCount, totalPayloadBytes, path,
+        [&](uint32_t i, const DecodedEntryHeader& h, int64_t payloadOffset) {
+          NNEvalContainerEntryLocation loc;
+          loc.key = h.key;
+          loc.nnXLen = h.nnXLen;
+          loc.nnYLen = h.nnYLen;
+          loc.hasOwnerMap = h.hasOwnerMap;
+          loc.headerFileOffset = headerArrayFileOffset + (int64_t)i * (int64_t)ENTRY_HEADER_BYTES;
+          loc.payloadFileOffset = payloadRegionFileOffset + payloadOffset;
+          loc.payloadBytes = h.payloadBytes;
+          applyLocation(out.locations, indexOfKey, loc);
+        }
+      );
+    }
+  );
+  return out;
 }
 
 //-------------------------------------------------------------------------------------
@@ -775,6 +967,53 @@ std::vector<std::unique_ptr<NNOutput>> NNEvalContainerContents::takeEntries() {
 }
 
 //-------------------------------------------------------------------------------------
+// NNEvalContainerIndex and its sink
+//-------------------------------------------------------------------------------------
+
+NNEvalContainerEntrySink::~NNEvalContainerEntrySink() {}
+
+NNEvalContainerIndex::NNEvalContainerIndex(
+  std::vector<NNEvalContainerEntryLocation> entries,
+  NNEvalContainerTail tail,
+  int64_t discardedTailBytes,
+  int64_t blocksApplied,
+  int64_t entriesApplied
+)
+  :entries_(std::move(entries)),
+   tail_(tail),
+   discardedTailBytes_(discardedTailBytes),
+   blocksApplied_(blocksApplied),
+   entriesApplied_(entriesApplied)
+{}
+
+NNEvalContainerIndex NNEvalContainerIndex::of(
+  std::vector<NNEvalContainerEntryLocation> entries,
+  NNEvalContainerTail tail,
+  int64_t discardedTailBytes,
+  int64_t blocksApplied,
+  int64_t entriesApplied
+) {
+  const bool truncated = tail == NNEvalContainerTail::Truncated;
+  if(truncated != (discardedTailBytes > 0))
+    throw StringError(
+      "NNEvalContainerIndex: tail disposition and discarded byte count disagree -- " +
+      std::string(truncated ? "Truncated" : "Intact") + " with " +
+      Global::int64ToString(discardedTailBytes) + " discarded bytes."
+    );
+  if(discardedTailBytes < 0 || blocksApplied < 0 || entriesApplied < 0)
+    throw StringError("NNEvalContainerIndex: a count was negative.");
+  return NNEvalContainerIndex(
+    std::move(entries), tail, discardedTailBytes, blocksApplied, entriesApplied);
+}
+
+int64_t NNEvalContainerIndex::totalPayloadBytes() const {
+  int64_t bytes = 0;
+  for(size_t i = 0; i < entries_.size(); i++)
+    bytes += entries_[i].payloadBytes;
+  return bytes;
+}
+
+//-------------------------------------------------------------------------------------
 // NNEvalContainer
 //-------------------------------------------------------------------------------------
 
@@ -831,18 +1070,136 @@ int64_t NNEvalContainer::bytesForEntry(int nnXLen, int nnYLen, bool hasOwnerMap)
 }
 
 NNEvalContainerContents NNEvalContainer::load() const {
-  ScanResult scan = scanContainer(path_, context_, contextHash_, modelInternalName_, modelVersion_);
+  ScannedEntries scan = scanEntries(path_, context_, contextHash_, modelInternalName_, modelVersion_);
   return NNEvalContainerContents::of(
     std::move(scan.entries),
-    scan.tornTailBytes > 0 ? NNEvalContainerTail::Truncated : NNEvalContainerTail::Intact,
-    scan.tornTailBytes,
-    scan.blocksApplied,
-    scan.entriesApplied
+    scan.scan.tornTailBytes > 0 ? NNEvalContainerTail::Truncated : NNEvalContainerTail::Intact,
+    scan.scan.tornTailBytes,
+    scan.scan.blocksApplied,
+    scan.scan.entriesApplied
   );
 }
 
+NNEvalContainerIndex NNEvalContainer::loadIndex() const {
+  ScannedLocations scan = scanLocations(path_, context_, contextHash_, modelInternalName_, modelVersion_);
+  return NNEvalContainerIndex::of(
+    std::move(scan.locations),
+    scan.scan.tornTailBytes > 0 ? NNEvalContainerTail::Truncated : NNEvalContainerTail::Intact,
+    scan.scan.tornTailBytes,
+    scan.scan.blocksApplied,
+    scan.scan.entriesApplied
+  );
+}
+
+void NNEvalContainer::readEntriesInto(
+  const std::vector<NNEvalContainerEntryLocation>& locations,
+  NNEvalContainerEntrySink& sink
+) const {
+  if(locations.empty())
+    return;
+
+  NNCacheFileHandle f(path_, "rb");
+  if(!f.isOpen())
+    throw StringError(
+      "NNEvalContainer: " + path_ + " could not be opened to read the entries a caller selected "
+      "from it. It existed when its key set was read."
+    );
+  const int64_t fileSize = sizeOfOpenFile(f.get(), path_);
+  if(!seekTo(f.get(), 0))
+    throw StringError("NNEvalContainer: could not rewind " + path_ + ".");
+
+  // THE SAME BOUNDARY load() APPLIES, re-applied here rather than assumed from the earlier
+  // scan: this is a second open of a file another process may have replaced, and the model
+  // check in particular is the one that keeps one net's evaluations from being read as
+  // another's (ADR-0012 P2).
+  if(fileSize < (int64_t)FIXED_FILE_HEADER_BYTES)
+    throw StringError("NNEvalContainer: " + path_ + " is now too short to hold its own header.");
+  std::vector<uint8_t> fixedHeader(FIXED_FILE_HEADER_BYTES);
+  if(std::fread(fixedHeader.data(), 1, FIXED_FILE_HEADER_BYTES, f.get()) != FIXED_FILE_HEADER_BYTES)
+    throw StringError("NNEvalContainer: could not read the header of " + path_ + ".");
+  const int64_t headerBytes = (int64_t)get32(fixedHeader.data() + 12);
+  if(fileSize < headerBytes)
+    throw StringError("NNEvalContainer: " + path_ + " is now shorter than the header it declares.");
+  std::vector<uint8_t> fileHeader((size_t)headerBytes);
+  std::memcpy(fileHeader.data(), fixedHeader.data(), FIXED_FILE_HEADER_BYTES);
+  const size_t nameBytes = (size_t)headerBytes - FIXED_FILE_HEADER_BYTES;
+  if(nameBytes > 0 &&
+     std::fread(fileHeader.data() + FIXED_FILE_HEADER_BYTES, 1, nameBytes, f.get()) != nameBytes)
+    throw StringError("NNEvalContainer: could not read the model name in the header of " + path_ + ".");
+  verifyFileHeader(fileHeader, path_, context_, contextHash_, modelInternalName_, modelVersion_);
+
+  // ASCENDING FILE ORDER, whatever order the caller asked in. The loader's order is
+  // descending popularity, which is scattered across the file; reading in that order would
+  // turn one forward pass into tens of thousands of backward seeks.
+  std::vector<size_t> order(locations.size());
+  for(size_t i = 0; i < order.size(); i++)
+    order[i] = i;
+  std::sort(order.begin(), order.end(), [&locations](size_t x, size_t y) {
+    if(locations[x].payloadFileOffset != locations[y].payloadFileOffset)
+      return locations[x].payloadFileOffset < locations[y].payloadFileOffset;
+    return x < y;
+  });
+
+  uint8_t entryHeader[ENTRY_HEADER_BYTES];
+  std::vector<uint8_t> payload;
+  for(size_t oi = 0; oi < order.size(); oi++) {
+    const size_t i = order[oi];
+    const NNEvalContainerEntryLocation& loc = locations[i];
+    if(loc.payloadBytes < 0 || loc.headerFileOffset < 0 || loc.payloadFileOffset < 0 ||
+       loc.payloadFileOffset + loc.payloadBytes > fileSize ||
+       loc.headerFileOffset + (int64_t)ENTRY_HEADER_BYTES > fileSize)
+      throw StringError(
+        "NNEvalContainer: " + path_ + ": entry " + loc.key.toString() +
+        " is located outside the file. The container changed under the caller."
+      );
+
+    if(!seekTo(f.get(), loc.headerFileOffset))
+      throw StringError("NNEvalContainer: could not seek within " + path_ + ".");
+    if(std::fread(entryHeader, 1, ENTRY_HEADER_BYTES, f.get()) != ENTRY_HEADER_BYTES)
+      throw StringError("NNEvalContainer: could not read an entry header of " + path_ + ".");
+    // THE KEY IS COMPARED FIRST, on the raw bytes, BEFORE the header is decoded at all.
+    // That ordering is the whole point: if the file was rewritten between the key-set scan
+    // and this read, the caller's offset now lands in the middle of some other entry's
+    // payload, and decoding those bytes as a header produces a nonsense shape whose refusal
+    // would blame the format for what is really a stale offset. The honest first question is
+    // "is this still the entry I was told about", and only then "is this entry well formed"
+    // (ADR-0021 Rule 1: the refusal observes the thing being claimed).
+    const Hash128 keyOnDisk(get64(entryHeader + 0), get64(entryHeader + 8));
+    if(!(keyOnDisk == loc.key))
+      throw StringError(
+        "NNEvalContainer: " + path_ + ": the entry at offset " +
+        Global::int64ToString(loc.headerFileOffset) + " is now " + keyOnDisk.toString() +
+        " and the caller's key set says it is " + loc.key.toString() +
+        ". The container changed between reading its key set and reading its entries."
+      );
+    const DecodedEntryHeader h = decodeEntryHeader(entryHeader, path_);
+    // And the rest of what the location says, for the same reason: a rewrite that happened
+    // to leave this key's header at this offset can still have changed its shape.
+    if(h.nnXLen != loc.nnXLen || h.nnYLen != loc.nnYLen ||
+       h.hasOwnerMap != loc.hasOwnerMap || h.payloadBytes != loc.payloadBytes)
+      throw StringError(
+        "NNEvalContainer: " + path_ + ": entry " + h.key.toString() + " at offset " +
+        Global::int64ToString(loc.headerFileOffset) +
+        " no longer has the shape the caller's key set records for it. "
+        "The container changed between reading its key set and reading its entries."
+      );
+
+    if(!seekTo(f.get(), loc.payloadFileOffset))
+      throw StringError("NNEvalContainer: could not seek within " + path_ + ".");
+    payload.resize((size_t)h.payloadBytes);
+    if(h.payloadBytes > 0 &&
+       std::fread(payload.data(), 1, (size_t)h.payloadBytes, f.get()) != (size_t)h.payloadBytes)
+      throw StringError("NNEvalContainer: could not read an entry payload of " + path_ + ".");
+
+    NNOutput& out = sink.outputFor(i);
+    out.whiteOwnerMap =
+      h.hasOwnerMap ? sink.ownerMapFor(i, (size_t)h.nnXLen * (size_t)h.nnYLen) : NULL;
+    decodePayloadInto(out, h, payload.data(), path_);
+  }
+}
+
 NNEvalContainerContents NNEvalContainer::compact() const {
-  ScanResult scan = scanContainer(path_, context_, contextHash_, modelInternalName_, modelVersion_);
+  ScannedEntries scan = scanEntries(path_, context_, contextHash_, modelInternalName_, modelVersion_);
   rewriteAsOneBlock(path_, scan.entries, contextHash_, modelVersion_, modelInternalName_);
   const int64_t liveSet = (int64_t)scan.entries.size();
   return NNEvalContainerContents::of(
@@ -860,12 +1217,15 @@ bool NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
       "NNEvalContainer: a compaction multiple of " + Global::intToString(liveSetMultiple) +
       " has no reading; it must be at least 1."
     );
-  const ScanResult scan = scanContainer(path_, context_, contextHash_, modelInternalName_, modelVersion_);
-  const int64_t liveSet = (int64_t)scan.entries.size();
+  // The key-set scan is enough to decide this: the trigger reads the live-set size and the
+  // physical entry count, and neither is a payload fact. It reads 32 bytes per entry rather
+  // than the whole ~69 MB card the full read would decode and discard.
+  const ScannedLocations scan = scanLocations(path_, context_, contextHash_, modelInternalName_, modelVersion_);
+  const int64_t liveSet = (int64_t)scan.locations.size();
   // A torn tail is repaired whether or not the size trigger fires: leaving it would make the
   // next append land at an offset no loader reaches.
-  const bool torn = scan.tornTailBytes > 0;
-  const bool overMultiple = liveSet > 0 && scan.entriesApplied > (int64_t)liveSetMultiple * liveSet;
+  const bool torn = scan.scan.tornTailBytes > 0;
+  const bool overMultiple = liveSet > 0 && scan.scan.entriesApplied > (int64_t)liveSetMultiple * liveSet;
   if(!torn && !overMultiple)
     return false;
   // DELEGATES rather than rewriting here, so "rewrite this container" has exactly one home
@@ -895,10 +1255,10 @@ NNEvalContainerAppendResult NNEvalContainer::appendBlock(
   // Scan first. A torn tail must be repaired BEFORE anything is appended: an append past a
   // torn tail lands at an offset no loader ever reaches, so every subsequent dump would be
   // silently lost while every call reported success.
-  const ScanResult scan = scanContainer(path_, context_, contextHash_, modelInternalName_, modelVersion_);
-  if(scan.tornTailBytes > 0) {
+  const ScannedEntries scan = scanEntries(path_, context_, contextHash_, modelInternalName_, modelVersion_);
+  if(scan.scan.tornTailBytes > 0) {
     rewriteAsOneBlock(path_, scan.entries, contextHash_, modelVersion_, modelInternalName_);
-    result.tornTailBytesDiscarded = scan.tornTailBytes;
+    result.tornTailBytesDiscarded = scan.scan.tornTailBytes;
     result.rewroteTheFile = true;
   }
 

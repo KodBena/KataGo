@@ -142,6 +142,69 @@ class NNCacheFrozenIndex {
 };
 
 //-------------------------------------------------------------------------------------
+// Where a level 0's evaluations live
+//-------------------------------------------------------------------------------------
+
+// THE EVALUATIONS OF ONE LEVEL 0 TOGETHER WITH THE STORAGE THEY OCCUPY, as one type with
+// one lifetime.
+//
+// WHY THIS TYPE EXISTS AT ALL, since a vector of unique_ptr already worked. There are two
+// ways to hold a level 0's evaluations and they have incompatible destruction rules. The
+// in-process build path allocates each NNOutput with `new` and each ownership map with
+// `new[]`, so ~NNOutput's `delete[] whiteOwnerMap` and unique_ptr's `delete` are both
+// exactly right. The LOADER carves both out of an arena -- one contiguous block of
+// NNOutputs, one of ownership-map floats -- so both of those are exactly wrong: they would
+// hand the allocator an interior pointer it never issued. A std::unique_ptr<NNOutput>
+// pointing at arena memory is therefore not a shape to be handled carefully, it is a shape
+// that must not EXIST -- so no store ever hands out an owning handle to an evaluation, and
+// the only owner of the storage is the store itself (ADR-0000 Rule 2a).
+//
+// It is not on the lookup path. NNCacheFrozenIndex's records carry the payload pointer and
+// a get resolves through the record; this interface is touched at build time and by the
+// accounting calls, which are already O(n).
+class NNCacheEvaluationStore {
+ public:
+  virtual ~NNCacheEvaluationStore();
+
+  NNCacheEvaluationStore(const NNCacheEvaluationStore&) = delete;
+  NNCacheEvaluationStore& operator=(const NNCacheEvaluationStore&) = delete;
+
+  virtual size_t numEvaluations() const = 0;
+  // Evaluation i, owned by this store and never null -- a store that would hold a null
+  // refuses to be constructed instead.
+  virtual NNOutput* evaluationAt(size_t i) const = 0;
+  // The bytes this store spends on PER-ENTRY BOOKKEEPING, the evaluations themselves
+  // excluded. It is what NNCacheFrozen::structureBytes adds to the index's own footprint,
+  // and it is deliberately not the payload question: the evaluations are counted once, as
+  // payload, by nnOutputFootprintBytes.
+  virtual size_t handleBytes() const = 0;
+
+ protected:
+  NNCacheEvaluationStore();
+};
+
+// Evaluations each allocated separately on the heap: the in-process build path, and the
+// shape every caller before the loader used.
+//
+// It costs one pointer per entry of bookkeeping, which is what puts the published level-0
+// structure figure at 44.9 B/entry rather than the index's own 36.9.
+class NNCacheHeapEvaluationStore final : public NNCacheEvaluationStore {
+ public:
+  // Throws StringError, naming the position, if any evaluation is null: a null carries no
+  // position hash to index it by.
+  static std::shared_ptr<NNCacheEvaluationStore> of(std::vector<std::unique_ptr<NNOutput>> evaluations);
+
+  size_t numEvaluations() const override;
+  NNOutput* evaluationAt(size_t i) const override;
+  size_t handleBytes() const override;
+
+ private:
+  explicit NNCacheHeapEvaluationStore(std::vector<std::unique_ptr<NNOutput>> evaluations);
+
+  std::vector<std::unique_ptr<NNOutput>> evaluations_;
+};
+
+//-------------------------------------------------------------------------------------
 // The level-0 structure: the index, plus evaluations and per-entry hit counters
 //-------------------------------------------------------------------------------------
 
@@ -178,6 +241,13 @@ class NNCacheFrozen {
   // Throws StringError, yielding no structure, for everything NNCacheFrozenIndex::build
   // refuses and additionally for a null evaluation, which carries no key to index by.
   static std::unique_ptr<NNCacheFrozen> build(std::vector<std::unique_ptr<NNOutput>> evaluations);
+
+  // The same, over evaluations that already live somewhere -- an arena, for the loader.
+  // The store is shared rather than owned outright because a get hands out its result
+  // through shared_ptr's aliasing constructor against exactly this owner.
+  //
+  // Throws StringError, yielding no structure, if the store is null.
+  static std::unique_ptr<NNCacheFrozen> build(std::shared_ptr<NNCacheEvaluationStore> evaluations);
 
   NNCacheFrozen(const NNCacheFrozen& other) = delete;
   NNCacheFrozen& operator=(const NNCacheFrozen& other) = delete;
@@ -228,16 +298,23 @@ class NNCacheFrozen {
   int64_t shadowedPayloadBytes() const;
   int64_t numReachableEntries() const;
 
+  // The store the evaluations live in. Exposed so that a caller releasing a level 0 can
+  // hold a weak reference to it and OBSERVE whether the storage actually went, rather than
+  // inferring it from having dropped its own handle -- an outstanding aliased evaluation
+  // handed out by get() keeps the whole store alive by construction, and that is a fact a
+  // detach must be able to report rather than assume away (ADR-0021 Rule 1).
+  const std::shared_ptr<NNCacheEvaluationStore>& evaluationStore() const { return evaluations_; }
+
  private:
-  NNCacheFrozen(NNCacheFrozenIndex&& index, std::vector<std::unique_ptr<NNOutput>>&& evaluations);
+  NNCacheFrozen(NNCacheFrozenIndex&& index, std::shared_ptr<NNCacheEvaluationStore>&& evaluations);
 
   static const uint32_t SHADOW_BIT = 0x80000000u;
   static const uint32_t COUNT_MASK = 0x7FFFFFFFu;
 
   NNCacheFrozenIndex index_;
-  // The caller's evaluation vector, MOVED in rather than copied -- so no moment of
-  // construction holds two sets of handles, and SPEC.md 6's transient-peak ceiling is met
-  // with the same margin as its resident one.
+  // The caller's evaluations and the storage they live in, MOVED in rather than copied --
+  // so no moment of construction holds two sets of handles, and SPEC.md 6's transient-peak
+  // ceiling is met with the same margin as its resident one.
   //
   // ONE SHARED REFERENCE COUNT OVER THE WHOLE SET, and this is a performance contract
   // rather than a detail. A get hands out its result through shared_ptr's ALIASING
@@ -252,12 +329,14 @@ class NNCacheFrozen {
   //
   // Two consequences, both the prototype's too. A caller holding one returned evaluation
   // keeps the WHOLE level-0 payload alive -- which costs nothing, because level 0 is built
-  // for a session and lives for it. And level 0 OWNS its evaluations: build() takes
-  // unique_ptr, so a caller cannot retain its own handle to one. Nothing in the engine
-  // wants to, because level 0 is built once from a supplied set and is never set into.
+  // for a session and lives for it, and which a release therefore OBSERVES rather than
+  // assumes away (see evaluationStore). And level 0 OWNS its evaluations: no store hands
+  // out an owning handle to one, so a caller cannot become a second owner. Nothing in the
+  // engine wants to, because level 0 is built once from a supplied set and is never set
+  // into.
   //
-  // This vector is never touched on the lookup path -- the record carries the pointer.
-  std::shared_ptr<std::vector<std::unique_ptr<NNOutput>>> evaluations_;
+  // This store is never touched on the lookup path -- the record carries the pointer.
+  std::shared_ptr<NNCacheEvaluationStore> evaluations_;
   // The per-entry count and shadow flag live in the index's own record, beside the key --
   // see NNCacheFrozenIndex::stateAt for the measurement that put them there. They share a
   // single 32-bit word so that shadowing and reading out the accrued count are ONE atomic

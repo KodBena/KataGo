@@ -155,6 +155,9 @@ namespace Tests {
 
   //testnnevalcontainer.cpp
   void runNNEvalContainerTests();
+
+  //testnncachelevelzero.cpp
+  void runNNCacheLevelZeroTests();
   //testanalysismodels.cpp
   void runAnalysisModelNameSpaceTests();
   // Not part of runtests: it is a measurement, not an assertion, and it writes real files.
