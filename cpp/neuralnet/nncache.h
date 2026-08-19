@@ -359,6 +359,21 @@ class NNCacheTable {
   virtual void set(const std::shared_ptr<NNOutput>& p) = 0;
   virtual void clear() = 0;
 
+  // Retrieves an entry WITHOUT counting a retrieval against it, and without consulting any
+  // pre-warmed level 0.
+  //
+  // WHY IT EXISTS. A dump has to read the entries it is about to write. Reading them through
+  // get() would count each one as a retrieval, so the act of persisting a session's counts
+  // would inflate the very counts being persisted -- the instrument inside the instrument
+  // (ADR-0009). And a dump wants LEVEL 1's entries specifically: a level-0 entry's bytes are
+  // already in the file by construction, so serving one here would hand a dump exactly the
+  // duplicate it exists to avoid.
+  //
+  // The base answer is get(), which is correct for every single-level table: counting is a
+  // property of the two-level strategy and no other shape counts anything. Only the
+  // two-level table overrides it, and it overrides it to skip level 0.
+  virtual bool peek(Hash128 nnHash, std::shared_ptr<NNOutput>& ret);
+
   //-----------------------------------------------------------------------------------
   // Context attribution of what this session earns
   //-----------------------------------------------------------------------------------
@@ -397,6 +412,35 @@ class NNCacheTable {
   // cannot be spent here, and is refused rather than indexing into this table's name space
   // at the same position.
   void set(const std::shared_ptr<NNOutput>& p, const NNCacheAttribution& attribution);
+
+  // The same, saying where the entry came from. The two-argument form above is exactly this
+  // one at LiveEvaluation -- which is what every evaluation path is, and what the default
+  // keeps costing nothing -- and the LoadedFromContainer form is for the ONE caller that has
+  // a different answer: an attach filling level 1 from the context's own container.
+  //
+  // See NNCacheEntryProvenance for why this is recorded here, at admission, rather than
+  // reconstructed at dump time.
+  void set(
+    const std::shared_ptr<NNOutput>& p,
+    const NNCacheAttribution& attribution,
+    NNCacheEntryProvenance provenance
+  );
+
+  // Exactly the keys `context` earned, for an implementation that can put hit counts beside
+  // them and for a dump that needs the denominator its own selection is a numerator of.
+  // Total: a context this table did not attach is refused by attachCacheContext's own
+  // ownership rule before it can be asked about here.
+  [[nodiscard]] std::vector<Hash128> attributedKeysFor(const NNCacheContextId& context) const;
+
+  // Exactly the keys `context` earned whose bytes are not on disk: what a dump of this
+  // context owes. Empty for a table with no attached context, and refused for a context this
+  // table did not attach, exactly as the attribution surface is.
+  [[nodiscard]] std::vector<Hash128> unpersistedKeysFor(const NNCacheContextId& context) const;
+
+  // Records that these keys of `context` are now on disk, and returns how many rows were
+  // marked. Called after a container append has succeeded and never before: a mark set ahead
+  // of a write that then throws would drop the entry from every future dump.
+  int64_t markPersisted(const NNCacheContextId& context, const std::vector<Hash128>& keys);
 
   // The key -> context ledger of what this session earned, for whoever persists it.
   // Thread-safe and O(ledger); a reporting call taken between sessions, never in a search.
@@ -440,6 +484,33 @@ class NNCacheTable {
   // two-level table returns Counted with one row per key.
   virtual NNCacheHitLedger harvestHitCounts() const;
 
+  // THE COUNTS THAT HAVE NOT REACHED THE COUNT LOG YET, and taking them advances the mark.
+  //
+  // This is the numeric twin of the persisted bit, and it exists for the same defect in the
+  // same shape. A count log record is an INCREMENT: appendDump adds each row's lookups to
+  // that key's running total and adds one to its sessions. So a dump must hand it the DELTA
+  // this attachment earned, and a second dump with nothing in between must hand it NOTHING
+  // -- otherwise an attach, a dump, a detach and a re-attach re-append what the attach
+  // loaded, and the record inflates by a whole session's worth of retrievals that never
+  // happened.
+  //
+  // TWO PROPERTIES, both of which harvestHitCounts() deliberately does NOT have, which is
+  // why this is a second surface rather than a change to that one:
+  //
+  //   IT IS CONSUMING. Taking the rows advances each key's persisted mark to its current
+  //   count, so the next take reports only what accrued after this one. The accumulated
+  //   total's one home is the count log file; what the in-memory counters hold is exactly
+  //   what has not reached it (ADR-0012 P1).
+  //
+  //   IT OMITS A KEY WITH NOTHING TO SAY. harvestHitCounts() reports a pre-warmed entry that
+  //   earned nothing with a row of zero hits, deliberately -- that is the fact that says to
+  //   stop carrying it. A DUMP must not write that row, because appendDump would raise its
+  //   sessions, so an attach-dump-detach-attach-dump cycle over an untouched card would
+  //   climb the sessions of every key it loaded while nothing was ever looked up.
+  //
+  // NotCounted from a table that keeps no per-key hit counts, exactly as harvestHitCounts is.
+  [[nodiscard]] virtual NNCacheHitLedger takeUnpersistedHitCounts();
+
   // Builds the table a config asks for. Throws, naming what is missing, for a
   // shape that is coherent but not implemented yet -- never silently substituting
   // the default one (ADR-0002).
@@ -447,11 +518,6 @@ class NNCacheTable {
 
  protected:
   NNCacheTable();
-
-  // Exactly the keys `context` earned, for an implementation that can put hit counts beside
-  // them. Total: a context this table did not attach is refused by attachCacheContext's own
-  // ownership rule before it can be asked about here.
-  [[nodiscard]] std::vector<Hash128> attributedKeysFor(const NNCacheContextId& context) const;
 
  private:
   // Allocated by the first attachCacheContext and never before. See attachCacheContext.

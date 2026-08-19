@@ -67,6 +67,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runNNEvalContainerTests();
   Tests::runNNCacheLevelZeroTests();
   Tests::runNNCacheContextTests();
+  Tests::runNNCacheDumpTests();
   Tests::runAnalysisModelNameSpaceTests();
 
   // Pick an arbitrary file that the test uses

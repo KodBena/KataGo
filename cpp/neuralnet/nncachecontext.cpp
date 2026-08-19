@@ -208,13 +208,21 @@ class NNCacheAttributionRecorder::Impl {
      unrecorded_(0)
   {}
 
-  void record(Hash128 key, const NNCacheAttribution& attribution) {
+  void record(Hash128 key, const NNCacheAttribution& attribution, NNCacheEntryProvenance provenance) {
     if(!attribution.isToContext()) {
       // Counted, never guessed into whichever context happens to be attached.
       noAttributable_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     const NNCacheContextId id = attribution.contextId();
+    // The row holds the context's position in a 32-bit field, which is what buys the
+    // persisted mark its bytes for free (see Row). A position past that is refused rather
+    // than truncated into a different context's index (ADR-0002).
+    if(id.index() > (size_t)0xFFFFFFFFu)
+      throw StringError(
+        "NNCacheAttributionRecorder: a context index past 2^32 cannot be recorded. Truncating "
+        "it would file the entry under whichever context sits at the wrapped position."
+      );
     const uint64_t home = key.hash0 & mask_;
     std::mutex& mutex = mutexPool_.getMutex((uint32_t)home & mutexMask_);
     std::lock_guard<std::mutex> lock(mutex);
@@ -225,11 +233,55 @@ class NNCacheAttributionRecorder::Impl {
       if(row.setIdPlusOne == 0 || row.key == key) {
         row.key = key;
         row.setIdPlusOne = id.setId() + 1;
-        row.contextIndex = id.index();
+        row.contextIndex = (uint32_t)id.index();
+        // ASSIGNED, NEVER OR-ED. LiveEvaluation clears an existing mark: the entry the table
+        // now holds is not the entry on disk. See the header.
+        row.persisted = (provenance == NNCacheEntryProvenance::LoadedFromContainer);
         return;
       }
     }
     unrecorded_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  int64_t markPersisted(const NNCacheContextId& context, const std::vector<Hash128>& keys) {
+    int64_t marked = 0;
+    for(size_t k = 0; k < keys.size(); k++) {
+      const Hash128 key = keys[k];
+      const uint64_t home = key.hash0 & mask_;
+      std::mutex& mutex = mutexPool_.getMutex((uint32_t)home & mutexMask_);
+      std::lock_guard<std::mutex> lock(mutex);
+      for(uint32_t step = 0; step < PROBE_WINDOW; step++) {
+        Row& row = rows_[(home + step) & mask_];
+        if(row.setIdPlusOne == 0)
+          break;
+        if(row.key != key)
+          continue;
+        // Only this context's own row. A key another context also earned is that context's
+        // to persist into its own file, and marking it here would drop it from that file.
+        if(row.setIdPlusOne == context.setId() + 1 && row.contextIndex == (uint32_t)context.index()) {
+          row.persisted = true;
+          marked += 1;
+        }
+        break;
+      }
+    }
+    return marked;
+  }
+
+  std::vector<Hash128> unpersistedKeysFor(const NNCacheContextId& context) const {
+    std::vector<Hash128> out;
+    for(size_t i = 0; i < rows_.size(); i++) {
+      std::mutex& mutex = mutexPool_.getMutex((uint32_t)i & mutexMask_);
+      std::lock_guard<std::mutex> lock(mutex);
+      if(rows_[i].setIdPlusOne == 0)
+        continue;
+      if(rows_[i].setIdPlusOne != context.setId() + 1 || rows_[i].contextIndex != (uint32_t)context.index())
+        continue;
+      if(rows_[i].persisted)
+        continue;
+      out.push_back(rows_[i].key);
+    }
+    return out;
   }
 
   vector<NNCacheAttributionRow> harvest(const NNCacheContextSet& contexts) const {
@@ -244,7 +296,7 @@ class NNCacheAttributionRecorder::Impl {
       // whichever context sits at the same position (ADR-0002); the table's set path checks
       // the same ownership before a row is ever written, so reaching this is a defect in
       // that path, not a client's doing.
-      if(rows_[i].setIdPlusOne != contexts.id() + 1 || rows_[i].contextIndex >= contexts.names().size())
+      if(rows_[i].setIdPlusOne != contexts.id() + 1 || (size_t)rows_[i].contextIndex >= contexts.names().size())
         throw StringError(
           "NNCacheAttributionRecorder: a recorded attribution names a context this cache's "
           "context set did not mint. It is not resolved against this set's names."
@@ -264,7 +316,7 @@ class NNCacheAttributionRecorder::Impl {
       std::lock_guard<std::mutex> lock(mutex);
       if(rows_[i].setIdPlusOne == 0)
         continue;
-      if(rows_[i].setIdPlusOne != context.setId() + 1 || rows_[i].contextIndex != context.index())
+      if(rows_[i].setIdPlusOne != context.setId() + 1 || rows_[i].contextIndex != (uint32_t)context.index())
         continue;
       out.push_back(rows_[i].key);
     }
@@ -282,12 +334,22 @@ class NNCacheAttributionRecorder::Impl {
   }
 
  private:
+  // 32 BYTES, AND THE PERSISTED MARK COSTS NONE OF THEM. The row is 16 + 8 + 4 + 1 = 29
+  // bytes of fields in a structure whose alignment is 8, so it occupies 32 either way: the
+  // mark lives in bytes this row was already paying for. contextIndex is 32-bit rather than
+  // size_t for exactly that reason, and record() refuses an index that would not fit rather
+  // than wrapping one. The relation is asserted in testnncachedump.cpp against sizeof(Row),
+  // not trusted from this comment -- an earlier comment in this file named a per-row byte
+  // figure that was not the real one.
   struct Row {
     Hash128 key;
     // The minting set's id, plus one, so that zero is free rather than a legal set id.
     uint64_t setIdPlusOne;
-    size_t contextIndex;
-    Row() : key(), setIdPlusOne(0), contextIndex(0) {}
+    uint32_t contextIndex;
+    // Whether this key's bytes are already in the context's evaluation container. See
+    // NNCacheEntryProvenance.
+    bool persisted;
+    Row() : key(), setIdPlusOne(0), contextIndex(0), persisted(false) {}
   };
 
   std::vector<Row> rows_;
@@ -343,8 +405,24 @@ NNCacheAttributionRecorder::NNCacheAttributionRecorder(int powerOfTwo, int mutex
 
 NNCacheAttributionRecorder::~NNCacheAttributionRecorder() {}
 
+void NNCacheAttributionRecorder::record(
+  Hash128 key, const NNCacheAttribution& attribution, NNCacheEntryProvenance provenance
+) {
+  impl_->record(key, attribution, provenance);
+}
+
 void NNCacheAttributionRecorder::record(Hash128 key, const NNCacheAttribution& attribution) {
-  impl_->record(key, attribution);
+  impl_->record(key, attribution, NNCacheEntryProvenance::LiveEvaluation);
+}
+
+int64_t NNCacheAttributionRecorder::markPersisted(
+  const NNCacheContextId& context, const vector<Hash128>& keys
+) {
+  return impl_->markPersisted(context, keys);
+}
+
+vector<Hash128> NNCacheAttributionRecorder::unpersistedKeysFor(const NNCacheContextId& context) const {
+  return impl_->unpersistedKeysFor(context);
 }
 
 vector<NNCacheAttributionRow> NNCacheAttributionRecorder::harvest(const NNCacheContextSet& contexts) const {

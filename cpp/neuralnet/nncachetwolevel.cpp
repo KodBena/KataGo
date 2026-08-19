@@ -110,16 +110,49 @@ class HitLedger {
     return out;
   }
 
+  // The hits that have not reached the count log yet, taking them as it reports them: per
+  // occupied row, the count minus its persisted mark, with the mark then advanced.
+  //
+  // THE MARK IS WHY THE COUNT IS NOT SIMPLY RESET TO ZERO. A count of zero is this
+  // structure's FREE-ROW marker, so zeroing an occupied row would cut the probe chain of
+  // every key placed behind it and lose their counts silently. The mark is a second word in
+  // the 4 bytes Row already padded away -- twoLevelHitLedgerBytes has always counted them --
+  // so this costs the ledger nothing and forecloses that whole failure by not needing to
+  // touch count at all.
+  std::vector<NNCacheHitCount> takeUnpersisted() {
+    std::vector<NNCacheHitCount> out;
+    for(size_t i = 0; i < rows_.size(); i++) {
+      std::mutex& mutex = mutexPool_.getMutex((uint32_t)i & mutexMask_);
+      std::lock_guard<std::mutex> lock(mutex);
+      Row& row = rows_[i];
+      if(row.count == 0)
+        continue;
+      if(row.count <= row.persisted)
+        continue;
+      NNCacheHitCount out_row;
+      out_row.key = row.key;
+      out_row.hits = row.count - row.persisted;
+      row.persisted = row.count;
+      out.push_back(out_row);
+    }
+    return out;
+  }
+
   int64_t unrecordedHits() const { return unrecorded_.load(std::memory_order_relaxed); }
   size_t structureBytes() const {
     return rows_.size() * sizeof(Row) + ((size_t)mutexMask_ + 1) * sizeof(std::mutex);
   }
 
  private:
+  // 24 bytes: 16 of key, 4 of count, and 4 that alignment has always spent on this row
+  // whether they held anything or not -- twoLevelHitLedgerBytes counts them explicitly. The
+  // persisted mark is those 4 bytes, so the delta surface costs this structure nothing.
   struct Row {
     Hash128 key;
     uint32_t count;
-    Row() : key(), count(0) {}
+    // How much of `count` has already been written to the count log. See takeUnpersisted.
+    uint32_t persisted;
+    Row() : key(), count(0), persisted(0) {}
   };
 
   std::vector<Row> rows_;
@@ -179,6 +212,14 @@ class NNCacheTableTwoLevel final : public NNCacheTable {
     levelOne_->set(p);
   }
 
+  // LEVEL 1 ONLY, AND WITHOUT COUNTING. Both halves are the point. Not counting is what
+  // keeps a dump from appearing in the counts it is dumping (ADR-0009); skipping level 0 is
+  // what keeps a dump from being handed an entry whose bytes are already in the file it is
+  // appending to, which is the duplicate the whole persisted mark exists to foreclose.
+  bool peek(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
+    return levelOne_->get(nnHash, ret);
+  }
+
   // Level 1 only. Level 0 is the pre-warmed content this session was handed; it cannot be
   // rebuilt in process, and clearing it would discard the whole point of having it. The
   // hit counts survive too: clear() is not the end of a session.
@@ -220,6 +261,20 @@ class NNCacheTableTwoLevel final : public NNCacheTable {
   // HOW OFTEN each was retrieved is this table's hit ledger. Neither is re-derived from the
   // other -- an earned key with no hit row appears with zero, which is a fact a dump wants,
   // not a row to drop.
+  // The delta twin of harvestHitCounts above, composed from the same two owners and in the
+  // same order. See NNCacheTable::takeUnpersistedHitCounts for what it is for.
+  //
+  // unrecordedHits is reported WHOLE rather than as a delta, and that is deliberate: it is a
+  // count of hits whose KEY was lost, so there is no row to hold a mark against and no way to
+  // divide it. A caller reading it twice sees the same running figure; it is a health number,
+  // not a payload.
+  NNCacheHitLedger takeUnpersistedHitCounts() override {
+    std::vector<NNCacheHitCount> rows = levelZero_->takeUnpersistedHits();
+    const std::vector<NNCacheHitCount> levelOneRows = ledger_.takeUnpersisted();
+    rows.insert(rows.end(), levelOneRows.begin(), levelOneRows.end());
+    return NNCacheHitLedger::counted(std::move(rows), ledger_.unrecordedHits());
+  }
+
   NNCacheHitLedger harvestHitCountsFor(const NNCacheContextId& context) const override {
     const std::vector<Hash128> keys = attributedKeysFor(context);
     std::vector<NNCacheHitCount> rows;
@@ -246,6 +301,9 @@ size_t twoLevelHitLedgerBytes(int hitLedgerPowerOfTwo) {
   // Kept in step with HitLedger::Row by construction rather than by a second copy of the
   // arithmetic (ADR-0012 P1). The mutex pool is not included: it is sized independently
   // and is reported through stats(), where the whole figure is what matters.
+  // The second uint32_t is the persisted mark, which before it existed was the padding this
+  // arithmetic already charged for. The figure is unchanged by its arrival, which is the
+  // point (ADR-0012 P1: the row type decides, this reads it).
   return (((size_t)1) << hitLedgerPowerOfTwo) * (sizeof(Hash128) + sizeof(uint32_t) + sizeof(uint32_t));
 }
 

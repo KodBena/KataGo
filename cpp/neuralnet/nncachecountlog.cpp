@@ -378,6 +378,12 @@ NNCacheCountLogContents::NNCacheCountLogContents(
    recordsApplied_(recordsApplied)
 {}
 
+std::string NNCacheLookupThreshold::describe() const {
+  if(lookups_ == 0)
+    return "every key, counted or not";
+  return "keys with at least " + Global::uint64ToString(lookups_) + " recorded lookups";
+}
+
 NNCacheCountLogContents NNCacheCountLogContents::of(
   std::vector<NNCacheCountRow> rows,
   int64_t unattributedLookups,

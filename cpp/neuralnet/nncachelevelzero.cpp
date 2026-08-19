@@ -234,8 +234,14 @@ size_t NNCacheLevelZeroBound::select(const std::vector<NNCacheLevelZeroCandidate
     // unreachable -- which is worse than its absence, because a later reader would trust it
     // (ADR-0013 Rule 4: the honest disposition of a check that catches nothing is to remove
     // it and say why, not to keep it as reassurance).
+    //
+    // THE COMPARISON ITSELF IS NOT WRITTEN HERE. It is NNCacheLookupThreshold::admits, the
+    // one home of "this key has been seen often enough", shared with the write side's
+    // NNCacheDiskAdmission so the two cannot drift on exactly the boundary case the
+    // paragraph above turns on (ADR-0012 P1).
+    const NNCacheLookupThreshold threshold = NNCacheLookupThreshold::of(lookups_);
     size_t taken = 0;
-    while(taken < ordered.size() && ordered[taken].lookups >= lookups_)
+    while(taken < ordered.size() && threshold.admits(ordered[taken].lookups))
       taken += 1;
     return taken;
   }
@@ -262,7 +268,7 @@ size_t NNCacheLevelZeroBound::select(const std::vector<NNCacheLevelZeroCandidate
 std::string NNCacheLevelZeroBound::describe() const {
   switch(kind_) {
   case Kind::All: return "every persisted key";
-  case Kind::MinLookups: return "keys with at least " + Global::uint64ToString(lookups_) + " recorded lookups";
+  case Kind::MinLookups: return NNCacheLookupThreshold::of(lookups_).describe();
   case Kind::MaxEntries: return "at most " + Global::int64ToString(amount_) + " entries";
   case Kind::MaxBytes: return "at most " + Global::int64ToString(amount_) + " resident payload bytes";
   default:
