@@ -589,15 +589,21 @@ void testTheArenaIsReleasedAtDetachAndNotOneMomentLater() {
   }
 }
 
-// A MEASUREMENT, not an assertion (ADR-0009): what the allocator actually gives back at a
-// detach on this box, and what the trim call itself contributes on top of the release.
+// ONE ASSERTION AND ONE MEASUREMENT, kept apart because they are different kinds of claim.
 //
-// It is separated from the test above because it must split an act that
-// nnCacheReleaseLevelZero deliberately performs as one -- release, then trim -- to attribute
-// the two. Nothing here is asserted against a number; the figures are printed so a report can
-// quote a measurement made on the machine it is reporting about rather than a figure
-// inherited from somewhere else.
-void measureWhatTheDetachGivesBack() {
+// THE ASSERTION is the end state: after the detach boundary has both released the arena and
+// asked the allocator for the pages, the process is back where it started. That is a logic
+// claim about the boundary and is asserted.
+//
+// THE MEASUREMENT is the ATTRIBUTION -- how much of that the free itself returned and how
+// much the trim did. It is printed and never asserted against a number, because it is a
+// property of one allocator on one box on one day (ADR-0009's calibration: a figure subject
+// to the environment is not pinned).
+//
+// Attributing the two requires splitting an act nnCacheReleaseLevelZero performs as one, so
+// this is done here rather than through it, which is also why the assertion above about the
+// released arena lives in its own test: that one goes through the real detach.
+void assertAndMeasureWhatTheDetachGivesBack() {
   ScopedTempDir tmp("nnlevelzero-reclaim");
 
   const int n = 15000;
@@ -624,6 +630,16 @@ void measureWhatTheDetachGivesBack() {
   const NNCacheHeapReclaim reclaim = nnCacheReclaimFreedHeap();
   const double trimMs = trimTimer.getSeconds() * 1000.0;
   const int64_t afterTrim = residentBytes();
+
+  if(baseline >= 0 && afterAttach >= 0 && afterTrim >= 0) {
+    // THE PROPERTY: the detach boundary gives the pages back. This scenario is the one that
+    // makes the claim non-trivial -- here the free alone reproducibly returns nothing to the
+    // operating system, so a boundary that did not ask would leave the whole arena charged
+    // to the process. The assertion is on the END STATE and not on which of the two steps
+    // returned it, so it stays true if a future allocator returns more at free.
+    testAssert(afterAttach - baseline > load.report.arenaTotalBytes / 2);
+    testAssert(afterTrim - baseline < load.report.arenaTotalBytes / 4);
+  }
 
   const char* reclaimName =
     reclaim == NNCacheHeapReclaim::Trimmed ? "Trimmed" :
@@ -792,5 +808,5 @@ void Tests::runNNCacheLevelZeroTests() {
   testAContainerRewrittenBetweenItsKeySetAndItsEntriesIsRefused();
   testATornContainerAttachesTheIntactPrefixAndSaysSo();
 
-  measureWhatTheDetachGivesBack();
+  assertAndMeasureWhatTheDetachGivesBack();
 }
