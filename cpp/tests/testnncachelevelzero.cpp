@@ -11,6 +11,9 @@
 #ifdef __linux__
 #include <unistd.h>
 #endif
+#if defined(__GLIBC__) && !defined(__UCLIBC__)
+#include <malloc.h>
+#endif
 
 #include "../core/fileutils.h"
 #include "../core/timer.h"
@@ -158,6 +161,21 @@ bool refused(const std::function<void()>& f, const string& mustSay) {
 // is an RSS statement -- so it is the figure the release test observes, rather than a
 // destructor call or an internal counter that would agree with the code being tested by
 // construction (ADR-0021 Rule 1).
+// Returns the heap to the operating system, for the SETUP of a measurement only.
+//
+// It deliberately does NOT call nnCacheReclaimFreedHeap, even though that is exactly what
+// that function does. A witness whose setup routes through the code it observes cannot go
+// red: the first version of the release test below called the production function to
+// establish its baseline, and the "the detach never trims" seen-red leg passed green,
+// because the defect disabled the setup and the observation together and the confounder the
+// setup existed to remove came straight back (ADR-0021 Rule 1: the witness observes at the
+// site of the claim, through nothing that the claim is about).
+void trimForMeasurementSetup() {
+#if defined(__GLIBC__) && !defined(__UCLIBC__)
+  (void)malloc_trim(0);
+#endif
+}
+
 int64_t residentBytes() {
 #ifdef __linux__
   FILE* f = fopen("/proc/self/statm", "r");
@@ -508,8 +526,10 @@ void testTheArenaIsReleasedAtDetachAndNotOneMomentLater() {
   // below reuses it instead of growing the process, and the whole observation collapses to
   // noise. It collapsed exactly that way on the first attempt, and the missing-trim seen-red
   // leg passed green against it (ADR-0021 Rule 4: a green that cannot go red witnesses
-  // nothing).
-  (void)nnCacheReclaimFreedHeap();
+  // nothing). The trim here is the test's OWN call and not the loader's -- see
+  // trimForMeasurementSetup for why that distinction is the difference between a witness
+  // and a tautology.
+  trimForMeasurementSetup();
   const int64_t baseline = residentBytes();
 
   NNCacheLevelZeroLoad load = nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::all()));
@@ -593,7 +613,7 @@ void measureWhatTheDetachGivesBack() {
   // heap every test before this one left grown. Without it the trim's figure would be the
   // whole suite's accumulated free lists attributed to one detach, which is the kind of
   // number that gets quoted for years (ADR-0009: the method is part of the claim).
-  (void)nnCacheReclaimFreedHeap();
+  trimForMeasurementSetup();
   const int64_t baseline = residentBytes();
   NNCacheLevelZeroLoad load = nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::all()));
   const int64_t afterAttach = residentBytes();
