@@ -2,12 +2,20 @@
 
 #include <cstring>
 
-//The two facts the candidate predicate reads, packed into one byte per point so that one snapshot
-//comparison covers both. Colors are 0..3 (C_EMPTY..C_WALL), so bit 2 is free for the flag and the
-//value can never be NEVER_OBSERVED.
+//THE SNAPSHOT'S FIELD SET, DECLARED ONCE. These are exactly the facts the candidate predicate is
+//allowed to read: whatever is packed here is what resync() re-verifies against reality on every
+//call, and nothing else is. Adding a term to the predicate that reads state this function does not
+//pack silently voids the whole staleness argument, so add it here first or do not add it.
+//Colors are 0..3 (C_EMPTY..C_WALL), so bit 2 is free for the flag and a packed byte is always <= 7,
+//never NEVER_OBSERVED.
 static inline uint8_t packState(Color color, bool wasEverOccupiedOrPlayed) {
   return (uint8_t)((uint8_t)color | (wasEverOccupiedOrPlayed ? 4u : 0u));
 }
+
+//The same function as packState, eight points at a time. The mask is what makes it the same
+//function rather than merely the same function on well-formed input: a bool byte outside {0,1}
+//would otherwise land bits above bit 2 and could even produce NEVER_OBSERVED.
+static constexpr uint64_t ONE_PER_BYTE = 0x0101010101010101ULL;
 
 //Eight packed points at a time. Reading through memcpy rather than a cast keeps this free of
 //aliasing assumptions about Color and bool arrays; every compiler turns it back into one load.
@@ -64,6 +72,39 @@ static inline uint64_t wordShiftedDown(const uint64_t* src, int w, int shift, in
   return (lo >> bitShift) | (hi << (64 - bitShift));
 }
 
+//The predicate itself. Its parameters ARE its input set: the two bitsets resync() re-verifies
+//against reality on every call, and the board's row stride, which is read fresh and carried across
+//nothing. There is deliberately no Board and no BoardHistory in scope here. That is the mechanism,
+//not an accident of factoring - a predicate term reading state the snapshot does not cover (the
+//simple ko point, a liberty count, the suicide rule) cannot be written without first widening this
+//signature, which is exactly the moment someone has to ask whether packState covers it.
+//
+//"Has an adjacent empty point" is the union of the empty-point bitset shifted by the four adjacency
+//offsets, which needs no per-point branching and no edge cases: the ring of wall points around the
+//board is never empty, so nothing wraps between rows and nothing shifts in from off the array.
+static int derivePredicate(
+  const uint64_t (&isEmptyBits)[SuperKoCandidates::NUM_WORDS],
+  const uint64_t (&wasEverBits)[SuperKoCandidates::NUM_WORDS],
+  int rowStride,
+  Loc (&outCandidates)[Board::MAX_ARR_SIZE]
+) {
+  constexpr int numWords = SuperKoCandidates::NUM_WORDS;
+  int numCandidates = 0;
+  for(int wordIdx = 0; wordIdx < numWords; wordIdx++) {
+    const uint64_t hasAdjacentEmpty =
+      wordShiftedUp(isEmptyBits,wordIdx,1) |
+      wordShiftedDown(isEmptyBits,wordIdx,1,numWords) |
+      wordShiftedUp(isEmptyBits,wordIdx,rowStride) |
+      wordShiftedDown(isEmptyBits,wordIdx,rowStride,numWords);
+    uint64_t candidates = isEmptyBits[wordIdx] & (wasEverBits[wordIdx] | ~hasAdjacentEmpty);
+    while(candidates != 0) {
+      outCandidates[numCandidates++] = (Loc)(wordIdx * 64 + indexOfLowestSetBit(candidates));
+      candidates &= candidates - 1;
+    }
+  }
+  return numCandidates;
+}
+
 SuperKoCandidates::SuperKoCandidates() {
   //Deliberately NOT a state that agrees with any real board: the first resync must find every point
   //different and rebuild the bitsets, rather than inherit whatever a caller happened to leave.
@@ -79,7 +120,10 @@ int SuperKoCandidates::resync(
 ) {
   static_assert(sizeof(Color) == 1, "the packed snapshot assumes one byte per color");
   static_assert(sizeof(bool) == 1, "the packed snapshot assumes one byte per wasEverOccupiedOrPlayed");
-  static_assert(C_EMPTY == 0 && C_WALL == 3, "the packed snapshot assumes colors fit in two bits");
+  static_assert(
+    C_EMPTY == 0 && C_BLACK == 1 && C_WHITE == 2 && C_WALL == 3,
+    "the packed snapshot assumes colors fit in two bits"
+  );
 
   //Phase 1: repair the bitsets against reality. Every point is compared, so it does not matter what
   //changed the board or whether this object was told about it.
@@ -87,9 +131,9 @@ int SuperKoCandidates::resync(
   for(int wordIdx = 0; wordIdx < numWholeWords; wordIdx++) {
     const int base = wordIdx * 8;
     const uint64_t colorBytes = loadEightBytes(board.colors + base);
-    //Each bool byte is 0 or 1, so shifting the whole word left by 2 shifts each byte's bit into that
-    //same byte's bit 2 with no carry across byte boundaries.
-    const uint64_t wasEverBytes = loadEightBytes(wasEverOccupiedOrPlayed + base) << 2;
+    //Masked to one bit per byte and then shifted left 2: each byte's flag lands in that same byte's
+    //bit 2, with no carry across byte boundaries and nothing above it. This is packState, widened.
+    const uint64_t wasEverBytes = (loadEightBytes(wasEverOccupiedOrPlayed + base) & ONE_PER_BYTE) << 2;
     const uint64_t current = colorBytes | wasEverBytes;
     if(current == loadEightBytes(snapshot + base))
       continue;
@@ -113,22 +157,6 @@ int SuperKoCandidates::resync(
     setBit(wasEverBits,loc,wasEverOccupiedOrPlayed[loc]);
   }
 
-  //Phase 2: derive the candidates. "Has an adjacent empty point" is the union of the empty-point
-  //bitset shifted by the four adjacency offsets, which needs no per-point branching and no edge
-  //cases - the ring of wall points around the board is never empty, so nothing wraps between rows.
-  const int rowStride = board.x_size + 1;
-  int numCandidates = 0;
-  for(int wordIdx = 0; wordIdx < NUM_WORDS; wordIdx++) {
-    const uint64_t hasAdjacentEmpty =
-      wordShiftedUp(isEmptyBits,wordIdx,1) |
-      wordShiftedDown(isEmptyBits,wordIdx,1,NUM_WORDS) |
-      wordShiftedUp(isEmptyBits,wordIdx,rowStride) |
-      wordShiftedDown(isEmptyBits,wordIdx,rowStride,NUM_WORDS);
-    uint64_t candidates = isEmptyBits[wordIdx] & (wasEverBits[wordIdx] | ~hasAdjacentEmpty);
-    while(candidates != 0) {
-      outCandidates[numCandidates++] = (Loc)(wordIdx * 64 + indexOfLowestSetBit(candidates));
-      candidates &= candidates - 1;
-    }
-  }
-  return numCandidates;
+  //Phase 2: derive the candidates from nothing but what phase 1 just re-verified.
+  return derivePredicate(isEmptyBits,wasEverBits,board.x_size + 1,outCandidates);
 }
