@@ -1723,6 +1723,13 @@ if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX")
     set(Protobuf_USE_STATIC_LIBS TRUE)
   endif()
   find_package(Protobuf REQUIRED)
+  # Protobuf 22 and up un-vendored abseil, so the generated *.pb.cc references absl symbols
+  # directly -- e.g. absl::log_internal_check_op, from the ABSL_DCHECK macros that protobuf's
+  # own headers expand to. Neither module-mode ${Protobuf_LIBRARIES} nor protobuf's exported
+  # imported target reliably names abseil on the link line, so under a linker defaulting to
+  # --as-needed (e.g. Gentoo) the link fails with "undefined reference to absl::...; DSO
+  # missing from command line". Find abseil explicitly and name the needed target below.
+  find_package(absl CONFIG REQUIRED)
   message(STATUS "Found Protobuf version: ${Protobuf_VERSION}")
   set(ONNX_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/onnx")
   protobuf_generate_cpp(ONNX_PROTO_SRCS ONNX_PROTO_HDRS "${ONNX_PROTO_DIR}/onnx.proto")
@@ -1733,8 +1740,11 @@ if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX")
   target_include_directories(katago SYSTEM PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${Protobuf_INCLUDE_DIRS})
   # Link the imported target rather than ${Protobuf_LIBRARIES}: when protobuf comes from a CMake
   # package config (e.g. vcpkg), the variable can resolve to the DLL itself rather than the import
-  # lib, and it also omits protobuf's own dependencies such as abseil.
-  target_link_libraries(katago protobuf::libprotobuf)
+  # lib, and it also omits protobuf's own dependencies such as abseil -- hence the explicit
+  # absl target beside it. absl::log_internal_check_op carries its own transitive absl deps,
+  # so this one target resolves the check/log machinery the generated code reaches for; add
+  # further absl::... targets here if more undefined-absl-symbol errors surface.
+  target_link_libraries(katago protobuf::libprotobuf absl::log_internal_check_op)
 endif()
 
 if(USE_BIGGER_BOARDS_EXPENSIVE)
