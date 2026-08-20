@@ -962,6 +962,7 @@ add_executable(katago
   game/board.cpp
   game/rules.cpp
   game/boardhistory.cpp
+  game/superkocandidates.cpp
   game/graphhash.cpp
   dataio/sgf.cpp
   dataio/numpywrite.cpp
