@@ -2,6 +2,7 @@
 
 #include "../core/test.h"
 #include "../game/lt9_census.h" //TEMPORARY -- LT-9 census scaffolding, inert unless KATAGO_LT9_CENSUS
+#include "../game/lt9_soundkey.h" //TEMPORARY -- LT-9 sound-key scaffolding, inert unless KATAGO_LT9_CENSUS
 
 using namespace std;
 
@@ -891,6 +892,19 @@ static void iterLadders(const Board& board, int nnXLen, const std::function<void
             for(Loc l : lt9_chainBuf) lt9_keyLocs.push_back((int)l);
             for(Loc l : lt9_libBuf) lt9_keyLocs.push_back((int)l);
             uint64_t lt9_key = lt9census::hashLocSet(lt9_keyLocs);
+
+            //TEMPORARY -- LT-9 SOUND-KEY bracket. beginDispatch arms the read-set recording that
+            //board.cpp's lt9MarkChain/lt9MarkMove sites feed; lookup() sits exactly where a real
+            //cache's lookup would, validating a stored read-set snapshot against the live board.
+            //The real search then runs REGARDLESS, so endDispatch can compare the cached answer
+            //against the recomputed one -- that comparison is the witness, and a measurement
+            //build that short-circuited on a hit would have none.
+            lt9soundkey::beginDispatch(
+              (int)loc, libs == 1 ? 1 : 2, (int)copy.ko_loc, lt9_key, board.pos_hash.hash0, lt9_keyLocs
+            );
+            bool lt9_cachedResult = false;
+            std::vector<int> lt9_cachedWorkingMoves;
+            (void)lt9soundkey::lookup(board.colors, lt9_cachedResult, lt9_cachedWorkingMoves);
 #endif
             //Perform search on copy so as not to mess up tracking of solved heads
             bool laddered;
@@ -901,7 +915,16 @@ static void iterLadders(const Board& board, int nnXLen, const std::function<void
               laddered = copy.searchIsLadderCapturedAttackerFirst2Libs(loc,buf,workingMoves);
             }
 #ifdef KATAGO_LT9_CENSUS
-            LT9_CENSUS_LADDER_DISPATCH(lt9_passIndex, lt9_key, LT9_CENSUS_TAKE_LADDER_EXPANSIONS());
+            {
+              uint64_t lt9_expansions = LT9_CENSUS_TAKE_LADDER_EXPANSIONS();
+              LT9_CENSUS_LADDER_DISPATCH(lt9_passIndex, lt9_key, lt9_expansions);
+              std::vector<int> lt9_realWorkingMoves;
+              if(libs != 1) {
+                lt9_realWorkingMoves.reserve(workingMoves.size());
+                for(Loc wm : workingMoves) lt9_realWorkingMoves.push_back((int)wm);
+              }
+              lt9soundkey::endDispatch(board.colors, laddered, lt9_realWorkingMoves, lt9_expansions);
+            }
 #endif
 
             chainHeadsSolved[numChainHeadsSolved] = head;

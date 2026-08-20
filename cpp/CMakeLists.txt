@@ -1020,6 +1020,7 @@ add_executable(katago
   game/superkocandidates.cpp
   game/graphhash.cpp
   game/lt9_census.cpp #TEMPORARY -- inert unless KATAGO_LT9_CENSUS is set; see the option() above
+  game/lt9_soundkey.cpp #TEMPORARY -- ditto; the sound-ladder-cache-key measurement
   dataio/sgf.cpp
   dataio/numpywrite.cpp
   dataio/poswriter.cpp

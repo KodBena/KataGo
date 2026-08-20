@@ -15,6 +15,7 @@
 #include "../core/rand.h"
 #include "../core/test.h"
 #include "../game/lt9_census.h" //TEMPORARY -- LT-9 census scaffolding, inert unless KATAGO_LT9_CENSUS
+#include "../game/lt9_soundkey.h" //TEMPORARY -- LT-9 sound-key scaffolding, inert unless KATAGO_LT9_CENSUS
 
 using namespace std;
 
@@ -1579,9 +1580,90 @@ bool Board::hasLibertyGainingCaptures(Loc loc) const {
   return false;
 }
 
+#ifdef KATAGO_LT9_CENSUS
+//TEMPORARY -- LT-9 sound-ladder-cache-key instrumentation. See game/lt9_soundkey.h for the two
+//closure rules and the soundness argument. Both are no-ops unless a dispatch is being recorded.
+
+//RULE-B, one level: chain(p) and every point orthogonally adjacent to one of its stones.
+//Agreement of colors[] over that set pins the chain's extent (its boundary is in the set, so it
+//cannot extend differently) and its liberty set (its liberties are exactly the empty points of
+//the boundary) -- which is all chain_data is ever consulted for.
+void Board::lt9MarkChain(Loc p) const {
+  if(!LT9_SK_RECORDING())
+    return;
+  if(p < 0 || p >= MAX_ARR_SIZE || (colors[p] != C_BLACK && colors[p] != C_WHITE)) {
+    LT9_SK_MARK_POINT((int)p);
+    return;
+  }
+  //Pass 1: the chain itself and its boundary.
+  Loc cur = p;
+  do {
+    LT9_SK_MARK_POINT((int)cur);
+    for(int i = 0; i < 4; i++)
+      LT9_SK_MARK_POINT((int)(cur + adj_offsets[i]));
+    cur = next_in_chain[cur];
+  } while(cur != p);
+  //Pass 2: findLibertyGainingCaptures reads the liberty COUNT of every chain adjacent to this
+  //one, and walks the liberties of any that is in atari, so each adjacent chain needs its own
+  //RULE-B closure too.
+  cur = p;
+  do {
+    for(int i = 0; i < 4; i++) {
+      Loc adj = cur + adj_offsets[i];
+      if(colors[adj] != C_BLACK && colors[adj] != C_WHITE)
+        continue;
+      if(chain_head[adj] == chain_head[p])
+        continue;
+      Loc c2 = adj;
+      do {
+        LT9_SK_MARK_POINT((int)c2);
+        for(int k = 0; k < 4; k++)
+          LT9_SK_MARK_POINT((int)(c2 + adj_offsets[k]));
+        c2 = next_in_chain[c2];
+      } while(c2 != adj);
+    }
+    cur = next_in_chain[cur];
+  } while(cur != p);
+}
+
+//The composite for a point the search tests for legality, measures, or plays: the point itself,
+//its four neighbours (RULE-A), and RULE-B's one-level closure for each neighbouring chain --
+//which is what isIllegalSuicide, getBoundNumLibertiesAfterPlay, getNumLibertiesAfterPlay,
+//countHeuristicConnectionLibertiesX2, wouldBeKoCapture and playMoveAssumeLegal's merge/capture
+//handling all consult.
+void Board::lt9MarkMove(Loc m) const {
+  if(!LT9_SK_RECORDING())
+    return;
+  if(m < 0 || m >= MAX_ARR_SIZE)
+    return;
+  LT9_SK_MARK_POINT((int)m);
+  for(int i = 0; i < 4; i++) {
+    Loc adj = m + adj_offsets[i];
+    LT9_SK_MARK_POINT((int)adj);
+    if(adj < 0 || adj >= MAX_ARR_SIZE)
+      continue;
+    if(colors[adj] != C_BLACK && colors[adj] != C_WHITE)
+      continue;
+    Loc cur = adj;
+    do {
+      LT9_SK_MARK_POINT((int)cur);
+      for(int k = 0; k < 4; k++)
+        LT9_SK_MARK_POINT((int)(cur + adj_offsets[k]));
+      cur = next_in_chain[cur];
+    } while(cur != adj);
+  }
+}
+#endif
+
 bool Board::searchIsLadderCapturedAttackerFirst2Libs(Loc loc, vector<Loc>& buf, vector<Loc>& workingMoves) {
   if(loc < 0 || loc >= MAX_ARR_SIZE)
     return false;
+#ifdef KATAGO_LT9_CENSUS
+  //TEMPORARY -- LT-9 sound-key site: the three guards below and findLiberties all consult
+  //chain-level state at loc, and each of them can decide the answer on its own.
+  LT9_SK_MARK_POINT((int)loc);
+  lt9MarkChain(loc);
+#endif
   if(colors[loc] != C_BLACK && colors[loc] != C_WHITE)
     return false;
   if(chain_data[chain_head[loc]].num_liberties != 2)
@@ -1604,14 +1686,25 @@ bool Board::searchIsLadderCapturedAttackerFirst2Libs(Loc loc, vector<Loc>& buf, 
   //Attacker: A suicide move cannot reduce the defender's liberties
   //Defender: A suicide move cannot gain liberties
   bool isMultiStoneSuicideLegal = false;
+#ifdef KATAGO_LT9_CENSUS
+  //TEMPORARY -- LT-9 sound-key site: both liberties are tested for legality and played.
+  lt9MarkMove(move0);
+  lt9MarkMove(move1);
+#endif
   if(isLegal(move0,opp,isMultiStoneSuicideLegal)) {
     MoveRecord record = playMoveRecorded(move0,opp);
     move0Works = searchIsLadderCaptured(loc,true,buf);
+#ifdef KATAGO_LT9_CENSUS
+    lt9MarkMove(move0);
+#endif
     undo(record);
   }
   if(isLegal(move1,opp,isMultiStoneSuicideLegal)) {
     MoveRecord record = playMoveRecorded(move1,opp);
     move1Works = searchIsLadderCaptured(loc,true,buf);
+#ifdef KATAGO_LT9_CENSUS
+    lt9MarkMove(move1);
+#endif
     undo(record);
   }
 
@@ -1629,6 +1722,12 @@ bool Board::searchIsLadderCapturedAttackerFirst2Libs(Loc loc, vector<Loc>& buf, 
 bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf) {
   if(loc < 0 || loc >= MAX_ARR_SIZE)
     return false;
+#ifdef KATAGO_LT9_CENSUS
+  //TEMPORARY -- LT-9 sound-key site: the two guards below consult colors[loc] and chain-level
+  //state at loc, and either can decide the answer on its own.
+  LT9_SK_MARK_POINT((int)loc);
+  lt9MarkChain(loc);
+#endif
   if(colors[loc] != C_BLACK && colors[loc] != C_WHITE)
     return false;
 
@@ -1681,6 +1780,9 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
     if(searchNodeCount >= MAX_LADDER_SEARCH_NODE_BUDGET) {
       stackIdx -= 1;
       while(stackIdx >= 0) {
+#ifdef KATAGO_LT9_CENSUS
+        lt9MarkMove(records[stackIdx].loc); //TEMPORARY -- LT-9 sound-key site, as above
+#endif
         undo(records[stackIdx]);
         stackIdx -= 1;
       }
@@ -1692,6 +1794,12 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
 
     //We just entered this level?
     if(moveListCur[stackIdx] == -1) {
+#ifdef KATAGO_LT9_CENSUS
+      //TEMPORARY -- LT-9 sound-key site: the pursued chain is re-consulted at every level (its
+      //extent and liberty count both move as the search plays and undoes), and this level's base
+      //cases, findLibertyGainingCaptures, findLiberties and hasLibertyGainingCaptures all read it.
+      lt9MarkChain(loc);
+#endif
       int libs = chain_data[chain_head[loc]].num_liberties;
 
       //Base cases.
@@ -1715,6 +1823,12 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
       if(isDefender) {
         moveListLen = findLibertyGainingCaptures(loc,buf,start,start);
         moveListLen += findLiberties(loc,buf,start,start+moveListLen);
+#ifdef KATAGO_LT9_CENSUS
+        //TEMPORARY -- LT-9 sound-key site: every generated defender move is a point the search
+        //measures (getBoundNumLibertiesAfterPlay below) or plays further down this level.
+        for(int i = 0; i < moveListLen; i++)
+          lt9MarkMove(buf[start+i]);
+#endif
 
         int lowerBoundLibs;
         int upperBoundLibs;
@@ -1740,6 +1854,13 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
         //   checkConsistency();
         // }
         assert(moveListLen == 2);
+#ifdef KATAGO_LT9_CENSUS
+        //TEMPORARY -- LT-9 sound-key site: both attacker candidates are measured
+        //(getNumImmediateLiberties, wouldBeKoCapture, getNumLibertiesAfterPlay,
+        //countHeuristicConnectionLibertiesX2) and one of them is played.
+        lt9MarkMove(buf[start]);
+        lt9MarkMove(buf[start+1]);
+#endif
 
         int libs0 = getNumImmediateLiberties(buf[start]);
         int libs1 = getNumImmediateLiberties(buf[start+1]);
@@ -1792,8 +1913,14 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
       assert(moveListCur[stackIdx] >= 0);
       assert(moveListCur[stackIdx] < moveListLens[stackIdx]);
       //If we returned from deeper we need to undo the move we made
-      if(returnedFromDeeper)
+      if(returnedFromDeeper) {
+#ifdef KATAGO_LT9_CENSUS
+        //TEMPORARY -- LT-9 sound-key site: undo's rebuild path reads the undone stone's chain
+        //and its boundary.
+        lt9MarkMove(records[stackIdx].loc);
+#endif
         undo(records[stackIdx]);
+      }
 
       //Defender has a move that is not ladder captured?
       if(isDefender && !returnValue) {
@@ -1833,6 +1960,11 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
     //Illegal move - treat it the same as a failed move, but don't return up a level so that we
     //loop again and just try the next move.
     bool isMultiStoneSuicideLegal = false;
+#ifdef KATAGO_LT9_CENSUS
+    //TEMPORARY -- LT-9 sound-key site: this point is tested for legality (isIllegalSuicide reads
+    //the liberty counts of its neighbouring chains) and, if legal, played.
+    lt9MarkMove(move);
+#endif
     if(!isLegal(move,p,isMultiStoneSuicideLegal)) {
       returnValue = isDefender;
       returnedFromDeeper = false;

@@ -5,6 +5,7 @@
 #ifdef KATAGO_LT9_CENSUS
 
 #include "../game/lt9_census.h"
+#include "../game/lt9_soundkey.h"
 
 #include <algorithm>
 #include <atomic>
@@ -226,6 +227,15 @@ void dumpAndReset() {
   size_t topN = std::min<size_t>(20, byCount.size());
   for(size_t i = 0; i < topN; i++)
     std::fprintf(f, "key=%llu timesSeen=%llu\n", (unsigned long long)byCount[i].second, (unsigned long long)byCount[i].first);
+
+  //TEMPORARY -- the sound-key block rides in the SAME dump block as the census numbers above, so
+  //the chain-shape figures serve as a substrate check on the sound-key figures over one identical
+  //run (see the comment in this file's own dumpAndReset ledger entry).
+  {
+    std::string skBlock = lt9soundkey::renderDump();
+    std::fwrite(skBlock.data(), 1, skBlock.size(), f);
+  }
+  lt9soundkey::reset();
 
   std::fclose(f);
 
