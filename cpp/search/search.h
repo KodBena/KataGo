@@ -1,6 +1,7 @@
 #ifndef SEARCH_SEARCH_H_
 #define SEARCH_SEARCH_H_
 
+#include <atomic>
 #include <memory>
 #include <unordered_set>
 
@@ -41,6 +42,46 @@ struct SearchNodeTable;
 struct SearchNodeChildrenReference;
 struct ConstSearchNodeChildrenReference;
 
+//A small flat set used for graph-search cycle detection along a single traversal path
+//(playout descent, or a tree-walk in searchresults.cpp). These paths are only tens of
+//nodes deep, so a contiguous vector with linear scan avoids both the per-op hash divide
+//and the pointer-chasing bucket walk that std::unordered_set's prime-modulo bucketing
+//costs on every insert/erase - and it stays cache-resident for paths of this length.
+//Semantics mirror exactly what the callers use: insert-if-absent (reporting whether it
+//was newly inserted, same as std::unordered_set::insert().second), erase-by-value, and
+//clear(). No iteration or lookup-without-mutation is needed anywhere in this codebase.
+template<typename T>
+class GraphPathSet {
+public:
+  void reserve(size_t n) { elems.reserve(n); }
+  void clear() { elems.clear(); }
+
+  //Returns true if value was not already present (and was inserted), false if it was
+  //already present (matching std::unordered_set<T>::insert(value).second).
+  bool insert(T value) {
+    for(const T& e: elems) {
+      if(e == value)
+        return false;
+    }
+    elems.push_back(value);
+    return true;
+  }
+
+  //Removes value if present. No-op if absent (matching std::unordered_set::erase).
+  void erase(const T& value) {
+    for(size_t i = 0; i < elems.size(); i++) {
+      if(elems[i] == value) {
+        elems[i] = elems.back();
+        elems.pop_back();
+        return;
+      }
+    }
+  }
+
+private:
+  std::vector<T> elems;
+};
+
 //Per-thread state
 struct SearchThread {
   int threadIdx;
@@ -50,7 +91,7 @@ struct SearchThread {
   BoardHistory history;
   Hash128 graphHash;
   //The path we trace down the graph as we do a playout
-  std::unordered_set<SearchNode*> graphPath;
+  GraphPathSet<SearchNode*> graphPath;
 
   //Tracks whether this thread did something that "should" be counted as a playout
   //for the purpose of playout limits
@@ -174,6 +215,16 @@ struct Search {
   SearchNodeTable* nodeTable;
   MutexPool* mutexPool;
   SubtreeValueBiasTable* subtreeValueBiasTable;
+
+  //Root-only cache of pow(nnPolicyProb,1/(4*searchParams.wideRootNoise+1)) for the whole root policy
+  //array, keyed by the array pointer it was built from (see maybeApplyWideRootNoise). Rebuilt at most
+  //once per search generation, by the single thread that wins the nodeAge race in
+  //maybeRecomputeExistingNNOutput; the key is compared with acquire/release ordering so a reader either
+  //sees a fully-populated table or (rare: before the winner publishes it, or right after beginSearch
+  //resets the key) falls back to computing pow directly - both give the identical byte-for-byte result,
+  //so correctness never depends on which happens, only performance does.
+  std::vector<float> wideRootNoiseAdjPolicyProbs;
+  std::atomic<const float*> wideRootNoiseAdjPolicyProbsSrc;
 
   //Thread pool
   int numThreadsSpawned;
@@ -574,6 +625,14 @@ private:
   double getExploreScalingHuman(
     double totalChildWeight
   ) const;
+  void maybeApplyWideRootNoise(
+    double& childUtility,
+    float& nnPolicyProb,
+    int movePos,
+    const float* policyProbs,
+    SearchThread* thread,
+    const SearchNode& parent
+  ) const;
   double getExploreSelectionValue(
     double exploreScaling,
     double nnPolicyProb,
@@ -601,6 +660,8 @@ private:
   double getNewExploreSelectionValue(
     const SearchNode& parent,
     double exploreScaling,
+    int movePos,
+    const float* policyProbs,
     float nnPolicyProb,
     double fpuValue,
     double parentWeightPerVisit,
@@ -743,7 +804,7 @@ private:
 
   bool getSharpScoreHelper(
     const SearchNode* node,
-    std::unordered_set<const SearchNode*>& graphPath,
+    GraphPathSet<const SearchNode*>& graphPath,
     double policyProbsBuf[NNPos::MAX_NN_POLICY_SIZE],
     double minProp,
     double desiredProp,
@@ -751,7 +812,7 @@ private:
   ) const;
   void getShallowAverageShorttermWLAndScoreErrorHelper(
     const SearchNode* node,
-    std::unordered_set<const SearchNode*>& graphPath,
+    GraphPathSet<const SearchNode*>& graphPath,
     double policyProbsBuf[NNPos::MAX_NN_POLICY_SIZE],
     double minProp,
     double desiredProp,
@@ -765,7 +826,7 @@ private:
     double pruneProp,
     double desiredProp,
     const SearchNode* node,
-    std::unordered_set<const SearchNode*>& graphPath,
+    GraphPathSet<const SearchNode*>& graphPath,
     Func& averaging
   ) const;
   template<typename Func>
@@ -777,7 +838,7 @@ private:
     ConstSearchNodeChildrenReference children,
     double* childWeightBuf,
     int childrenCapacity,
-    std::unordered_set<const SearchNode*>& graphPath,
+    GraphPathSet<const SearchNode*>& graphPath,
     Func& averaging
   ) const;
 

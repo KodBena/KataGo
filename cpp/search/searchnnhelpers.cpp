@@ -225,6 +225,32 @@ bool Search::maybeRecomputeExistingNNOutput(
           recomputeHappened = true;
         }
       }
+
+      //We are the single elected thread for this searchNodeAge (guaranteed by the nodeAge exchange
+      //above), so this is the one safe place to (re)build the wideRootNoise pow(...) cache (search.h)
+      //for whichever NNOutput just became current for the root - the exact same policy array
+      //maybeApplyWideRootNoise's callers index with getPos(moveLoc). Building it here regardless of
+      //whether a recompute actually happened above keeps this simple; it's ~362 pow() calls, done at
+      //most once per search, not on the per-descend hot path it replaces.
+      if(searchParams.wideRootNoise > 0.0) {
+        NNOutput* curNNOutput = node.getNNOutput();
+        if(curNNOutput != NULL) {
+          const float* rawPolicyProbs = curNNOutput->getPolicyProbsMaybeNoised();
+          double exponent = 1.0 / (4.0*searchParams.wideRootNoise + 1.0);
+          std::vector<float> table(NNPos::MAX_NN_POLICY_SIZE);
+          for(int i = 0; i<NNPos::MAX_NN_POLICY_SIZE; i++) {
+            float p = rawPolicyProbs[i];
+            //Illegal/off-board entries are never looked up (callers only index legal movePos values,
+            //same as the un-hoisted code only ever called pow on nnPolicyProb >= 0), so their table
+            //entries are left unspecified rather than fed through pow's negative-base domain error.
+            table[i] = p < 0 ? p : (float)pow((double)p, exponent);
+          }
+          wideRootNoiseAdjPolicyProbs = std::move(table);
+          //Release-store the key only after the vector above is fully written, so any reader that
+          //observes this pointer via an acquire load is guaranteed to see the completed table too.
+          wideRootNoiseAdjPolicyProbsSrc.store(rawPolicyProbs, std::memory_order_release);
+        }
+      }
     }
   }
   return recomputeHappened;

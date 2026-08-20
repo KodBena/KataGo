@@ -1404,7 +1404,7 @@ std::pair<double,double> Search::getShallowAverageShorttermWLAndScoreError(const
     return std::make_pair(0.0,0.0);
   if(!nnEvaluator->supportsShorttermError())
     return std::make_pair(-1.0,-1.0);
-  std::unordered_set<const SearchNode*> graphPath;
+  GraphPathSet<const SearchNode*> graphPath;
   double policyProbsBuf[NNPos::MAX_NN_POLICY_SIZE];
   double wlError = 0.0;
   double scoreError = 0.0;
@@ -1427,7 +1427,7 @@ std::pair<double,double> Search::getShallowAverageShorttermWLAndScoreError(const
 
 void Search::getShallowAverageShorttermWLAndScoreErrorHelper(
   const SearchNode* node,
-  std::unordered_set<const SearchNode*>& graphPath,
+  GraphPathSet<const SearchNode*>& graphPath,
   double policyProbsBuf[NNPos::MAX_NN_POLICY_SIZE],
   double minProp,
   double desiredProp,
@@ -1449,9 +1449,9 @@ void Search::getShallowAverageShorttermWLAndScoreErrorHelper(
     return;
   }
 
-  std::pair<std::unordered_set<const SearchNode*>::iterator,bool> result = graphPath.insert(node);
+  bool wasInserted = graphPath.insert(node);
   // No insertion, node was already there, this means we hit a cycle in the graph
-  if(!result.second) {
+  if(!wasInserted) {
     //Just treat it as base case and immediately terminate.
     wlError += desiredProp * nnOutput->shorttermWinlossError;
     scoreError += desiredProp * nnOutput->shorttermScoreError;
@@ -1551,7 +1551,7 @@ bool Search::getSharpScore(const SearchNode* node, double& ret) const {
   // Store initial value so we can start accumulating
   ret = 0.0;
 
-  std::unordered_set<const SearchNode*> graphPath;
+  GraphPathSet<const SearchNode*> graphPath;
 
   double policyProbsBuf[NNPos::MAX_NN_POLICY_SIZE];
   if(node != rootNode) {
@@ -1630,7 +1630,7 @@ bool Search::getSharpScore(const SearchNode* node, double& ret) const {
 
 bool Search::getSharpScoreHelper(
   const SearchNode* node,
-  std::unordered_set<const SearchNode*>& graphPath,
+  GraphPathSet<const SearchNode*>& graphPath,
   double policyProbsBuf[NNPos::MAX_NN_POLICY_SIZE],
   double minProp,
   double desiredProp,
@@ -1656,9 +1656,9 @@ bool Search::getSharpScoreHelper(
     return true;
   }
 
-  std::pair<std::unordered_set<const SearchNode*>::iterator,bool> result = graphPath.insert(node);
+  bool wasInserted = graphPath.insert(node);
   // No insertion, node was already there, this means we hit a cycle in the graph
-  if(!result.second) {
+  if(!wasInserted) {
     // Just treat it as base case and immediately terminate.
     double scoreMean = (double)nnOutput->whiteScoreMean;
     // cout << "Accumulating " << scoreMean << " " << desiredProp << endl;
@@ -1764,7 +1764,7 @@ vector<double> Search::getAverageTreeOwnership(const SearchNode* node) const {
   double minProp = 0.5 / pow(std::max(1.0,(double)visits),0.75);
   //Entirely drop a node with weight less than this
   double pruneProp = minProp * 0.01;
-  std::unordered_set<const SearchNode*> graphPath;
+  GraphPathSet<const SearchNode*> graphPath;
   traverseTreeForOwnership(minProp,pruneProp,1.0,node,graphPath,accumulate);
   return vec;
 }
@@ -1788,7 +1788,7 @@ std::pair<vector<double>,vector<double>> Search::getAverageAndStandardDeviationT
   double minProp = 0.5 / pow(std::max(1.0,(double)visits),0.75);
   // Entirely drop a node with weight less than this
   double pruneProp = minProp * 0.01;
-  std::unordered_set<const SearchNode*> graphPath;
+  GraphPathSet<const SearchNode*> graphPath;
   traverseTreeForOwnership(minProp,pruneProp,1.0,node,graphPath,accumulate);
   for(int pos = 0; pos<nnArea; pos++) {
     const double avg = average[pos];
@@ -1804,7 +1804,7 @@ bool Search::traverseTreeForOwnership(
   double pruneProp,
   double desiredProp,
   const SearchNode* node,
-  std::unordered_set<const SearchNode*>& graphPath,
+  GraphPathSet<const SearchNode*>& graphPath,
   Func& accumulate
 ) const {
   if(node == NULL)
@@ -1832,9 +1832,9 @@ bool Search::traverseTreeForOwnership(
     return true;
   }
 
-  std::pair<std::unordered_set<const SearchNode*>::iterator,bool> result = graphPath.insert(node);
+  bool wasInserted = graphPath.insert(node);
   // No insertion, node was already there, this means we hit a cycle in the graph
-  if(!result.second) {
+  if(!wasInserted) {
     //Just treat it as base case and immediately terminate.
     float* ownerMap = nnOutput->whiteOwnerMap;
     assert(ownerMap != NULL);
@@ -1876,7 +1876,7 @@ double Search::traverseTreeForOwnershipChildren(
   ConstSearchNodeChildrenReference children,
   double* childWeightBuf,
   int childrenCapacity,
-  std::unordered_set<const SearchNode*>& graphPath,
+  GraphPathSet<const SearchNode*>& graphPath,
   Func& accumulate
 ) const {
   int numChildren = 0;

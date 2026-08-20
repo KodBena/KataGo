@@ -103,6 +103,8 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    nodeTable(NULL),
    mutexPool(NULL),
    subtreeValueBiasTable(NULL),
+   wideRootNoiseAdjPolicyProbs(),
+   wideRootNoiseAdjPolicyProbsSrc(nullptr),
    numThreadsSpawned(0),
    threads(NULL),
    threadTasks(NULL),
@@ -708,6 +710,13 @@ void Search::beginSearch(bool pondering) {
 
   clearOldNNOutputs();
   computeRootValues();
+
+  //Invalidate the wide-root-noise pow(...) cache (search.h) unconditionally: this runs single-threaded
+  //before any search thread is spawned, and it closes the one address-reuse hazard the cache has - a
+  //freed NNOutput from a prior search's clearOldNNOutputs() landing at the same address as this
+  //search's fresh root NNOutput, which would otherwise look like a same-array cache hit with stale
+  //values. maybeRecomputeExistingNNOutput repopulates it for the new state during the search proper.
+  wideRootNoiseAdjPolicyProbsSrc.store(nullptr, std::memory_order_relaxed);
 
   //Prepare value bias table if we need it
   if(searchParams.subtreeValueBiasFactor != 0 && subtreeValueBiasTable == NULL && !(searchParams.antiMirror && mirroringPla != C_EMPTY))
@@ -1439,9 +1448,9 @@ bool Search::playoutDescend(
   //reasonable in the end of the search.
   //Note that this means that child visits >= edge visits is NOT an invariant.
   {
-    std::pair<std::unordered_set<SearchNode*>::iterator,bool> result = thread.graphPath.insert(child);
+    bool wasInserted = thread.graphPath.insert(child);
     //No insertion, child was already there
-    if(!result.second) {
+    if(!wasInserted) {
       if(countEdgeVisit) {
         SearchNodeChildrenReference children = node.getChildren(nodeState);
         children[bestChildIdx].addEdgeVisits(1);
