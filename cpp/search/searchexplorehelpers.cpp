@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "../core/fancymath.h"
 #include "../search/searchnode.h"
@@ -651,6 +652,13 @@ void Search::selectBestChildToDescend(
     //    excluded outright, which reaches the same outcome: never selected, never recorded.
     //The prob finally reported is re-read from policyProbs rather than carried through the key, so the
     //exact bits the conditional loop would have reported are the bits that leave this function.
+    //The order-preserving reading of a float's bits as an integer is a fact about IEEE-754 binary32
+    //and two's-complement integers, not about C++ in general, so say so where a port would trip over
+    //it rather than leaving it to be discovered as a wrong move choice.
+    static_assert(
+      std::numeric_limits<float>::is_iec559 && sizeof(float) == sizeof(int32_t),
+      "The policy sort key reads a float's bits as an integer, which orders correctly only for IEEE-754 binary32"
+    );
     int32_t policyKeyBuf[NNPos::MAX_NN_POLICY_SIZE];
     int32_t bestPolicyKey = NOT_A_NEW_CHILD_CANDIDATE;
     for(int movePos = 0; movePos<policySize; movePos++) {
