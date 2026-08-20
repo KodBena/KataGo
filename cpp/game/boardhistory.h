@@ -84,7 +84,10 @@ private:
   //fold of exactly that set of locations. The array and the hash are one fact with one owner: every
   //write goes through setSuperKoBanned or clearSuperKoBanned, which update both together, so the
   //hash is always current and never has to be recomputed by sweeping the board. They are private
-  //for that reason - a direct writer could desynchronize them.
+  //for that reason - a direct writer could desynchronize them. (Note on the balance of the two: the
+  //non-encore per-move sweep clears both and then sets the bans it finds, rather than toggling each
+  //point in place as it used to. The hash is a plain xor-fold over the banned set, so clearing and
+  //re-folding gives the same value; what changed is only which of the two writers does the work.)
   bool superKoBanned[Board::MAX_ARR_SIZE];
   Hash128 superKoBannedHash;
   //The points the per-move sweep that recomputes superKoBanned still has to examine. Private for the

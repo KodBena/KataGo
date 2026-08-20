@@ -41,8 +41,17 @@ using namespace TestCommon;
 //       here. Two flavors are constructed: scrambling stones onto and off the board with
 //       Board::setStonesTolerant, and substituting an entirely different (earlier) Board, in both
 //       cases then making a move through the history and checking W3 on the result. This is the case
-//       the pre-change code could not fail and the post-change code can, so it is the case this
-//       extension exists for.
+//       the pre-change code could not fail and the post-change code can. It is insurance against a
+//       future rewrite toward the incrementally-maintained design, not against the shipped one: no
+//       defect has been found that W4 catches and W3 does not, because the shipped implementation
+//       carries nothing that ordinary play would not already expose. Stated plainly here, because
+//       "there is a test for that" is exactly the claim that stops such a rewrite being scrutinized.
+//
+//  W6 - W3 still holds after a warm history is cleared onto a board of a DIFFERENT SIZE. Both pieces
+//       of carried state are size-dependent: the snapshot is indexed by a board-array index whose
+//       meaning depends on the row stride, and the adjacency shifts are BY the stride. The shipped
+//       design carries no stride and re-compares the snapshot in full, so it needs nothing special
+//       here - but that is a derivation, and this is what observes it.
 //
 //W1, W2 and W3 are checked at every position of a randomized corpus that is deliberately weighted
 //toward the states in which the checked things could differ: small boards so positions repeat,
@@ -72,6 +81,7 @@ namespace {
     int64_t numWithNeverOccupiedCandidateBanned = 0;
     int64_t numOutOfBandScrambleChecks = 0;
     int64_t numOutOfBandSubstitutedBoardChecks = 0;
+    int64_t numResizedOntoDifferentBoardChecks = 0;
   };
 
   //The fold over the whole array, recomputed from scratch. This is what the maintained hash claims
@@ -200,10 +210,14 @@ namespace {
     return hash;
   }
 
-  void checkPosition(
+  //Returns whether the W3 full-sweep comparison actually ran at this position. Callers that count
+  //constructed cases use that, so their counts measure comparisons performed rather than cases
+  //attempted - a count of attempts would clear its floor while the thing it stands for never ran.
+  bool checkPosition(
     const Board& board, const BoardHistory& hist, Player nextPlayer, double drawEquivalentWinsForWhite,
     SuperKoHashCorpusStats& stats
   ) {
+    bool fullSweepComparisonRan = false;
     //W1: the maintained hash is the fold over the array it claims to summarize. Observed on the
     //history object, which is where a missed write site would show up.
     testAssert(hist.getSuperKoBannedHash() == recomputeSuperKoBannedHash(hist));
@@ -225,6 +239,7 @@ namespace {
         for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
           testAssert(hist.isSuperKoBanned((Loc)i) == expected[i]);
         stats.numFullSweepComparisons += 1;
+        fullSweepComparisonRan = true;
 
         //Coverage of the one point class for which "empty and a stone was once here" - the obvious
         //and WRONG candidate predicate - is too narrow: a point that never held a stone, where
@@ -272,6 +287,7 @@ namespace {
       stats.numInEncore2 += 1;
     if(hist.koRecapBlockHash != Hash128())
       stats.numWithKoRecapBlock += 1;
+    return fullSweepComparisonRan;
   }
 
   //Play out one randomized game, checking both witnesses before the first move and after every move.
@@ -419,11 +435,49 @@ namespace {
           }
         }
         oobHist.makeBoardMoveAssumeLegal(oobBoard,oobLoc,pla,NULL,true);
-        checkPosition(oobBoard,oobHist,getOpp(pla),drawEquivalentWinsForWhite,stats);
-        if(substituteAnEarlierBoard)
-          stats.numOutOfBandSubstitutedBoardChecks += 1;
-        else
-          stats.numOutOfBandScrambleChecks += 1;
+        //Counted only if the resulting position was one where W3 actually compared against the full
+        //sweep. Roughly half of this corpus is in an encore, where the marks come from a different
+        //rule and W3 does not apply, so counting the construction rather than the comparison would
+        //put a floor on cases that never checked anything.
+        if(checkPosition(oobBoard,oobHist,getOpp(pla),drawEquivalentWinsForWhite,stats)) {
+          if(substituteAnEarlierBoard)
+            stats.numOutOfBandSubstitutedBoardChecks += 1;
+          else
+            stats.numOutOfBandScrambleChecks += 1;
+        }
+      }
+
+      //W6: clear a warm history onto a board of a DIFFERENT SIZE and play on. Both pieces of state
+      //the candidate set carries across moves are size-dependent in different ways - the snapshot is
+      //indexed by a board-array index whose meaning depends on the stride, and the adjacency is
+      //computed from the stride itself - so a resize is the case where carrying either one would
+      //show. Nothing in the shipped design carries the stride and the snapshot is re-compared in
+      //full, but that is a derivation, and this is the corpus position that observes it.
+      if(rand.nextBool(0.03)) {
+        int resizedIdx = rand.nextInt(0,9);
+        int resizedX = SIZES[resizedIdx][0];
+        int resizedY = SIZES[resizedIdx][1];
+        if(resizedX != xSize || resizedY != ySize) {
+          //Deliberately NOT a fresh history: this one has already swept many positions on the old
+          //size, so its snapshot and bitsets are warm and describe a board that no longer exists.
+          BoardHistory resizedHist = hist;
+          Board resizedBoard(resizedX,resizedY);
+          Player resizedPla = rand.nextBool(0.5) ? P_BLACK : P_WHITE;
+          resizedHist.clear(resizedBoard,resizedPla,rules,initialEncorePhase);
+          for(int step = 0; step<12; step++) {
+            if(resizedHist.isGameFinished)
+              break;
+            Loc resizedLoc = PlayUtils::chooseRandomLegalMove(resizedBoard,resizedHist,resizedPla,rand,Board::NULL_LOC);
+            if(resizedLoc == Board::NULL_LOC)
+              resizedLoc = Board::PASS_LOC;
+            if(!resizedHist.isLegal(resizedBoard,resizedLoc,resizedPla))
+              continue;
+            resizedHist.makeBoardMoveAssumeLegal(resizedBoard,resizedLoc,resizedPla,NULL,true);
+            resizedPla = getOpp(resizedPla);
+            if(checkPosition(resizedBoard,resizedHist,resizedPla,drawEquivalentWinsForWhite,stats))
+              stats.numResizedOntoDifferentBoardChecks += 1;
+          }
+        }
       }
 
       //The non-encore branch corrects for the case where the simple ko loc is itself superko-banned.
@@ -478,9 +532,10 @@ void Tests::runSuperKoBannedHashTests() {
   report("  constructed ko-loc-is-banned pairs", stats.numKoLocBannedPairsChecked, 360);
   report("  compared against a full sweep    ", stats.numFullSweepComparisons, 83000);
   report("  with a never-occupied suicide pt ", stats.numWithNeverOccupiedSuicidePoint, 15000);
-  report("  never-occupied point actually banned", stats.numWithNeverOccupiedCandidateBanned, 22);
-  report("  out-of-band board scrambles      ", stats.numOutOfBandScrambleChecks, 2300);
-  report("  out-of-band substituted boards   ", stats.numOutOfBandSubstitutedBoardChecks, 2350);
+  report("  never-occupied point actually banned", stats.numWithNeverOccupiedCandidateBanned, 35);
+  report("  out-of-band board scrambles      ", stats.numOutOfBandScrambleChecks, 950);
+  report("  out-of-band substituted boards   ", stats.numOutOfBandSubstitutedBoardChecks, 880);
+  report("  resized onto a different board   ", stats.numResizedOntoDifferentBoardChecks, 16000);
   //Not floored, and printed without one on purpose: this count is 0 by construction, because a
   //history's own recompute always clears the ban at its own board's ko loc. The constructed
   //ko-loc-is-banned pairs counted above are what cover that branch instead.
