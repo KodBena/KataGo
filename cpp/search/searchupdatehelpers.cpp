@@ -1,5 +1,7 @@
 #include "../search/search.h"
 
+#include <cstring>
+
 #include "../core/fancymath.h"
 #include "../search/searchnode.h"
 #include "../search/distributiontable.h"
@@ -8,6 +10,18 @@
 #include "../core/using.h"
 //------------------------
 
+//Branchless equivalent of (pla == P_WHITE ? x : -x), by XORing the IEEE-754 sign bit.
+//Bit-exact: XORing the sign bit of a double is exactly IEEE negation for every value,
+//including zero, infinities, and NaNs, so this is byte-identical to the ternary it replaces.
+static inline double flipSignIfNotWhite(double x, Player pla) {
+  uint64_t bits;
+  std::memcpy(&bits, &x, sizeof(bits));
+  uint64_t signMask = (uint64_t)(pla != P_WHITE) << 63;
+  bits ^= signMask;
+  double result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
 
 void Search::addLeafValue(
   SearchNode& node,
@@ -191,7 +205,7 @@ void Search::recomputeNodeStats(SearchNode& node, SearchThread& thread, int numV
       continue;
 
     double childUtility = stats.stats.utilityAvg;
-    stats.selfUtility = node.nextPla == P_WHITE ? childUtility : -childUtility;
+    stats.selfUtility = flipSignIfNotWhite(childUtility, node.nextPla);
     stats.weightAdjusted = stats.stats.getChildWeight(edgeVisits);
     stats.prevMoveLoc = moveLoc;
 
