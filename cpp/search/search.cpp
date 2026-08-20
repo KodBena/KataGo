@@ -1439,9 +1439,9 @@ bool Search::playoutDescend(
   //reasonable in the end of the search.
   //Note that this means that child visits >= edge visits is NOT an invariant.
   {
-    std::pair<std::unordered_set<SearchNode*>::iterator,bool> result = thread.graphPath.insert(child);
+    bool wasInserted = thread.graphPath.insert(child);
     //No insertion, child was already there
-    if(!result.second) {
+    if(!wasInserted) {
       if(countEdgeVisit) {
         SearchNodeChildrenReference children = node.getChildren(nodeState);
         children[bestChildIdx].addEdgeVisits(1);
