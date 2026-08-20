@@ -1,0 +1,155 @@
+#include "../command/analysismodels.h"
+
+#include "../core/global.h"
+#include "../core/test.h"
+
+using namespace std;
+
+//-------------------------------------------------------------------------------------
+// ModelResolution
+//-------------------------------------------------------------------------------------
+
+ModelResolution::ModelResolution(std::optional<SearchableModelIdx> idx_, std::optional<std::string> refusalMessage_)
+  : idx(idx_), refusalMessage(std::move(refusalMessage_))
+{}
+
+ModelResolution ModelResolution::resolved(SearchableModelIdx searchableIdx_) {
+  return ModelResolution(searchableIdx_, std::nullopt);
+}
+
+ModelResolution ModelResolution::companionRefusal(const string& requestedName) {
+  return ModelResolution(
+    std::nullopt,
+    "Model \"" + requestedName + "\" is the human SL companion model. It participates in searches of the "
+    "searchable models as configured, but it cannot itself be the model of an analysis request."
+  );
+}
+
+ModelResolution ModelResolution::unknownRefusal(const string& requestedName, const vector<ModelAddress>& addresses) {
+  string loaded;
+  for(const ModelAddress& address: addresses) {
+    if(address.role != ModelRole::Searchable)
+      continue;
+    if(loaded.size() > 0)
+      loaded += ", ";
+    loaded += "\"" + address.internalName + "\"";
+  }
+  return ModelResolution(
+    std::nullopt,
+    "Unknown model \"" + requestedName + "\". Selectable models are: " + loaded +
+    ". Names are the \"internalName\" values that the query_models action reports."
+  );
+}
+
+std::optional<SearchableModelIdx> ModelResolution::searchableIdx() const {
+  return idx;
+}
+
+std::optional<string> ModelResolution::refusal() const {
+  return refusalMessage;
+}
+
+//-------------------------------------------------------------------------------------
+// The two rules, over the name space alone
+//-------------------------------------------------------------------------------------
+
+std::optional<string> findInternalNameCollision(const vector<ModelAddress>& addresses) {
+  for(size_t i = 0; i < addresses.size(); i++) {
+    for(size_t j = i + 1; j < addresses.size(); j++) {
+      if(addresses[i].internalName != addresses[j].internalName)
+        continue;
+      return
+        "Two hosted models share the internal model name \"" + addresses[i].internalName + "\": " +
+        addresses[i].sourceLabel + " and " + addresses[j].sourceLabel +
+        ". Analysis requests select a model by that name, so two models under one name have no "
+        "unambiguous answer and the engine refuses to start rather than serve one of them under the "
+        "other's name. Load distinct models, or drop the duplicate.";
+    }
+  }
+  return std::nullopt;
+}
+
+vector<ModelAddress> addressesOf(const vector<HostedModel>& models) {
+  vector<ModelAddress> addresses;
+  for(const HostedModel& model: models)
+    addresses.push_back(model.address);
+  return addresses;
+}
+
+ModelResolution resolveModelName(const vector<ModelAddress>& addresses, const string& requestedName) {
+  //Searchable-first, or a searchable model's index is not its position and resolution hands
+  //back the wrong model. See the header.
+  bool seenCompanion = false;
+  for(const ModelAddress& address: addresses) {
+    if(address.role == ModelRole::HumanCompanion)
+      seenCompanion = true;
+    else
+      testAssert(!seenCompanion);
+  }
+
+  for(size_t i = 0; i < addresses.size(); i++) {
+    if(addresses[i].internalName != requestedName)
+      continue;
+    if(addresses[i].role == ModelRole::HumanCompanion)
+      return ModelResolution::companionRefusal(requestedName);
+    return ModelResolution::resolved(SearchableModelIdx(i));
+  }
+  return ModelResolution::unknownRefusal(requestedName, addresses);
+}
+
+//-------------------------------------------------------------------------------------
+// AnalysisModelHosts
+//-------------------------------------------------------------------------------------
+
+AnalysisModelHosts::AnalysisModelHosts(vector<ModelAddress> addrs_, vector<NNEvaluator*> evals_, size_t numSearchableModels_)
+  : addrs(std::move(addrs_)), evals(std::move(evals_)), numSearchableModels(numSearchableModels_)
+{}
+
+AnalysisModelHosts AnalysisModelHosts::create(vector<HostedModel> searchable, std::optional<HostedModel> companion) {
+  if(searchable.size() <= 0)
+    throw StringError("AnalysisModelHosts::create - the analysis engine must host at least one searchable model");
+
+  vector<HostedModel> models = std::move(searchable);
+  for(const HostedModel& model: models) {
+    testAssert(model.address.role == ModelRole::Searchable);
+    testAssert(model.eval != NULL);
+  }
+  if(companion.has_value()) {
+    testAssert(companion.value().address.role == ModelRole::HumanCompanion);
+    testAssert(companion.value().eval != NULL);
+    models.push_back(companion.value());
+  }
+
+  const size_t numSearchableModels = models.size() - (companion.has_value() ? 1 : 0);
+  vector<ModelAddress> addrs = addressesOf(models);
+  vector<NNEvaluator*> evals;
+  for(const HostedModel& model: models)
+    evals.push_back(model.eval);
+
+  std::optional<string> collision = findInternalNameCollision(addrs);
+  if(collision.has_value())
+    throw StringError(collision.value());
+
+  return AnalysisModelHosts(std::move(addrs), std::move(evals), numSearchableModels);
+}
+
+size_t AnalysisModelHosts::numSearchable() const {
+  return numSearchableModels;
+}
+
+NNEvaluator* AnalysisModelHosts::searchableEval(SearchableModelIdx idx) const {
+  //One of the two places a SearchableModelIdx is unwrapped: this is the storage it indexes.
+  testAssert(idx.value() < numSearchableModels);
+  return evals[idx.value()];
+}
+
+vector<SearchableModelIdx> AnalysisModelHosts::searchableIdxs() const {
+  vector<SearchableModelIdx> idxs;
+  for(size_t i = 0; i < numSearchableModels; i++)
+    idxs.push_back(SearchableModelIdx(i));
+  return idxs;
+}
+
+ModelResolution AnalysisModelHosts::resolve(const string& requestedName) const {
+  return resolveModelName(addrs, requestedName);
+}

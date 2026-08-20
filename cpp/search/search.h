@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <unordered_set>
 
 #include "../core/global.h"
@@ -92,6 +93,11 @@ struct Search {
   //across different params (the eval cache persists across param changes and, in the analysis engine, is
   //shared across threads that may be running with different params). Recomputed at the start of each search.
   Hash128 evalCacheParamsHash;
+  //Hash of the identity of the neural nets this search evaluates with, folded into the eval cache key so that
+  //cached search results are not shared across different models. The eval cache outlives a Search::setNNEval
+  //swap and, in the analysis engine, is shared by every bot, so without this term a result computed by one
+  //model could be served to a search running a different one. Recomputed at the start of each search.
+  Hash128 evalCacheModelHash;
   Loc rootHintLoc;
 
   //External user-specified moves that are illegal or that should be nontrivially searched, and the number of turns for which they should
@@ -118,6 +124,18 @@ struct Search {
   double mirrorCenterSymmetryError;
 
   bool alwaysIncludeOwnerMap;
+
+  //Which of nnEvaluator's attached cache contexts this search's evaluations are earned by.
+  //Carried rather than derived: only the request knows which context it is studying, and only
+  //the boundary that read the request could refuse an unknown one. Defaults to
+  //NoAttributableContext, which is what every caller that never sets it leaves it as, and is
+  //exactly the behaviour before this field existed.
+  //
+  //It is deliberately NOT part of SearchParams. SearchParams is hashed into the eval-cache key
+  //(SearchParams::getHash), and a cache context is a bookkeeping tag that changes nothing a
+  //search computes -- folding it in would split the eval cache along a term with no effect on
+  //any result, which is a cache miss bought for nothing.
+  NNCacheAttribution cacheAttribution;
 
   SearchParams searchParams;
   int64_t numSearchesBegun;
@@ -259,6 +277,13 @@ struct Search {
   void setRootSymmetryPruningOnly(const std::vector<int>& rootPruneOnlySymmetries);
   void setParams(const SearchParams& params);
   void setParamsNoClearing(const SearchParams& params); //Does not clear search
+  //Which attached cache context this search's evaluations are earned by. The attribution must
+  //have been resolved against THIS search's nnEvaluator; spending one resolved against another
+  //model's cache is refused at the set path rather than filing the entry under whichever
+  //context sits at the same position there.
+  //Does not clear the search: attribution is bookkeeping about what a search earns and changes
+  //nothing about what it computes, so there is nothing computed under the old value to discard.
+  void setCacheAttribution(const NNCacheAttribution& attribution);
   //Resolve a false/auto/true alwaysComputePassAliveUnderSuicideRules setting against what a neural net
   //declares that it expects. Auto resolves to the net's declaration (false if nnEval is NULL).
   static bool resolveAlwaysComputePassAliveUnderSuicideRules(const SearchParams& params, const NNEvaluator* nnEval);
@@ -274,6 +299,22 @@ struct Search {
   //The one writer of nnPosGeometry. Every setter that changes the root board or the evaluator
   //calls this, so the cached mapping is never derived from a geometry that has moved on.
   void updateNNPosGeometry();
+
+  //The single home of the eval cache's addressing contract. An eval cache table can outlive a params change
+  //and a model swap, and in the analysis engine one table is shared by every bot, so a cached search result is
+  //addressed by all three things it depends on: the position, the params that produced it, and the models that
+  //evaluated it. Public and static because that contract is shared by every holder of a table, not private to
+  //one Search.
+  static Hash128 getEvalCacheKey(Hash128 graphHash, Hash128 paramsHash, Hash128 modelHash) {
+    return graphHash ^ paramsHash ^ modelHash;
+  }
+  //The model term of that key, derived from the internal model names, which are the identities this engine
+  //keys models by. The composition is length-prefixed so that no pair of names can be confused for another
+  //pair. An absent human model is nullopt, which is distinct from a human model whose name is the empty string.
+  static Hash128 getEvalCacheModelHash(
+    const std::string& modelInternalName,
+    const std::optional<std::string>& humanModelInternalName
+  );
 
   //If the number of threads is reduced, this can free up some excess threads in the thread pool.
   //Calling this is never necessary, it may just reduce some resource use.
@@ -699,8 +740,10 @@ private:
   //----------------------------------------------------------------------------------------
   uint32_t createMutexIdxForNode(SearchThread& thread) const;
 
-  // Key to look up or store a node in the eval cache so that distinct params never share cached search results.
-  Hash128 getEvalCacheKey(Hash128 graphHash) const { return graphHash ^ evalCacheParamsHash; }
+  // Key to look up or store a node in the eval cache, for this search's own params and models.
+  Hash128 getEvalCacheKey(Hash128 graphHash) const {
+    return getEvalCacheKey(graphHash, evalCacheParamsHash, evalCacheModelHash);
+  }
 
   SearchNode* allocateOrFindNode(SearchThread& thread, Player nextPla, Loc bestChildMoveLoc, bool forceNonTerminal, Hash128 graphHash);
   void clearOldNNOutputs();

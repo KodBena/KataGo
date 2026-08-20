@@ -1,0 +1,7 @@
+name	n10000_uniform
+outcome	BUILD_OK
+n_keys	10000
+n_queries	30000
+n_expect_member	10000
+n_expect_absent	20000
+note	uniform 128-bit keys; queries are all members, an equal mass of random absent keys, and an equal mass of one-bit perturbations of members

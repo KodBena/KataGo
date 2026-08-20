@@ -24,7 +24,8 @@ NNResultBuf::NNResultBuf()
     errorLogLockout(false),
     // If no symmetry is specified, it will use default or random based on config.
     symmetry(NNInputs::SYMMETRY_NOTSPECIFIED),
-    policyOptimism(0.0)
+    policyOptimism(0.0),
+    cacheAttribution()
 {}
 
 NNResultBuf::~NNResultBuf() {
@@ -58,8 +59,7 @@ NNEvaluator::NNEvaluator(
   int yLen,
   bool rExactNNLen,
   bool iUseNHWC,
-  int nnCacheSizePowerOfTwo,
-  int nnMutexPoolSizePowerofTwo,
+  const NNCacheConfig& nnCacheConfig,
   bool skipNeuralNet,
   const string& homeDataDirOverride,
   enabled_t useFP16Mode,
@@ -84,7 +84,9 @@ NNEvaluator::NNEvaluator(
    debugSkipNeuralNet(skipNeuralNet),
    computeContext(NULL),
    loadedModel(NULL),
-   nnCacheTable(NULL),
+   nnCacheTable(nullptr),
+   nnCacheLevelZeroTable(nullptr),
+   nnCacheDirectory(nnCacheConfig.cacheDirectory),
    logger(lg),
    internalModelName(),
    modelVersion(-1),
@@ -127,8 +129,19 @@ NNEvaluator::NNEvaluator(
     );
   }
 
-  if(nnCacheSizePowerOfTwo >= 0)
-    nnCacheTable = new NNCacheTable(nnCacheSizePowerOfTwo, nnMutexPoolSizePowerofTwo);
+  // A configured cache directory IS the decision to carry a level-0 resolution list, so the
+  // two branches here are the whole of that decision and nothing downstream re-decides it.
+  // Without one, this is byte for byte the table this evaluator always built.
+  if(nnCacheConfig.sizePowerOfTwo >= 0) {
+    if(nnCacheConfig.cacheDirectory.has_value()) {
+      std::unique_ptr<NNCacheTwoLevelTable> twoLevel = NNCacheTable::createWithLevelZeroList(nnCacheConfig);
+      nnCacheLevelZeroTable = twoLevel.get();
+      nnCacheTable = std::move(twoLevel);
+    }
+    else {
+      nnCacheTable = NNCacheTable::create(nnCacheConfig);
+    }
+  }
 
   if(!debugSkipNeuralNet) {
     vector<int> gpuIdxs = gpuIdxByServerThread;
@@ -174,7 +187,8 @@ NNEvaluator::~NNEvaluator() {
     NeuralNet::freeLoadedModel(loadedModel);
   loadedModel = NULL;
 
-  delete nnCacheTable;
+  nnCacheLevelZeroTable = nullptr;
+  nnCacheTable.reset();
 }
 
 string NNEvaluator::getModelName() const {
@@ -369,8 +383,111 @@ void NNEvaluator::clearStats() {
 }
 
 void NNEvaluator::clearCache() {
-  if(nnCacheTable != NULL)
+  if(nnCacheTable != nullptr)
     nnCacheTable->clear();
+}
+
+NNCacheContextId NNEvaluator::attachCacheContext(const string& name) {
+  if(nnCacheTable == nullptr)
+    throw StringError(
+      "NNEvaluator: model '" + modelName + "' has no NN cache configured, so there is nothing "
+      "for context '" + name + "' to be attached to and nothing it could ever be attributed. "
+      "Attaching it would report success for a registration that can never be spent."
+    );
+  return nnCacheTable->attachCacheContext(name);
+}
+
+NNCacheContextResolution NNEvaluator::resolveCacheContext(const std::optional<string>& requested) const {
+  if(nnCacheTable == nullptr) {
+    if(!requested.has_value())
+      return NNCacheContextResolution::resolved(NNCacheAttribution::noAttributableContext());
+    return NNCacheContextResolution::refused(
+      "Unknown cacheContext '" + requested.value() + "'. Model '" + modelName +
+      "' has no NN cache configured, so no context is attached to it."
+    );
+  }
+  return nnCacheTable->cacheContexts().resolveForRequest(requested);
+}
+
+NNCacheAttributionLedger NNEvaluator::harvestCacheAttribution() const {
+  if(nnCacheTable == nullptr)
+    return NNCacheAttributionLedger::notAttributed();
+  return nnCacheTable->harvestAttribution();
+}
+
+NNCacheHitLedger NNEvaluator::harvestCacheHitCountsFor(const NNCacheContextId& context) const {
+  if(nnCacheTable == nullptr)
+    throw StringError(
+      "NNEvaluator: model '" + modelName + "' has no NN cache configured, so no context is "
+      "attached to it and none has earned anything here."
+    );
+  return nnCacheTable->harvestHitCountsFor(context);
+}
+
+const std::optional<std::string>& NNEvaluator::getCacheDirectory() const {
+  return nnCacheDirectory;
+}
+
+NNCacheTable& NNEvaluator::cacheTable() const {
+  if(nnCacheTable == nullptr)
+    throw StringError(
+      "NNEvaluator: model '" + modelName + "' has no NN cache configured (nnCacheSizePowerOfTwo "
+      "is negative), so there is no cache table to read or persist."
+    );
+  return *nnCacheTable;
+}
+
+// The one home of "this evaluator was built with a level-0 resolution list", so the three
+// surfaces below refuse in the same words and a fourth cannot drift from them.
+NNCacheTwoLevelTable& NNEvaluator::levelZeroTableOrThrow() const {
+  if(nnCacheLevelZeroTable == nullptr)
+    throw StringError(
+      "NNEvaluator: model '" + modelName + "' has no persisted cache: '" +
+      string(NNCacheConfig::KEY_DIR) + "' is not set in its config, so its cache was built "
+      "without a level-0 resolution list and there is nothing to attach a context to."
+    );
+  return *nnCacheLevelZeroTable;
+}
+
+// THE TRIPWIRE THAT USED TO STAND HERE IS GONE, and its removal is the point rather than a
+// casualty. assertNoEvaluationInFlightForLevelZeroSwap existed for exactly one caller: one that
+// reached past the protocol layer to these two acts directly. That caller can no longer be
+// written -- both acts now require an NNCacheLevelZeroSwapPermit, which nothing outside the three
+// mints named on that type can construct -- so the assertion policed a class the type system no
+// longer lets anyone express. Keeping it would give one rule two homes, the weaker of which was
+// compiled out of every release build this project ships and therefore never protected a shipped
+// binary at all (ADR-0012 P1; ADR-0000 Rule 2a -- the class is foreclosed at construction, which
+// is the top of ADR-0002's loudness hierarchy, so a run-time check below it adds nothing). The
+// axis the permit does NOT cover, named rather than left silent: a bug INSIDE the protocol layer
+// that called these while a request was open. That axis is the request loop's own refusal
+// (cacheSwapConcurrencyRefusal), which is always on, is exercised by the analysis engine cache
+// action suite, and is not compiled out of anything.
+
+NNCacheLevelZeroAttachment NNEvaluator::attachLevelZeroSource(
+  NNCacheLevelZeroSwapPermit permit,
+  std::unique_ptr<NNCacheFrozen> source,
+  const NNCacheContextId& servesContext
+) {
+  NNCacheTwoLevelTable& table = levelZeroTableOrThrow();
+  // REQUIRED HERE, THOUGH THE TABLE ACCEPTS A SOURCE WITHOUT ONE. This is the protocol's door,
+  // and every source that comes through it was loaded from some context's container on that
+  // context's behalf -- so an attach through here that named no context would be a source whose
+  // retrievals no per-context dump could ever write, which is a silent loss with a client on the
+  // other end of it. The table's own door stays permissive because a table can legitimately be
+  // handed a source before any context exists: its own construction does exactly that.
+  return table.attachLevelZero(permit, std::move(source), std::optional<NNCacheContextId>(servesContext));
+}
+
+std::unique_ptr<NNCacheFrozen> NNEvaluator::detachLevelZeroSource(
+  NNCacheLevelZeroSwapPermit permit,
+  const NNCacheLevelZeroSourceId& id
+) {
+  NNCacheTwoLevelTable& table = levelZeroTableOrThrow();
+  return table.detachLevelZero(permit, id);
+}
+
+size_t NNEvaluator::numLevelZeroSources() const {
+  return levelZeroTableOrThrow().numLevelZeroSources();
 }
 
 
@@ -1034,10 +1151,15 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
   vector<std::shared_ptr<NNOutput>> ptrs;
   std::array<int, SymmetryHelpers::NUM_SYMMETRIES> symmetryIndexes;
   std::iota(symmetryIndexes.begin(), symmetryIndexes.end(), 0);
+  // evaluate() CONSUMES the buffer's cache-context tag, so it has to be re-supplied for each
+  // symmetry rather than set once by the caller. All of these evaluations are the same query's,
+  // earned by the same context, and every one of them sets an entry (skipCache is on).
+  const NNCacheAttribution attributionForEverySymmetry = buf.cacheAttribution;
   for(int i = 0; i<numSymmetriesToSample; i++) {
     std::swap(symmetryIndexes[i], symmetryIndexes[rand.nextInt(i,SymmetryHelpers::NUM_SYMMETRIES-1)]);
     nnInputParams.symmetry = symmetryIndexes[i];
     bool skipCacheThisIteration = true; // Skip cache since there's no guarantee which symmetry is in the cache
+    buf.cacheAttribution = attributionForEverySymmetry;
     evaluate(
       board, history, nextPlayer, sgfMeta,
       nnInputParams,
@@ -1082,6 +1204,18 @@ void NNEvaluator::evaluate(
   testAssert(!isKilled);
   buf.hasResult = false;
 
+  // THE CACHE-CONTEXT TAG IS CONSUMED HERE, not read at the end.
+  //
+  // NNResultBuf is allocated once per thread and reused for every evaluation that thread ever
+  // makes, including this evaluator's and a companion evaluator's. A tag left standing on it
+  // would be spent by whichever evaluation came next -- filing one query's earnings under the
+  // context of the query before it, silently, since both are legal values. Taking it out of the
+  // buffer at entry makes a stale tag unrepresentable rather than something every call site has
+  // to remember not to leave behind: a caller that supplies one gets it spent exactly once, and
+  // a caller that supplies none is unattributed, which is counted and reported.
+  const NNCacheAttribution cacheAttribution = buf.cacheAttribution;
+  buf.cacheAttribution = NNCacheAttribution::noAttributableContext();
+
   if(board.x_size > nnXLen || board.y_size > nnYLen)
     throw StringError("NNEvaluator was configured with nnXLen = " + Global::intToString(nnXLen) +
                       " nnYLen = " + Global::intToString(nnYLen) +
@@ -1109,7 +1243,7 @@ void NNEvaluator::evaluate(
 
   bool hadResultWithoutOwnerMap = false;
   shared_ptr<NNOutput> resultWithoutOwnerMap;
-  if(nnCacheTable != NULL && !skipCache && nnCacheTable->get(nnHash,buf.result)) {
+  if(nnCacheTable != nullptr && !skipCache && nnCacheTable->get(nnHash,buf.result)) {
     if(!(includeOwnerMap && buf.result->whiteOwnerMap == NULL))
     {
       m_numCacheHits.fetch_add(1, std::memory_order_relaxed);
@@ -1465,100 +1599,11 @@ void NNEvaluator::evaluate(
   }
 
 
-  // And record the nnHash in the result and put it into the table
+  // And record the nnHash in the result and put it into the table, filed under the context
+  // that earned it -- which is the context the request named, carried here on the buffer.
+  // With no context attached anywhere this is the same store it always was.
   buf.result->nnHash = nnHash;
-  if(nnCacheTable != NULL)
-    nnCacheTable->set(buf.result);
+  if(nnCacheTable != nullptr)
+    nnCacheTable->set(buf.result, cacheAttribution);
 
-}
-
-// Uncomment this to lower the effective hash size down to one where we get true collisions
-// #define SIMULATE_TRUE_HASH_COLLISIONS
-
-NNCacheTable::Entry::Entry()
-  :ptr(nullptr)
-{}
-NNCacheTable::Entry::~Entry()
-{}
-
-NNCacheTable::NNCacheTable(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo) {
-  if(sizePowerOfTwo < 0 || sizePowerOfTwo > 63)
-    throw StringError("NNCacheTable: Invalid sizePowerOfTwo: " + Global::intToString(sizePowerOfTwo));
-  if(mutexPoolSizePowerOfTwo < 0 || mutexPoolSizePowerOfTwo > 31)
-    throw StringError("NNCacheTable: Invalid mutexPoolSizePowerOfTwo: " + Global::intToString(mutexPoolSizePowerOfTwo));
-#if defined(SIMULATE_TRUE_HASH_COLLISIONS)
-  sizePowerOfTwo = sizePowerOfTwo > 12 ? 12 : sizePowerOfTwo;
-#endif
-  if(mutexPoolSizePowerOfTwo > sizePowerOfTwo)
-    mutexPoolSizePowerOfTwo = sizePowerOfTwo;
-
-  tableSize = ((uint64_t)1) << sizePowerOfTwo;
-  tableMask = tableSize-1;
-  entries = new Entry[tableSize];
-  uint32_t mutexPoolSize = ((uint32_t)1) << mutexPoolSizePowerOfTwo;
-  mutexPoolMask = mutexPoolSize-1;
-  mutexPool = new MutexPool(mutexPoolSize);
-}
-NNCacheTable::~NNCacheTable() {
-  delete[] entries;
-  delete mutexPool;
-}
-
-bool NNCacheTable::get(Hash128 nnHash, shared_ptr<NNOutput>& ret) {
-  // Free ret BEFORE locking, to avoid any expensive operations while locked.
-  if(ret != nullptr)
-    ret.reset();
-
-  uint64_t idx = nnHash.hash0 & tableMask;
-  uint32_t mutexIdx = (uint32_t)idx & mutexPoolMask;
-  Entry& entry = entries[idx];
-  std::mutex& mutex = mutexPool->getMutex(mutexIdx);
-
-  std::lock_guard<std::mutex> lock(mutex);
-
-  bool found = false;
-#if defined(SIMULATE_TRUE_HASH_COLLISIONS)
-  if(entry.ptr != nullptr && ((entry.ptr->nnHash.hash0 ^ nnHash.hash0) & 0xFFF) == 0) {
-    ret = entry.ptr;
-    found = true;
-  }
-#else
-  if(entry.ptr != nullptr && entry.ptr->nnHash == nnHash) {
-    ret = entry.ptr;
-    found = true;
-  }
-#endif
-  return found;
-}
-
-void NNCacheTable::set(const shared_ptr<NNOutput>& p) {
-  // Immediately copy p right now, before locking, to avoid any expensive operations while locked.
-  shared_ptr<NNOutput> buf(p);
-
-  uint64_t idx = p->nnHash.hash0 & tableMask;
-  uint32_t mutexIdx = (uint32_t)idx & mutexPoolMask;
-  Entry& entry = entries[idx];
-  std::mutex& mutex = mutexPool->getMutex(mutexIdx);
-
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    // Perform a swap, to avoid any expensive free under the mutex.
-    entry.ptr.swap(buf);
-  }
-
-  // No longer locked, allow buf to fall out of scope now, will free whatever used to be present in the table.
-}
-
-void NNCacheTable::clear() {
-  shared_ptr<NNOutput> buf;
-  for(size_t idx = 0; idx<tableSize; idx++) {
-    Entry& entry = entries[idx];
-    uint32_t mutexIdx = (uint32_t)idx & mutexPoolMask;
-    std::mutex& mutex = mutexPool->getMutex(mutexIdx);
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      entry.ptr.swap(buf);
-    }
-    buf.reset();
-  }
 }

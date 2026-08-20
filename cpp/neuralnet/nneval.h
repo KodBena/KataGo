@@ -10,38 +10,14 @@
 #include "../core/threadsafequeue.h"
 #include "../game/board.h"
 #include "../game/boardhistory.h"
+#include "../neuralnet/nncache.h"
+#include "../neuralnet/nncachefrozen.h"
+#include "../neuralnet/nncachetwolevel.h"
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/sgfmetadata.h"
 #include "../neuralnet/nninterface.h"
-#include "../search/mutexpool.h"
 
 class NNEvaluator;
-
-class NNCacheTable {
-  struct Entry {
-    std::shared_ptr<NNOutput> ptr;
-    Entry();
-    ~Entry();
-  };
-
-  Entry* entries;
-  MutexPool* mutexPool;
-  uint64_t tableSize;
-  uint64_t tableMask;
-  uint32_t mutexPoolMask;
-
- public:
-  NNCacheTable(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo);
-  ~NNCacheTable();
-
-  NNCacheTable(const NNCacheTable& other) = delete;
-  NNCacheTable& operator=(const NNCacheTable& other) = delete;
-
-  // These are thread-safe. For get, ret will be set to nullptr upon a failure to find.
-  bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret);
-  void set(const std::shared_ptr<NNOutput>& p);
-  void clear();
-};
 
 // Each thread should allocate and re-use one of these
 struct NNResultBuf {
@@ -59,6 +35,42 @@ struct NNResultBuf {
   bool errorLogLockout; // error flag to restrict log to 1 error to prevent spam
   int symmetry; // The symmetry to use for this eval
   double policyOptimism; // The policy optimism to use for this eval
+
+  // Which attached cache context this evaluation is earned by, if this evaluator's cache has
+  // any attached. The last leg of the plumb an analysis request starts: the request names a
+  // context, the boundary resolves it against the model the request selected, the search
+  // carries the resolution, and it arrives HERE -- on the buffer the evaluation rides on --
+  // because the set that files the entry happens at the end of the very call this buffer is
+  // the argument to. Anything shorter-lived than the buffer would need a second channel to
+  // reach that set.
+  //
+  // Defaults to NoAttributableContext, which is what a request naming no context carries and
+  // what every caller of evaluate() that never heard of contexts leaves it as.
+  //
+  // DEFERRED ALTERNATIVE, FILED HERE RATHER THAN NARRATED ELSEWHERE (ADR-0000 Exceptions).
+  // The type-safe carrier is a REQUIRED PARAMETER of NNEvaluator::evaluate rather than a field
+  // on a buffer, because a parameter is checked by the compiler at every call site and a field
+  // is not. It was not taken, and the cost is concrete rather than a preference: outside
+  // nneval.cpp and searchnnhelpers.cpp there are 15 files holding live evaluate() calls -- 7
+  // production (evalsgf, gtp, writetrainingdata, genbook, startposes, play, playutils) and 8
+  // test -- every one of which would have to thread an explicit
+  // NNCacheAttribution::noAttributableContext() argument for no behavioural reason, and none
+  // of which has anything to do with cache contexts. The accepted design
+  // (cache-protocol-consult.wiki section 7) also names NNResultBuf as the carrier by name.
+  //
+  // WHAT THAT COSTS, EXACTLY, so a later reader can weigh it rather than re-derive it: a
+  // MISSING assignment at some future evaluate() call site inside Search is not caught by the
+  // compiler. It degrades to NoAttributableContext, which is counted and reported -- loud, not
+  // silently wrong -- so the residual is under-attribution, never mis-attribution. The other
+  // half of the class, a STALE tag surviving into the next evaluation, is already foreclosed:
+  // evaluate() consumes this field at entry (see nneval.cpp), and testnncachecontext.cpp's
+  // buffer-reuse tripwire holds it there.
+  //
+  // REVISIT WHEN a further evaluate() call site is added inside Search, or when a second
+  // per-evaluation tag of this kind wants the same carrier -- either is the point at which
+  // one parameter pays for the fifteen files, and the second would make the buffer a place
+  // where two independent facts are remembered by convention.
+  NNCacheAttribution cacheAttribution;
 
   NNResultBuf();
   ~NNResultBuf();
@@ -107,8 +119,7 @@ class NNEvaluator {
     int nnYLen,
     bool requireExactNNLen,
     bool inputsUseNHWC,
-    int nnCacheSizePowerOfTwo,
-    int nnMutexPoolSizePowerofTwo,
+    const NNCacheConfig& nnCacheConfig,
     bool debugSkipNeuralNet,
     const std::string& homeDataDirOverride,
     enabled_t useFP16Mode,
@@ -168,6 +179,109 @@ class NNEvaluator {
 
   // Clear all entires cached in the table
   void clearCache();
+
+  //-----------------------------------------------------------------------------------
+  // Cache contexts (see nncachecontext.h)
+  //-----------------------------------------------------------------------------------
+
+  // Attaches a context that this evaluator's cached earnings may be attributed to, and
+  // returns the only kind of value that can address it.
+  //
+  // THIS IS THE SEAM the cache_attach action plugs into. That action does not exist yet: it
+  // is the increment that reads a context's evaluation container, builds its frozen level-0
+  // structure and joins its count log for build order, and it will call this to register the
+  // name that content arrived under. Registering the name is separable from loading the
+  // content, and separating them is what lets the request tag be resolved, refused and spent
+  // before any loader exists -- rather than the tag waiting on the loader and the loader
+  // landing with no tested consumer.
+  //
+  // Throws StringError, naming what failed, if this evaluator has no cache at all, if the
+  // name is outside the closed alphabet a context name must fit, or if it is already
+  // attached.
+  NNCacheContextId attachCacheContext(const std::string& name);
+
+  // What a request's optional "cacheContext" field selects on THIS model, or the refusal to
+  // hand the client. See NNCacheContextSet::resolveForRequest for the rule; an evaluator
+  // with no cache configured at all answers a named context with a refusal saying so, and no
+  // name with NoAttributableContext, which is exactly today's behaviour.
+  [[nodiscard]] NNCacheContextResolution resolveCacheContext(const std::optional<std::string>& requested) const;
+
+  // The key -> context ledger of what this session earned in this evaluator's cache.
+  // NotAttributed if there is no cache or no context was attached.
+  [[nodiscard]] NNCacheAttributionLedger harvestCacheAttribution() const;
+
+  // The hit-count rows a dump of exactly this context would write. Throws StringError if
+  // there is no cache, or for a context this evaluator did not attach.
+  [[nodiscard]] NNCacheHitLedger harvestCacheHitCountsFor(const NNCacheContextId& context) const;
+
+  //-----------------------------------------------------------------------------------
+  // The persisted cache (see nncachelevelzero.h, nnevalcontainer.h, nncachedump.h)
+  //-----------------------------------------------------------------------------------
+
+  // WHERE THIS MODEL'S PERSISTED CACHE LIVES: the directory holding <context>.nncounts and
+  // <context>.<model>.nnevals, present exactly when the operator set nnCacheDir -- and
+  // therefore exactly when this evaluator's cache can attach a level-0 source at all. The
+  // two are one configuration decision, so they are one field here as they are one field in
+  // NNCacheConfig, and there is no state in which an engine has a directory it cannot attach
+  // from or an attach surface with nowhere to read.
+  [[nodiscard]] const std::optional<std::string>& getCacheDirectory() const;
+
+  // THIS EVALUATOR'S CACHE TABLE, for the protocol layer that persists and reports on it --
+  // the harvest, attribution, dump-planning and stats surfaces NNCacheTable already carries.
+  //
+  // A reference rather than a pointer, and a throw rather than a null, so a caller cannot
+  // hold "maybe there is a cache" as a value it might forget to test (ADR-0012 P9 rule 1).
+  // Throws StringError, saying so, when this evaluator has no cache configured.
+  [[nodiscard]] NNCacheTable& cacheTable() const;
+
+  // ATTACHES ONE PRE-WARMED LEVEL-0 SOURCE at the END of this cache's resolution order, and
+  // returns the only kind of value that can address it. Last attached is last tried, which
+  // is the whole of the cross-model priority mechanism: a client that wants a source to win
+  // a key attaches it earlier.
+  //
+  // NOT SAFE AGAINST A CONCURRENT EVALUATION, and that is a property of the structure rather
+  // than a caution: a get walks the resolution list lock-free, and this mutates the vector it
+  // walks, so a concurrent get can read freed memory. The protocol layer forecloses it by
+  // refusing attach and detach while any request is open (docs/Analysis_Engine.md,
+  // "cache_attach"), AND THAT REFUSAL IS THE ONLY DOOR: this act takes an
+  // NNCacheLevelZeroSwapPermit, which cannot be constructed outside the three places that type
+  // names, so a caller holding an NNEvaluator& and no permit cannot write this call at all. It
+  // is not refused at run time; it does not compile. See NNCacheLevelZeroSwapPermit for why a
+  // type replaced the release-compiled-out assertion that used to sit here.
+  //
+  // Throws StringError if this evaluator has no level-0 resolution list -- no nnCacheDir --
+  // or for a null source.
+  // `servesContext` is the context this source was loaded for, and it is REQUIRED at this door:
+  // it is what lets a dump of that context write the retrievals this source serves, which no
+  // key-shaped rule could recover afterwards. It must be a context THIS evaluator's cache
+  // attached, and is refused by name otherwise.
+  //
+  // The returned value carries the handle AND what reconciling the source against level 1 did --
+  // attach shadows every arriving key level 1 already owns, so a source detached across a set
+  // and re-attached cannot serve the evaluation that set superseded
+  // (NNCacheLevelZeroSources::attach).
+  [[nodiscard]] NNCacheLevelZeroAttachment attachLevelZeroSource(
+    NNCacheLevelZeroSwapPermit permit,
+    std::unique_ptr<NNCacheFrozen> source,
+    const NNCacheContextId& servesContext
+  );
+
+  // Removes the source `id` names and HANDS IT BACK, leaving every other source's relative
+  // order unchanged. Returning it is what lets the caller release its storage through
+  // nnCacheReleaseLevelZero, which OBSERVES whether the arena actually went rather than
+  // assuming the destructor ran.
+  //
+  // Carries the same concurrency contract, and the same permit, as attachLevelZeroSource.
+  // Throws StringError for an id this cache did not mint, for one already detached, and when
+  // there is no level-0 resolution list at all.
+  [[nodiscard]] std::unique_ptr<NNCacheFrozen> detachLevelZeroSource(
+    NNCacheLevelZeroSwapPermit permit,
+    const NNCacheLevelZeroSourceId& id
+  );
+
+  // How many level-0 sources are attached right now. Zero for a freshly started engine.
+  // Throws StringError when there is no level-0 resolution list at all.
+  [[nodiscard]] size_t numLevelZeroSources() const;
 
   // Queue a position for the next neural net batch evaluation and wait for it. Upon evaluation, result
   // will be supplied in NNResultBuf& buf, the shared_ptr there can grabbed via std::move if desired.
@@ -254,6 +368,10 @@ class NNEvaluator {
   void clearStats();
 
  private:
+  // The one home of "this evaluator was built with a level-0 resolution list", so the three
+  // public level-0 surfaces refuse in the same words.
+  [[nodiscard]] NNCacheTwoLevelTable& levelZeroTableOrThrow() const;
+
   const std::string modelName;
   const std::string modelFileName;
   const int nnXLen;
@@ -269,7 +387,13 @@ class NNEvaluator {
 
   ComputeContext* computeContext;
   LoadedModel* loadedModel;
-  NNCacheTable* nnCacheTable;
+  std::unique_ptr<NNCacheTable> nnCacheTable;
+  // The same table as nnCacheTable when this evaluator was built with a level-0 resolution
+  // list, and null otherwise. NOT OWNED -- nnCacheTable owns it -- and set once at
+  // construction beside it, so "has a directory" and "has an attach surface" are decided in
+  // one place and cannot come apart.
+  NNCacheTwoLevelTable* nnCacheLevelZeroTable;
+  std::optional<std::string> nnCacheDirectory;
   Logger* logger;
 
   std::string internalModelName;

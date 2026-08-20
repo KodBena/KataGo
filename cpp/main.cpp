@@ -62,6 +62,8 @@ testbackendreference : Test backend absolute outputs against compiled-in blended
 dumponnx : (TensorRT/ONNX only) Write out the ONNX graph KataGo builds for a model.
 
 runtests : Test important board algorithms and datastructures
+runnncachebench : Measure what the nn cache's inline hash tag costs and buys
+benchnncachepolicy : Sweep the nn cache policy matrix over a recorded operation trace
 runnnlayertests : Test a few subcomponents of the current neural net backend
 runonnxmodelfiletests : (TensorRT/ONNX only) Test the .onnx model file reader
 
@@ -116,6 +118,22 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::dumponnx(subArgs);
   else if(subcommand == "runtests")
     return MainCmds::runtests(subArgs);
+  else if(subcommand == "runnncachebench")
+    return MainCmds::runnncachebench(subArgs);
+  else if(subcommand == "benchnncachepolicy")
+    return MainCmds::benchnncachepolicy(subArgs);
+  // The cpp/spec/chd conformance driver. Deliberately absent from printHelp: it is an
+  // instrument check_vectors.py drives, not an operator verb.
+  else if(subcommand == "chdvectordriver")
+    return MainCmds::chdvectordriver(subArgs);
+  else if(subcommand == "runnncachefrozenbench")
+    return MainCmds::runnncachefrozenbench(subArgs);
+  else if(subcommand == "runnncachetwolevelbench")
+    return MainCmds::runnncachetwolevelbench(subArgs);
+  // The count log's write-volume measurement. Deliberately absent from printHelp for the
+  // same reason as the two above: an instrument, not an operator verb.
+  else if(subcommand == "runnncachecountlogbench")
+    return MainCmds::runnncachecountlogbench(subArgs);
   else if(subcommand == "runnnlayertests")
     return MainCmds::runnnlayertests(subArgs);
   else if(subcommand == "runnnontinyboardtest")

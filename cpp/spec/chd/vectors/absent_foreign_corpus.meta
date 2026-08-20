@@ -1,0 +1,7 @@
+name	absent_foreign_corpus
+outcome	BUILD_OK
+n_keys	5000
+n_queries	20000
+n_expect_member	0
+n_expect_absent	20000
+note	every query is a key from an independently generated corpus; all must be absent

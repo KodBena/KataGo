@@ -1033,6 +1033,20 @@ add_executable(katago
   neuralnet/sgfmetadata.cpp
   neuralnet/modelversion.cpp
   neuralnet/nneval.cpp
+  neuralnet/nncache.cpp
+  neuralnet/nncacheprobed.cpp
+  neuralnet/nncachechained.cpp
+  neuralnet/nncacheadmission.cpp
+  neuralnet/nncachesighting.cpp
+  neuralnet/nncachefrozen.cpp
+  neuralnet/nncachetwolevel.cpp
+  neuralnet/nncachecontext.cpp
+  neuralnet/nncachecountlog.cpp
+  neuralnet/nncachefileformat.cpp
+  neuralnet/nnevalcontainer.cpp
+  neuralnet/nncachelevelzero.cpp
+  neuralnet/nncachedump.cpp
+  neuralnet/nncachetrace.cpp
   neuralnet/desc.cpp
   neuralnet/debugprint.cpp
   ${NEURALNET_BACKEND_SOURCES}
@@ -1074,6 +1088,21 @@ add_executable(katago
   tests/testcommon.cpp
   tests/testconfig.cpp
   tests/testmisc.cpp
+  tests/testnncache.cpp
+  tests/testnncachepolicy.cpp
+  tests/testnncachefrozen.cpp
+  tests/testnncachetwolevel.cpp
+  tests/testnncachefrozenbench.cpp
+  tests/testnncachetwolevelbench.cpp
+  tests/testnncachecountlog.cpp
+  tests/testnncachecontext.cpp
+  tests/testnnevalcontainer.cpp
+  tests/testnncachelevelzero.cpp
+  tests/testnncachedump.cpp
+  tests/testanalysiscacheactions.cpp
+  tests/testanalysismodels.cpp
+  tests/testnncachecountlogbench.cpp
+  tests/testnncachebench.cpp
   tests/testnnevalcanary.cpp
   tests/testbackendreference.cpp
   tests/backendreferencedata.cpp
@@ -1104,8 +1133,12 @@ add_executable(katago
   distributed/client.cpp
   command/commandline.cpp
   command/analysis.cpp
+  command/analysiscacheactions.cpp
+  command/analysismodels.cpp
   command/benchmark.cpp
   command/benchmarknn.cpp
+  command/benchnncachepolicy.cpp
+  command/chdvectordriver.cpp
   command/contribute.cpp
   command/dumponnx.cpp
   command/evalsgf.cpp

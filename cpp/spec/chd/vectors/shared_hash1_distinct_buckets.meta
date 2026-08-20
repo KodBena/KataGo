@@ -1,0 +1,7 @@
+name	shared_hash1_distinct_buckets
+outcome	BUILD_OK
+n_keys	1000
+n_queries	2000
+n_expect_member	1000
+n_expect_absent	1000
+note	one pair of distinct keys sharing a hash1 value, placed at opposite ends of the hash0 range so they fall in different buckets; construction must succeed

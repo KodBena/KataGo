@@ -285,6 +285,12 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
       setupFor == SETUP_FOR_ANALYSIS ? 17 :
       cfg.getInt("nnMutexPoolSizePowerOfTwo", -1, 24);
 
+    // The cache's policy keys are decoded and validated at the cache's own boundary,
+    // which refuses an unknown value or an incoherent combination rather than falling
+    // back to the default silently. Absent every policy key this is exactly
+    // NNCacheConfig::statusQuo(...), i.e. today's cache.
+    NNCacheConfig nnCacheConfig = NNCacheConfig::fromCfg(cfg, nnCacheSizePowerOfTwo, nnMutexPoolSizePowerOfTwo);
+
 #ifndef USE_EIGEN_BACKEND
     int nnMaxBatchSize;
     if(setupFor == SETUP_FOR_BENCHMARK || setupFor == SETUP_FOR_BENCHMARKNN || setupFor == SETUP_FOR_DISTRIBUTED) {
@@ -322,8 +328,7 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
       nnYLen,
       requireExactNNLen,
       inputsUseNHWC,
-      nnCacheSizePowerOfTwo,
-      nnMutexPoolSizePowerOfTwo,
+      nnCacheConfig,
       debugSkipNeuralNet,
       homeDataDirOverride,
       useFP16Mode,

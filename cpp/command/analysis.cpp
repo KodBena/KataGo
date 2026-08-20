@@ -9,8 +9,12 @@
 #include "../program/playutils.h"
 #include "../program/play.h"
 #include "../command/commandline.h"
+#include "../command/analysiscacheactions.h"
+#include "../command/analysismodels.h"
 #include "../core/test.h"
 #include "../main.h"
+
+#include <optional>
 
 #include "../external/nlohmann_json/json.hpp"
 
@@ -22,6 +26,23 @@ struct AnalyzeRequest {
   string id;
   int turnNumber;
   int64_t priority;
+
+  //Which hosted model analyzes this request, already resolved from the request's optional "model"
+  //field against the loaded name space. The request carries the resolved index and never the
+  //requested name: resolution happens once, at the boundary that can refuse it, so no later
+  //stage can resolve it differently or fail to resolve it at all.
+  //A request that named no model carries AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX, which is
+  //also what a freshly-built request carries before its "model" field has been read.
+  SearchableModelIdx modelIdx = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+
+  //Which of the selected model's attached cache contexts this request's new evaluations are
+  //earned by, already resolved from the request's optional "cacheContext" field against that
+  //model's own attached contexts. The request carries the RESOLUTION and never the requested
+  //name, for the same reason it carries a resolved model index: resolution happens once, at the
+  //boundary that can refuse it, so no later stage can resolve it differently or fail to.
+  //A request that named no context carries NoAttributableContext unless exactly one context is
+  //attached, which is also what a freshly-built request carries.
+  NNCacheAttribution cacheAttribution;
 
   Board board;
   BoardHistory hist;
@@ -56,6 +77,148 @@ struct AnalyzeRequest {
   std::atomic<int> status;
 };
 
+//The bots one analysis thread owns, one per hosted searchable model.
+//
+//This is a type rather than a plain vector<AsyncBot*> for one reason. The engine stores bots on
+//two axes -- analysis thread, then model -- and as two bare size_t subscripts both
+//bots[threadIdx][modelIdx] and bots[modelIdx][threadIdx] compile; whenever the two counts happen
+//to be equal, which two analysis threads hosting two models makes an ordinary shape, the
+//transposed one is in bounds too and quietly serves requests from the wrong model's bot. This
+//type is subscriptable only by a SearchableModelIdx, so the transposition is a compile error.
+class BotsByModel {
+ public:
+  void add(AsyncBot* bot) { bots.push_back(bot); }
+  [[nodiscard]] AsyncBot* at(SearchableModelIdx idx) const {
+    //The second and last place a SearchableModelIdx is unwrapped: this is the storage it indexes.
+    testAssert(idx.value() < bots.size());
+    return bots[idx.value()];
+  }
+  //For the operations that are per-bot rather than per-model -- stopping, killing, deleting them
+  //all -- where no index is involved and so none can be confused.
+  [[nodiscard]] const std::vector<AsyncBot*>& all() const { return bots; }
+
+ private:
+  std::vector<AsyncBot*> bots;
+};
+
+
+//RENDERING a request's response and EMITTING it are separate acts, and every FINAL response goes
+//through the render half first. The reason is ordering, not tidiness: a request must be gone from
+//openRequests BEFORE its final response reaches the write queue. The write queue is FIFO and one
+//thread drains it, so a response the client has read is a response that was pushed; if the erase
+//happened before the push, it happened before anything the client could observe of this request.
+//A client that waits for its query's answer and then sends cache_attach or cache_detach therefore
+//reads an open-request count that no longer counts the query it just watched finish. Emitting
+//first and erasing after -- which is what this code used to do -- leaves exactly that window open,
+//and the refusal those two actions make on a nonzero count fires inside it. Splitting render from
+//emit is what lets the erase sit between the two.
+//
+//These are file-scope functions rather than lambdas inside the command so that [[nodiscard]] is
+//ENFORCED. In C++17 -- this project's standard (CMakeLists.txt CMAKE_CXX_STANDARD 17) -- the
+//attribute cannot appertain to a lambda's call operator: GCC 15.2 answers a lambda-borne
+//[[nodiscard]] with "attribute can only be applied to functions or to class or enumeration types
+//[-Wattributes]" and drops it, so writing it there would decorate rather than check. Dropping any
+//of these returns silently loses a client's response, which is exactly what the attribute is for
+//(ADR-0012 P9 rule 5).
+
+//The response for a request we don't actually have results for. This is used when something is
+//user-terminated before being actually analyzed properly. Only used outside of search too.
+[[nodiscard]] static string renderNoAnalysis(const AnalyzeRequest* request) {
+  json ret;
+  ret["id"] = request->id;
+  ret["turnNumber"] = request->turnNumber;
+  ret["isDuringSearch"] = false;
+  ret["noResults"] = true;
+  return ret.dump();
+}
+
+//Returns nothing if no analysis was reportable due to there being no root node or search results.
+[[nodiscard]] static std::optional<string> renderAnalysis(
+  const AnalyzeRequest* request, const Search* search, bool isDuringSearch, bool preventEncore
+) {
+  json ret;
+  ret["id"] = request->id;
+  ret["turnNumber"] = request->turnNumber;
+  ret["isDuringSearch"] = isDuringSearch;
+
+  bool success = search->getAnalysisJson(
+    request->perspective,
+    request->analysisPVLen, preventEncore, request->includePolicy,
+    request->includeOwnership,request->includeOwnershipStdev,
+    request->includeMovesOwnership,request->includeMovesOwnershipStdev,
+    request->includePVVisits,
+    request->includeNoResultValue,
+    ret
+  );
+
+  if(!success)
+    return std::nullopt;
+  return ret.dump();
+}
+
+//Terminates `request` and returns its final response if terminating it is what closed the request
+//out -- that is, if no analysis thread had claimed it, so none will ever write one. The CALLER
+//emits that response, and only after erasing the request from openRequests, for the same reason
+//the analysis loop does: a response the client can see must not name a request the engine still
+//counts as open. Returns nothing when some analysis thread owns the response instead.
+[[nodiscard]] static std::optional<string> terminateRequest(
+  vector<BotsByModel>& bots, AnalyzeRequest* request
+) {
+  //Firstly, flag the request as terminated
+  int prevStatus = request->status.exchange(AnalyzeRequest::STATUS_TERMINATED,std::memory_order_acq_rel);
+  //Already terminated? Nothing to do.
+  if(prevStatus == AnalyzeRequest::STATUS_TERMINATED)
+  {}
+  //No thread claimed it, so it's up to us to write the result
+  else if(prevStatus == AnalyzeRequest::STATUS_IN_QUEUE) {
+    return renderNoAnalysis(request);
+  }
+  //A thread popped it. That thread will notice that it's terminated once it tries to put its thread idx in, so we need not do anything.
+  else if(prevStatus == AnalyzeRequest::STATUS_POPPED)
+  {}
+  //A thread started searching it and put its thread idx in
+  else {
+    testAssert(prevStatus >= 0);
+    //We've already set the above status to terminated so when the thread terminates due to our killing it below, it will see this.
+    //Or else the thread has already done so, in which case it's already properly written a result, also fine.
+    int threadIdx = prevStatus;
+    //Terminate it by thread index, and within that thread by the model the request resolved to:
+    //that is the one bot of that thread's pool the request can be running on.
+    bots[threadIdx].at(request->modelIdx)->stopWithoutWait();
+  }
+  return std::nullopt;
+}
+
+//Terminates each of the given requests and returns the responses the CALLER must emit, in order,
+//once it has released openRequestsMutex.
+//MUST BE CALLED WITH openRequestsMutex HELD, and the returned responses MUST NOT be emitted until
+//it is released. Two obligations, one reason each:
+// - held, because a request this call closes is erased from openRequests here, and that erase has
+//   to be in the same critical section that found it;
+// - rendered before release, because the moment the lock is dropped, the analysis thread that
+//   pops a terminated request is free to erase and DELETE it, so the request is no longer there
+//   to read from. The responses leave here as strings, already rendered, for exactly that reason.
+//A request closed here will never be searched -- the analysis thread that pops it sees
+//STATUS_TERMINATED and skips straight past the search -- so it touches no cache from this point
+//on, and dropping it from the open count is truthful rather than merely convenient. Dropping it
+//is also required: its response is about to be emitted, and a client that reads a response for a
+//request the engine still counts as open is the very thing this ordering exists to prevent.
+[[nodiscard]] static vector<string> closeTerminated(
+  vector<BotsByModel>& bots,
+  std::map<int64_t, AnalyzeRequest*>& openRequests,
+  const vector<AnalyzeRequest*>& requests
+) {
+  vector<string> closedResponses;
+  for(AnalyzeRequest* request: requests) {
+    std::optional<string> response = terminateRequest(bots, request);
+    if(response.has_value()) {
+      openRequests.erase(request->internalId);
+      closedResponses.push_back(std::move(response.value()));
+    }
+  }
+  return closedResponses;
+}
+
 
 int MainCmds::analysis(const vector<string>& args) {
   Board::initHash();
@@ -64,6 +227,7 @@ int MainCmds::analysis(const vector<string>& args) {
 
   ConfigParser cfg;
   string modelFile;
+  vector<string> extraModelFiles;
   string humanModelFile;
   bool numAnalysisThreadsCmdlineSpecified;
   int numAnalysisThreadsCmdline;
@@ -79,11 +243,14 @@ int MainCmds::analysis(const vector<string>& args) {
 
     TCLAP::ValueArg<int> numAnalysisThreadsArg("","analysis-threads","Analyze up to this many positions in parallel. Equivalent to numAnalysisThreads in the config.",false,0,"THREADS");
     TCLAP::SwitchArg quitWithoutWaitingArg("","quit-without-waiting","When stdin is closed, quit quickly without waiting for queued tasks");
+    TCLAP::MultiArg<string> extraModelArg("","extra-model","Also host this model, selectable by its internalName via the \"model\" field of a request. May be given more than once.",false,"FILE");
     cmd.add(numAnalysisThreadsArg);
     cmd.add(quitWithoutWaitingArg);
+    cmd.add(extraModelArg);
     cmd.parseArgs(args);
 
     modelFile = cmd.getModelFile();
+    extraModelFiles = extraModelArg.getValue();
     humanModelFile = cmd.getHumanModelFile();
     numAnalysisThreadsCmdlineSpecified = numAnalysisThreadsArg.isSet();
     numAnalysisThreadsCmdline = numAnalysisThreadsArg.getValue();
@@ -152,7 +319,12 @@ int MainCmds::analysis(const vector<string>& args) {
     cfg.contains("assumeMultipleStartingBlackMovesAreHandicap") ? cfg.getBool("assumeMultipleStartingBlackMovesAreHandicap") : true;
   const bool preventEncore = cfg.contains("preventCleanupPhase") ? cfg.getBool("preventCleanupPhase") : true;
 
-  NNEvaluator* nnEval = NULL;
+  //Every searchable model the process hosts, primary first. Without -extra-model this is exactly
+  //the one model the engine has always loaded.
+  //There is deliberately no variable naming "the primary evaluator" that outlives this block: the
+  //only handle on a model afterwards is modelHosts, indexed by the model a request resolved to, so
+  //a later reader cannot reach for the primary net by name without meaning to.
+  vector<HostedModel> searchableModels;
   NNEvaluator* humanEval = NULL;
   {
     Setup::initializeSession(cfg);
@@ -161,11 +333,26 @@ int MainCmds::analysis(const vector<string>& args) {
     const int defaultMaxBatchSize = -1;
     const bool disableFP16 = false;
     const string expectedSha256 = "";
-    nnEval = Setup::initializeNNEvaluator(
-      modelFile,modelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
-      NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
-      Setup::SETUP_FOR_ANALYSIS
-    );
+    //Loads one searchable model and admits it to the name space, refusing at once if its internal
+    //name is one an already-loaded model answers to. Same rule AnalysisModelHosts::create enforces,
+    //applied as each model arrives, so a process that is going to be refused for a duplicate does
+    //not first pay to load every remaining net onto the device.
+    auto loadSearchableModel = [&](const string& file, const string& argName) {
+      NNEvaluator* eval = Setup::initializeNNEvaluator(
+        file,file,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
+        NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+        Setup::SETUP_FOR_ANALYSIS
+      );
+      searchableModels.push_back(
+        HostedModel{ModelAddress{eval->getInternalModelName(), argName + " " + eval->getModelFileName(), ModelRole::Searchable}, eval}
+      );
+      const std::optional<string> collision = findInternalNameCollision(addressesOf(searchableModels));
+      if(collision.has_value())
+        throw StringError(collision.value());
+    };
+    loadSearchableModel(modelFile, "-model");
+    for(const string& extraModelFile: extraModelFiles)
+      loadSearchableModel(extraModelFile, "-extra-model");
     if(humanModelFile != "") {
       humanEval = Setup::initializeNNEvaluator(
         humanModelFile,humanModelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
@@ -182,9 +369,24 @@ int MainCmds::analysis(const vector<string>& args) {
     }
   }
 
+  //The name space of the loaded models. The duplicate-name refusal above fires as each model is
+  //admitted; create() enforces the same rule for the whole set, including the human companion,
+  //which shares the name space because a client reads its name from query_models too.
+  const AnalysisModelHosts modelHosts = [&]() {
+    std::optional<HostedModel> companion;
+    if(humanEval != NULL) {
+      companion = HostedModel{
+        ModelAddress{humanEval->getInternalModelName(), "-human-model " + humanEval->getModelFileName(), ModelRole::HumanCompanion},
+        humanEval
+      };
+    }
+    return AnalysisModelHosts::create(std::move(searchableModels), std::move(companion));
+  }();
+
 #ifndef USE_EIGEN_BACKEND
-  {
-    int nnMaxBatchSizeTotal = nnEval->getNumGpus() * nnEval->getMaxBatchSize();
+  for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {
+    NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
+    int nnMaxBatchSizeTotal = eval->getNumGpus() * eval->getMaxBatchSize();
     int numThreadsTotal = defaultParams.numThreads * numAnalysisThreads;
     if(nnMaxBatchSizeTotal * 1.5 <= numThreadsTotal) {
       logger.write(
@@ -201,7 +403,10 @@ int MainCmds::analysis(const vector<string>& args) {
 
   //Check for unused config keys
   cfg.warnUnusedKeys(cerr,&logger);
-  Setup::maybeWarnHumanSLParams(defaultParams,nnEval,humanEval,cerr,&logger);
+  //Per hosted model: the default params may be honorable by one net and not another, and a warning
+  //that only ever consulted the primary would be silent about exactly the model a request names.
+  for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs())
+    Setup::maybeWarnHumanSLParams(defaultParams,modelHosts.searchableEval(modelIdx),humanEval,cerr,&logger);
 
   logger.write("Loaded config "+ cfg.getFileName());
   logger.write("Loaded model "+ modelFile);
@@ -217,6 +422,8 @@ int MainCmds::analysis(const vector<string>& args) {
   const std::set<std::string> expectedKeys = {
     "id",
     "action",
+    "model",
+    "cacheContext",
     "terminateId",
     "turnNumbers",
     "boardXSize",
@@ -276,6 +483,10 @@ int MainCmds::analysis(const vector<string>& args) {
   std::mutex openRequestsMutex;
   std::map<int64_t, AnalyzeRequest*> openRequests;
 
+  //What the cache actions have attached to each hosted model. Read and written ONLY on the request
+  //loop below, which is a single thread, so it takes no lock; see AnalysisCacheAttachments.
+  AnalysisCacheAttachments cacheAttachments(modelHosts.numSearchable());
+
   auto reportError = [&pushToWrite,&logger,&logErrorsAndWarnings](const string& s) {
     json ret;
     ret["error"] = s;
@@ -302,37 +513,16 @@ int MainCmds::analysis(const vector<string>& args) {
       logger.write("Warning: " + ret.dump());
   };
 
-  //Report analysis for which we don't actually have results. This is used when something is user-terminated before being actually
-  //analyzed properly. Only used outside of search too
-  auto reportNoAnalysis = [&pushToWrite](const AnalyzeRequest* request) {
-    json ret;
-    ret["id"] = request->id;
-    ret["turnNumber"] = request->turnNumber;
-    ret["isDuringSearch"] = false;
-    ret["noResults"] = true;
-    pushToWrite(new string(ret.dump()));
-  };
-
-  //Returns false if no analysis was reportable due to there being no root node or search results.
-  auto reportAnalysis = [&preventEncore,&pushToWrite](const AnalyzeRequest* request, const Search* search, bool isDuringSearch) {
-    json ret;
-    ret["id"] = request->id;
-    ret["turnNumber"] = request->turnNumber;
-    ret["isDuringSearch"] = isDuringSearch;
-
-    bool success = search->getAnalysisJson(
-      request->perspective,
-      request->analysisPVLen, preventEncore, request->includePolicy,
-      request->includeOwnership,request->includeOwnershipStdev,
-      request->includeMovesOwnership,request->includeMovesOwnershipStdev,
-      request->includePVVisits,
-      request->includeNoResultValue,
-      ret
-    );
-
-    if(success)
-      pushToWrite(new string(ret.dump()));
-    return success;
+  //Renders and emits in one act. The ONLY emit-where-you-render caller is the during-search
+  //report, which needs no ordering against the erase: the request genuinely IS open while a
+  //during-search report is written, so a count of 1 read after one is exactly truthful. Every
+  //FINAL response instead goes through renderAnalysis/renderNoAnalysis at file scope, so the
+  //erase can be sequenced before the emit -- see the comment on those.
+  auto reportAnalysis = [&pushToWrite,&preventEncore](const AnalyzeRequest* request, const Search* search, bool isDuringSearch) {
+    std::optional<string> rendered = renderAnalysis(request,search,isDuringSearch,preventEncore);
+    if(rendered.has_value())
+      pushToWrite(new string(std::move(rendered.value())));
+    return rendered.has_value();
   };
 
   // Common eval cache for all analysis threads
@@ -341,15 +531,25 @@ int MainCmds::analysis(const vector<string>& args) {
     evalCache = std::make_shared<EvalCacheTable>(defaultParams.subtreeValueBiasTableNumShards);
   }
 
+  //One analysis thread owns one bot per hosted searchable model, indexed by model. Each bot binds
+  //its evaluator for its whole life (AsyncBot and Search take it at construction), so the model a
+  //request names is served by picking the bot already bound to it -- no evaluator is ever swapped
+  //under a live search. The thread runs one of its bots at a time, so hosting N models multiplies
+  //the idle bots, not the concurrent searches: the thread budget is unchanged.
   auto analysisLoop = [
-    &logger,&toAnalyzeQueue,&reportAnalysis,&reportNoAnalysis,&logSearchInfo,&nnEval,&openRequestsMutex,&openRequests
-  ](AsyncBot* bot, int threadIdx) {
+    &logger,&toAnalyzeQueue,&pushToWrite,&reportAnalysis,&preventEncore,&logSearchInfo,&modelHosts,&openRequestsMutex,&openRequests
+  ](BotsByModel* botsByModel, int threadIdx) {
     while(true) {
       std::pair<std::pair<int64_t,int64_t>,AnalyzeRequest*> analysisItem;
       bool suc = toAnalyzeQueue.waitPop(analysisItem);
       if(!suc)
         break;
       AnalyzeRequest* request = analysisItem.second;
+      //Rendered below, emitted after the erase further down. Stays empty on the path where the
+      //request was already terminated in the queue -- the terminate wrote its response then.
+      std::optional<string> finalResponse;
+      //The model was resolved when the request was parsed; this is where that resolution is spent.
+      AsyncBot* bot = botsByModel->at(request->modelIdx);
       int expected = AnalyzeRequest::STATUS_IN_QUEUE;
       //If it's already terminated, then there's nothing for us to do
       if(!request->status.compare_exchange_strong(expected, AnalyzeRequest::STATUS_POPPED, std::memory_order_acq_rel)) {
@@ -360,6 +560,9 @@ int MainCmds::analysis(const vector<string>& args) {
         bot->setPosition(request->nextPla,request->board,request->hist);
         bot->setAlwaysIncludeOwnerMap(request->includeOwnership || request->includeOwnershipStdev || request->includeMovesOwnership || request->includeMovesOwnershipStdev);
         bot->setParams(request->params);
+        //The cache context was resolved when the request was parsed, against this very model; this
+        //is where that resolution is spent.
+        bot->setCacheAttribution(request->cacheAttribution);
         bot->setAvoidMoveUntilByLoc(request->avoidMoveUntilByLocBlack,request->avoidMoveUntilByLocWhite);
 
         Player pla = request->nextPla;
@@ -393,20 +596,20 @@ int MainCmds::analysis(const vector<string>& args) {
 
         if(logSearchInfo) {
           ostringstream sout;
-          PlayUtils::printGenmoveLog(sout,bot->getSearch(),nnEval,Board::NULL_LOC,NAN,request->perspective,false);
+          PlayUtils::printGenmoveLog(sout,bot->getSearch(),modelHosts.searchableEval(request->modelIdx),Board::NULL_LOC,NAN,request->perspective,false);
           logger.write(sout.str());
         }
 
         {
           const bool isDuringSearch = false;
           const Search* search = bot->getSearch();
-          bool analysisWritten = reportAnalysis(request,search,isDuringSearch);
+          finalResponse = renderAnalysis(request,search,isDuringSearch,preventEncore);
           //If the search didn't have any root or root neural net output, it must have been interrupted and we must be quitting imminently
-          if(!analysisWritten) {
+          if(!finalResponse.has_value()) {
             //If the reason we stopped was because we noticed a terminate, then we will write out a dummy response even if we didn't have
             //enough info to generate a real one, to fulfill a promise in the API docs that we always write something.
             if(request->status.load(std::memory_order_acquire) == AnalyzeRequest::STATUS_TERMINATED)
-              reportNoAnalysis(request);
+              finalResponse = renderNoAnalysis(request);
             //Otherwise, this case is only possible if we're just shutting down
             else
               logger.write("Note: Search quitting due to no visits - this is normal and possible when shutting down but a bug under any other situation.");
@@ -417,28 +620,42 @@ int MainCmds::analysis(const vector<string>& args) {
       //Free up bot resources in case it's a while before we do more search
       bot->clearSearch();
 
-      //This request is no longer open
+      //This request is no longer open, and the erase says so BEFORE the response is queued for
+      //output. That order is the whole point (see renderAnalysis above): a client that has read
+      //this response can send a cache action and be certain this request is not in the count that
+      //action reads.
+      //It is also safe to erase only here and not earlier: every cache lookup and store a request
+      //makes happens inside NNEvaluator::evaluate on a search thread, and genMoveSynchronous* has
+      //already waited for every one of those threads to finish. So the entry's removal strictly
+      //follows the last time this request could touch the list an attach or detach rewrites --
+      //which is why the count can be transiently too HIGH but never too low.
       {
         std::lock_guard<std::mutex> lock(openRequestsMutex);
         openRequests.erase(request->internalId);
       }
+      if(finalResponse.has_value())
+        pushToWrite(new string(std::move(finalResponse.value())));
       delete request;
     }
   };
-  auto analysisLoopProtected = [&logger,&analysisLoop](AsyncBot* bot, int threadIdx) {
-    Logger::logThreadUncaught("analysis loop", &logger, [&](){ analysisLoop(bot, threadIdx); });
+  auto analysisLoopProtected = [&logger,&analysisLoop](BotsByModel* botsByModel, int threadIdx) {
+    Logger::logThreadUncaught("analysis loop", &logger, [&](){ analysisLoop(botsByModel, threadIdx); });
   };
 
   vector<std::thread> threads;
   std::thread write_thread = std::thread(writeLoop);
-  vector<AsyncBot*> bots;
+  //One pool per analysis thread, each holding one bot per model. Sized up front so that the
+  //pointers handed to the threads below stay valid as later threads' pools are filled.
+  vector<BotsByModel> bots(numAnalysisThreads);
   for(int threadIdx = 0; threadIdx<numAnalysisThreads; threadIdx++) {
-    string searchRandSeed = Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
-    AsyncBot* bot = new AsyncBot(defaultParams, nnEval, humanEval, &logger, searchRandSeed);
-    bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
-    bot->setExternalEvalCache(evalCache);
-    threads.emplace_back(analysisLoopProtected,bot,threadIdx);
-    bots.push_back(bot);
+    for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {
+      string searchRandSeed = Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
+      AsyncBot* bot = new AsyncBot(defaultParams, modelHosts.searchableEval(modelIdx), humanEval, &logger, searchRandSeed);
+      bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
+      bot->setExternalEvalCache(evalCache);
+      bots[threadIdx].add(bot);
+    }
+    threads.emplace_back(analysisLoopProtected,&bots[threadIdx],threadIdx);
   }
 
   logger.write("Analyzing up to " + Global::intToString(numAnalysisThreads) + " positions at a time in parallel");
@@ -447,29 +664,6 @@ int MainCmds::analysis(const vector<string>& args) {
     cerr << "Started, ready to begin handling requests" << endl;
   }
 
-  auto terminateRequest = [&bots,&reportNoAnalysis](AnalyzeRequest* request) {
-    //Firstly, flag the request as terminated
-    int prevStatus = request->status.exchange(AnalyzeRequest::STATUS_TERMINATED,std::memory_order_acq_rel);
-    //Already terminated? Nothing to do.
-    if(prevStatus == AnalyzeRequest::STATUS_TERMINATED)
-    {}
-    //No thread claimed it, so it's up to us to write the result
-    else if(prevStatus == AnalyzeRequest::STATUS_IN_QUEUE) {
-      reportNoAnalysis(request);
-    }
-    //A thread popped it. That thread will notice that it's terminated once it tries to put its thread idx in, so we need not do anything.
-    else if(prevStatus == AnalyzeRequest::STATUS_POPPED)
-    {}
-    //A thread started searching it and put its thread idx in
-    else {
-      testAssert(prevStatus >= 0);
-      //We've already set the above status to terminated so when the thread terminates due to our killing it below, it will see this.
-      //Or else the thread has already done so, in which case it's already properly written a result, also fine.
-      int threadIdx = prevStatus;
-      //Terminate it by thread index
-      bots[threadIdx]->stopWithoutWait();
-    }
-  };
 
   auto requestLoop = [&]() {
     string line;
@@ -506,21 +700,47 @@ int MainCmds::analysis(const vector<string>& args) {
       //Special actions
       if(input.find("action") != input.end() && input["action"].is_string()) {
         string action = input["action"].get<string>();
+        //The cache actions are the ones that DO mean something by "model": it selects whose cache
+        //-- and therefore whose files -- the action addresses. Every other action is unchanged.
+        const bool isCacheAction =
+          action == "cache_attach" || action == "cache_detach" ||
+          action == "cache_dump" || action == "cache_stats";
+        //"model" selects which model analyzes a QUERY. The non-cache actions read it nowhere, and
+        //an action that accepted it and then did the same thing regardless would be a field the
+        //receiver cannot honor -- so it is refused here rather than ignored.
+        if(!isCacheAction && input.find("model") != input.end()) {
+          reportErrorForId(rbase.id, "model", "The \"model\" field selects which model analyzes a query and is not supported on this action; the cache actions take it to select whose cache they address");
+          continue;
+        }
+        //Same disposition, same reason: "cacheContext" says which attached context a QUERY's new
+        //evaluations are earned by. No action reads it -- the cache actions name their context in
+        //their own "context" field, which is a different question (which body of persisted content
+        //this act is ABOUT, not which one a query's earnings belong to) -- so it is refused here for
+        //every action rather than silently ignored.
+        if(input.find("cacheContext") != input.end()) {
+          reportErrorForId(rbase.id, "cacheContext", "The \"cacheContext\" field attributes a query's new cache entries and is not supported on an action query; the cache actions name the context they act on in their own \"context\" field");
+          continue;
+        }
         if(action == "query_version") {
           input["version"] = Version::getKataGoVersion();
           input["git_hash"] = Version::getGitRevision();
           pushToWrite(new string(input.dump()));
         }
         else if(action == "query_models") {
+          //Every hosted model, searchable ones first in the order they were configured, the human
+          //companion last -- so with one model and no -human-model this is the same one entry it
+          //has always been, and the "internalName" a client reads here is exactly the name the
+          //"model" field of a request takes.
           input["models"] = json::array();
-          if(nnEval != NULL) {
+          for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {
+            NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
             json modelInfo;
-            modelInfo["name"] = nnEval->getModelName();
-            modelInfo["internalName"] = nnEval->getInternalModelName();
-            modelInfo["maxBatchSize"] = nnEval->getMaxBatchSize();
-            modelInfo["usesHumanSLProfile"] = nnEval->requiresSGFMetadata();
-            modelInfo["version"] = nnEval->getModelVersion();
-            modelInfo["usingFP16"] = nnEval->getUsingFP16Mode().toString();
+            modelInfo["name"] = eval->getModelName();
+            modelInfo["internalName"] = eval->getInternalModelName();
+            modelInfo["maxBatchSize"] = eval->getMaxBatchSize();
+            modelInfo["usesHumanSLProfile"] = eval->requiresSGFMetadata();
+            modelInfo["version"] = eval->getModelVersion();
+            modelInfo["usingFP16"] = eval->getUsingFP16Mode().toString();
             input["models"].push_back(modelInfo);
           }
           if(humanEval != NULL) {
@@ -537,7 +757,11 @@ int MainCmds::analysis(const vector<string>& args) {
         }
         else if(action == "clear_cache") {
           //This should be thread-safe.
-          nnEval->clearCache();
+          //Every hosted model's cache: the action has always meant "drop everything cached", and a
+          //model whose cache it silently skipped would keep serving entries the client asked to be
+          //rid of. With one model this is the one clearCache it has always been.
+          for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs())
+            modelHosts.searchableEval(modelIdx)->clearCache();
           if(humanEval != NULL)
             humanEval->clearCache();
           if(evalCache != nullptr)
@@ -570,15 +794,21 @@ int MainCmds::analysis(const vector<string>& args) {
             }
           }
 
+          vector<string> closedResponses;
           {
             std::lock_guard<std::mutex> lock(openRequestsMutex);
             std::set<int> turnNumbersSet(turnNumbers.begin(),turnNumbers.end());
+            //Matched first, then terminated, because closing one erases it from the map being walked.
+            vector<AnalyzeRequest*> matched;
             for(auto it = openRequests.begin(); it != openRequests.end(); ++it) {
               AnalyzeRequest* request = it->second;
               if(request->id == terminateId && (!hasTurnNumbers || (turnNumbersSet.find(request->turnNumber) != turnNumbersSet.end())))
-                terminateRequest(request);
+                matched.push_back(request);
             }
+            closedResponses = closeTerminated(bots, openRequests, matched);
           }
+          for(string& response: closedResponses)
+            pushToWrite(new string(std::move(response)));
           pushToWrite(new string(input.dump()));
         }
         else if(action == "terminate_all") {
@@ -595,19 +825,117 @@ int MainCmds::analysis(const vector<string>& args) {
             }
           }
 
+          vector<string> closedResponses;
           {
             std::lock_guard<std::mutex> lock(openRequestsMutex);
             std::set<int> turnNumbersSet(turnNumbers.begin(),turnNumbers.end());
+            //Matched first, then terminated, because closing one erases it from the map being walked.
+            vector<AnalyzeRequest*> matched;
             for(auto it = openRequests.begin(); it != openRequests.end(); ++it) {
               AnalyzeRequest* request = it->second;
               if(!hasTurnNumbers || (turnNumbersSet.find(request->turnNumber) != turnNumbersSet.end()))
-                terminateRequest(request);
+                matched.push_back(request);
             }
+            closedResponses = closeTerminated(bots, openRequests, matched);
           }
+          for(string& response: closedResponses)
+            pushToWrite(new string(std::move(response)));
           pushToWrite(new string(input.dump()));
         }
+        else if(isCacheAction) {
+          //Which model's cache. The same translate-and-validate Port a query's "model" field goes
+          //through, and for a sharper reason: a cache action names the FILES it reads and writes, so
+          //coercing an unknown name to the primary model would read or write another model's
+          //container under this one's name, with nothing in the response to say it happened.
+          SearchableModelIdx modelIdx = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+          bool modelResolved = true;
+          if(input.find("model") != input.end()) {
+            if(!input["model"].is_string()) {
+              reportErrorForId(rbase.id, "model", "Must be a string, the \"internalName\" of a loaded model as the query_models action reports it");
+              modelResolved = false;
+            }
+            else {
+              const ModelResolution resolution = modelHosts.resolve(input["model"].get<string>());
+              if(!resolution.searchableIdx().has_value()) {
+                reportErrorForId(rbase.id, "model", resolution.refusal().value());
+                modelResolved = false;
+              }
+              else
+                modelIdx = resolution.searchableIdx().value();
+            }
+          }
+          if(!modelResolved)
+            continue;
+
+          int64_t openRequestCount = 0;
+          {
+            std::lock_guard<std::mutex> lock(openRequestsMutex);
+            openRequestCount = (int64_t)openRequests.size();
+          }
+          const AnalysisEngineCounters counters{openRequestCount};
+
+          //The decode's refusal is reported before the concurrency one deliberately: a client with a
+          //typo'd field learns about the typo rather than being told to try again later and hitting
+          //the same wall.
+          try {
+            bool handled = false;
+            json result;
+            if(action == "cache_attach") {
+              const CacheActionDecode<CacheAttachRequest> decoded = decodeCacheAttach(input);
+              if(decoded.refusal().has_value())
+                reportErrorForId(rbase.id, decoded.refusal().value().field, decoded.refusal().value().message);
+              else if(openRequestCount > 0)
+                reportErrorForId(rbase.id, "action", cacheSwapConcurrencyRefusal("cache_attach", openRequestCount));
+              else {
+                result = cacheAttachExecute(modelHosts, modelIdx, cacheAttachments, decoded.value().value());
+                handled = true;
+              }
+            }
+            else if(action == "cache_detach") {
+              const CacheActionDecode<CacheDetachRequest> decoded = decodeCacheDetach(input);
+              if(decoded.refusal().has_value())
+                reportErrorForId(rbase.id, decoded.refusal().value().field, decoded.refusal().value().message);
+              else if(openRequestCount > 0)
+                reportErrorForId(rbase.id, "action", cacheSwapConcurrencyRefusal("cache_detach", openRequestCount));
+              else {
+                result = cacheDetachExecute(modelHosts, modelIdx, cacheAttachments, decoded.value().value());
+                handled = true;
+              }
+            }
+            else if(action == "cache_dump") {
+              //Legal while requests are open -- every structure a dump reads is thread-safe and off
+              //the get/set path -- so there is no refusal here. The response carries the open-request
+              //count at dump time, so a client that dumped live can see that it did.
+              const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(input);
+              if(decoded.refusal().has_value())
+                reportErrorForId(rbase.id, decoded.refusal().value().field, decoded.refusal().value().message);
+              else {
+                result = cacheDumpExecute(modelHosts, modelIdx, cacheAttachments, decoded.value().value(), counters);
+                handled = true;
+              }
+            }
+            else {
+              testAssert(action == "cache_stats");
+              const CacheActionDecode<CacheStatsRequest> decoded = decodeCacheStats(input);
+              if(decoded.refusal().has_value())
+                reportErrorForId(rbase.id, decoded.refusal().value().field, decoded.refusal().value().message);
+              else {
+                result = cacheStatsExecute(modelHosts, modelIdx, cacheAttachments);
+                handled = true;
+              }
+            }
+            if(handled) {
+              for(json::const_iterator it = result.begin(); it != result.end(); ++it)
+                input[it.key()] = it.value();
+              pushToWrite(new string(input.dump()));
+            }
+          }
+          catch(const StringError& e) {
+            reportErrorForId(rbase.id, "action", e.what());
+          }
+        }
         else {
-          reportError("'action' field must be 'query_version' or 'query_models' or 'clear_cache' or 'terminate' or 'terminate_all'");
+          reportError("'action' field must be 'query_version' or 'query_models' or 'clear_cache' or 'cache_attach' or 'cache_detach' or 'cache_dump' or 'cache_stats' or 'terminate' or 'terminate_all'");
         }
 
         continue;
@@ -630,6 +958,56 @@ int MainCmds::analysis(const vector<string>& args) {
       rbase.priority = 0;
       rbase.avoidMoveUntilByLocBlack.clear();
       rbase.avoidMoveUntilByLocWhite.clear();
+      //A request that names no model is served by the primary model, which without -extra-model is
+      //the only model there is: the no-model path is the engine's prior behaviour, untouched.
+      rbase.modelIdx = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+      //Reset alongside it: rbase is reused across requests, so a context resolved for the previous
+      //one must not survive into a request that named none.
+      rbase.cacheAttribution = NNCacheAttribution::noAttributableContext();
+
+      //The optional "model" field. An unrecognized key elsewhere in a request is only WARNED about,
+      //and that warning is switchable off with warnUnusedFields -- a disposition this field cannot
+      //borrow. A "model" the engine cannot honor is refused here as an error and the request is not
+      //analyzed at all, because the alternative is analyzing with a net the client did not ask for,
+      //which is precisely the outcome the field exists to prevent, and which the response carries
+      //no evidence of.
+      if(input.find("model") != input.end()) {
+        if(!input["model"].is_string()) {
+          reportErrorForId(rbase.id, "model", "Must be a string, the \"internalName\" of a loaded model as the query_models action reports it");
+          continue;
+        }
+        const ModelResolution resolution = modelHosts.resolve(input["model"].get<string>());
+        if(!resolution.searchableIdx().has_value()) {
+          reportErrorForId(rbase.id, "model", resolution.refusal().value());
+          continue;
+        }
+        rbase.modelIdx = resolution.searchableIdx().value();
+      }
+
+      //The optional "cacheContext" field. It is resolved against the model this request already
+      //selected, because contexts are attached per model: each model's cache has its own attach
+      //order and its own name space, and a name attached to one says nothing about another.
+      //Resolving it here, after "model", is what makes that true by construction.
+      //An unknown name is an ERROR and the request is not analyzed, rather than being analyzed
+      //with its earnings filed under some other context -- which would write this session's work
+      //into the wrong card's file, with no field of the response carrying evidence it happened.
+      {
+        std::optional<string> requestedContext;
+        if(input.find("cacheContext") != input.end()) {
+          if(!input["cacheContext"].is_string()) {
+            reportErrorForId(rbase.id, "cacheContext", "Must be a string naming a cache context attached to the model this query selects");
+            continue;
+          }
+          requestedContext = input["cacheContext"].get<string>();
+        }
+        const NNCacheContextResolution contextResolution =
+          modelHosts.searchableEval(rbase.modelIdx)->resolveCacheContext(requestedContext);
+        if(!contextResolution.attribution().has_value()) {
+          reportErrorForId(rbase.id, "cacheContext", contextResolution.refusal().value());
+          continue;
+        }
+        rbase.cacheAttribution = contextResolution.attribution().value();
+      }
 
       auto parseInteger = [&rbase,&reportErrorForId](const json& dict, const char* field, int64_t& buf, int64_t min, int64_t max, const char* errorMessage) {
         try {
@@ -967,7 +1345,11 @@ int MainCmds::analysis(const vector<string>& args) {
               reportWarningForId(rbase.id, "overrideSettings", string("Unknown config params: ") + Global::concat(unusedKeys,","));
             }
             ostringstream out;
-            if(Setup::maybeWarnHumanSLParams(rbase.params,nnEval,humanEval,out,NULL)) {
+            //The request's own model, not the primary one: this check decides whether THIS request
+            //is honored, and asking a net the request did not name is the wrong-net service in the
+            //quietest register of all -- it does not serve a wrong evaluation, it refuses or admits
+            //a request on evidence from the wrong net.
+            if(Setup::maybeWarnHumanSLParams(rbase.params,modelHosts.searchableEval(rbase.modelIdx),humanEval,out,NULL)) {
               throw StringError(out.str());
             }
           }
@@ -1148,8 +1530,12 @@ int MainCmds::analysis(const vector<string>& args) {
           initialPlayer = BoardHistory::numHandicapStonesOnBoard(board) > 0 ? P_WHITE : P_BLACK;
       }
 
+      //Rule support and history modes are properties of the model that will actually run the
+      //search, so they are asked of the model this request resolved to.
+      NNEvaluator* requestEval = modelHosts.searchableEval(rbase.modelIdx);
+
       bool rulesWereSupported;
-      Rules supportedRules = nnEval->getSupportedRules(rules,rulesWereSupported);
+      Rules supportedRules = requestEval->getSupportedRules(rules,rulesWereSupported);
       if(!rulesWereSupported) {
         ostringstream out;
         out << "Rules " << rules << " not supported by neural net, using " << supportedRules << " instead";
@@ -1161,7 +1547,7 @@ int MainCmds::analysis(const vector<string>& args) {
       //Keep this request's history consistent with the BoardHistoryModes that the search
       //for this request will resolve to. (The search would re-stamp its own copy anyway, but this keeps
       //any adjudication done during request setup/replay consistent with them.)
-      BoardHistory hist(board,nextPla,rules,0,Search::resolveHistoryModes(rbase.params, nnEval));
+      BoardHistory hist(board,nextPla,rules,0,Search::resolveHistoryModes(rbase.params, requestEval));
       hist.setAssumeMultipleStartingBlackMovesAreHandicap(assumeMultipleStartingBlackMovesAreHandicap);
 
       if(warnUnusedFields) {
@@ -1187,6 +1573,8 @@ int MainCmds::analysis(const vector<string>& args) {
           newRequest->internalId = internalIdCounter++;
           newRequest->id = rbase.id;
           newRequest->turnNumber = turnNumber;
+          newRequest->modelIdx = rbase.modelIdx;
+          newRequest->cacheAttribution = rbase.cacheAttribution;
           newRequest->board = board;
           newRequest->hist = hist;
           newRequest->nextPla = nextPla;
@@ -1266,10 +1654,12 @@ int MainCmds::analysis(const vector<string>& args) {
     //Making this readOnly should signal the analysis loop threads to terminate once they have nothing left.
     toAnalyzeQueue.setReadOnly();
     //Interrupt any searches going on to help the analysis threads realize to terminate faster.
-    for(int i = 0; i<bots.size(); i++)
-      bots[i]->stopWithoutWait();
-    for(int i = 0; i<bots.size(); i++)
-      bots[i]->setKilled();
+    for(size_t i = 0; i<bots.size(); i++)
+      for(AsyncBot* bot: bots[i].all())
+        bot->stopWithoutWait();
+    for(size_t i = 0; i<bots.size(); i++)
+      for(AsyncBot* bot: bots[i].all())
+        bot->setKilled();
     for(int i = 0; i<threads.size(); i++)
       threads[i].join();
     write_thread.join();
@@ -1285,20 +1675,27 @@ int MainCmds::analysis(const vector<string>& args) {
     write_thread.join();
   }
 
-  for(int i = 0; i<bots.size(); i++)
-    delete bots[i];
+  for(size_t i = 0; i<bots.size(); i++)
+    for(AsyncBot* bot: bots[i].all())
+      delete bot;
 
-  logger.write(nnEval->getModelFileName());
-  logger.write("NN rows: " + Global::int64ToString(nnEval->numRowsProcessed()));
-  logger.write("NN batches: " + Global::int64ToString(nnEval->numBatchesProcessed()));
-  logger.write("NN avg batch size: " + Global::doubleToString(nnEval->averageProcessedBatchSize()));
+  //Per hosted model, so a session that ran two nets can be read for how much work each one did.
+  for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {
+    NNEvaluator* eval = modelHosts.searchableEval(modelIdx);
+    logger.write(eval->getModelFileName());
+    logger.write("NN rows: " + Global::int64ToString(eval->numRowsProcessed()));
+    logger.write("NN batches: " + Global::int64ToString(eval->numBatchesProcessed()));
+    logger.write("NN avg batch size: " + Global::doubleToString(eval->averageProcessedBatchSize()));
+  }
   if(humanEval != NULL) {
     logger.write(humanEval->getModelFileName());
     logger.write("NN rows: " + Global::int64ToString(humanEval->numRowsProcessed()));
     logger.write("NN batches: " + Global::int64ToString(humanEval->numBatchesProcessed()));
     logger.write("NN avg batch size: " + Global::doubleToString(humanEval->averageProcessedBatchSize()));
   }
-  delete nnEval;
+  //main owns the evaluators; modelHosts only refers to them.
+  for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs())
+    delete modelHosts.searchableEval(modelIdx);
   delete humanEval;
   NeuralNet::globalCleanup();
   ScoreValue::freeTables();

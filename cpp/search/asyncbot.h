@@ -50,6 +50,8 @@ class AsyncBot {
   void setAlwaysIncludeOwnerMap(bool b);
   void setParams(const SearchParams& params);
   void setParamsNoClearing(const SearchParams& params);
+  //Which of this bot's evaluator's attached cache contexts this bot's evaluations are earned by.
+  void setCacheAttribution(const NNCacheAttribution& attribution);
   void setExternalPatternBonusTable(std::unique_ptr<PatternBonusTable>&& table);
   void setCopyOfExternalPatternBonusTable(const std::unique_ptr<PatternBonusTable>& table);
   void setExternalEvalCache(const std::shared_ptr<EvalCacheTable>& cache);

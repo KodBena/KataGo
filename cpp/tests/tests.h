@@ -151,10 +151,72 @@ namespace Tests {
 
   //testbook.cpp
   void runBookTests();
+
+  //testnncache.cpp
+  void runNNCacheConfigTests();
+  void runNNCachePolicyTests();
+
+  //testnncachefrozen.cpp
+  void runNNCacheFrozenTests();
+
+  //testnncachecountlog.cpp
+  void runNNCacheCountLogTests();
+
+  //testnnevalcontainer.cpp
+  void runNNEvalContainerTests();
+
+  //testnncachelevelzero.cpp
+  void runNNCacheLevelZeroTests();
+
+  //testnncachetwolevel.cpp
+  void runNNCacheTwoLevelTests();
+
+  //testnncachecontext.cpp
+  void runNNCacheContextTests();
+
+  //testnncachedump.cpp
+  void runNNCacheDumpTests();
+
+  //testanalysismodels.cpp
+  void runAnalysisModelNameSpaceTests();
+  void runAnalysisCacheActionTests();
+  // Not part of runtests: it is a measurement, not an assertion, and it writes real files.
+  // Reached by the runnncachecountlogbench subcommand, which names the directory.
+  void runNNCacheCountLogBench(const std::string& directory);
+
+  // Not part of runtests: it is a measurement, not an assertion. Reached by the
+  // runnncachefrozenbench subcommand.
+  void runNNCacheFrozenBench();
+  // Not part of runtests: it is a measurement, not an assertion. Reached by the
+  // runnncachebench subcommand.
+  void runNNCacheBench();
+  // Not part of runtests: it is a measurement, not an assertion. Reached by the
+  // runnncachetwolevelbench subcommand.
+  void runNNCacheTwoLevelBench();
 }
 
 namespace TestCommon {
   bool boardsSeemEqual(const Board& b1, const Board& b2);
+
+  // A uniquely-named directory under the working directory that removes itself when the test
+  // that made it returns or throws. For the tests that genuinely need a file on disk -- a count
+  // log, a model file the loader will open -- not for tests in general.
+  //
+  // One thing it does NOT survive, stated because the name suggests otherwise: a failed
+  // testAssert calls Global::fatalError, which calls quick_exit, which runs no destructors. A
+  // red leg therefore does leave its directory behind (witnessed), which is why the names are
+  // in .gitignore. The unique suffix is what keeps that from tripping up the next run.
+  class ScopedTempDir {
+   public:
+    explicit ScopedTempDir(const std::string& namePrefix);
+    ~ScopedTempDir();
+    ScopedTempDir(const ScopedTempDir&) = delete;
+    ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+    const std::string& path() const;
+
+   private:
+    std::string path_;
+  };
 
   constexpr int MIN_BENCHMARK_SGF_DATA_SIZE = 7;
   constexpr int MAX_BENCHMARK_SGF_DATA_SIZE = 19;

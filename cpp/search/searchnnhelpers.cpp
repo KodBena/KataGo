@@ -27,6 +27,11 @@ void Search::computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwner
   }
   if(searchParams.ignorePreRootHistory || searchParams.ignoreAllHistory)
     nnInputParams.maxHistory = 0;
+  //The tag rides the buffer into the evaluator's set path. It is supplied per CALL rather than
+  //once per search because evaluate() consumes it: the buffer is reused for every evaluation
+  //this thread makes, including the companion evaluator's, and a tag left standing on it would
+  //be spent by whichever evaluation came next.
+  nnResultBuf.cacheAttribution = cacheAttribution;
   nnEvaluator->evaluate(
     board, hist, pla, &searchParams.humanSLProfile,
     nnInputParams,
@@ -95,6 +100,7 @@ bool Search::initNodeNNOutput(
   std::shared_ptr<NNOutput>* result = NULL;
   std::shared_ptr<NNOutput>* humanResult = NULL;
   if(isRoot && searchParams.rootNumSymmetriesToSample > 1) {
+    thread.nnResultBuf.cacheAttribution = cacheAttribution;
     result = nnEvaluator->averageMultipleSymmetries(
       thread.board, thread.history, thread.pla, &searchParams.humanSLProfile,
       nnInputParams,
@@ -102,6 +108,9 @@ bool Search::initNodeNNOutput(
       thread.rand, searchParams.rootNumSymmetriesToSample
     );
     if(needsHumanOutputInTree() || (isRoot && needsHumanOutputAtRoot())) {
+      //No tag is supplied for the companion model, and none is left over: the call above
+      //consumed it. The companion has its own cache and its own context name space, so an id
+      //minted by nnEvaluator's set would name a different context there, or nothing.
       humanResult = humanEvaluator->averageMultipleSymmetries(
         thread.board, thread.history, thread.pla, &searchParams.humanSLProfile,
         paramsForHumanEvaluator(nnInputParams),
@@ -111,6 +120,7 @@ bool Search::initNodeNNOutput(
     }
   }
   else {
+    thread.nnResultBuf.cacheAttribution = cacheAttribution;
     nnEvaluator->evaluate(
       thread.board, thread.history, thread.pla, &searchParams.humanSLProfile,
       nnInputParams,
@@ -118,6 +128,7 @@ bool Search::initNodeNNOutput(
     );
     result = new std::shared_ptr<NNOutput>(std::move(thread.nnResultBuf.result));
     if(needsHumanOutputInTree() || (isRoot && needsHumanOutputAtRoot())) {
+      //No tag for the companion model, for the reason given at the symmetry-averaging call.
       humanEvaluator->evaluate(
         thread.board, thread.history, thread.pla, &searchParams.humanSLProfile,
         paramsForHumanEvaluator(nnInputParams),

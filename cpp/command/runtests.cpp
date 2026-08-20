@@ -64,6 +64,17 @@ int MainCmds::runtests(const vector<string>& args) {
   ScoreValue::freeTables();
 
   Tests::runInlineConfigTests();
+  Tests::runNNCacheConfigTests();
+  Tests::runNNCachePolicyTests();
+  Tests::runNNCacheFrozenTests();
+  Tests::runNNCacheCountLogTests();
+  Tests::runNNEvalContainerTests();
+  Tests::runNNCacheLevelZeroTests();
+  Tests::runNNCacheTwoLevelTests();
+  Tests::runNNCacheContextTests();
+  Tests::runNNCacheDumpTests();
+  Tests::runAnalysisModelNameSpaceTests();
+  Tests::runAnalysisCacheActionTests();
 
   // Pick an arbitrary file that the test uses
   if(FileUtils::exists("tests/data/configs/folded/test-parent.cfg"))
@@ -73,6 +84,53 @@ int MainCmds::runtests(const vector<string>& args) {
   }
 
   cout << "All tests passed" << endl;
+  return 0;
+}
+
+// A measurement, not an assertion, so it is deliberately not part of runtests: it
+// takes seconds, allocates hundreds of megabytes, and its numbers mean nothing unless
+// the box is idle.
+int MainCmds::runnncachebench(const vector<string>& args) {
+  (void)args;
+  Board::initHash();
+  ScoreValue::initTables();
+  Tests::runNNCacheBench();
+  ScoreValue::freeTables();
+  return 0;
+}
+
+// The SPEC.md 8 performance floor for the frozen level-0 cache. A measurement, so it is
+// not part of runtests, for the same reason runnncachebench is not.
+int MainCmds::runnncachefrozenbench(const vector<string>& args) {
+  (void)args;
+  Board::initHash();
+  ScoreValue::initTables();
+  Tests::runNNCacheFrozenBench();
+  ScoreValue::freeTables();
+  return 0;
+}
+
+// What the ordered resolution list costs the level-0 miss path, paired in one process
+// against the single-source shape it replaced. A measurement, so it is not part of
+// runtests, for the same reason the two above are not.
+int MainCmds::runnncachetwolevelbench(const vector<string>& args) {
+  (void)args;
+  Board::initHash();
+  ScoreValue::initTables();
+  Tests::runNNCacheTwoLevelBench();
+  ScoreValue::freeTables();
+  return 0;
+}
+
+// The count log's write-volume-per-dump measurement. Not part of runtests for the same
+// reason as the two above, and additionally because it writes real files: the directory is
+// named on the command line rather than defaulted, so a measurement never scatters logs
+// into whatever the working directory happened to be.
+int MainCmds::runnncachecountlogbench(const vector<string>& args) {
+  // args[0] is the subcommand name itself, per handleSubcommand's own slicing in main.cpp.
+  if(args.size() != 2)
+    throw StringError("runnncachecountlogbench: expected exactly one argument, the directory to write under.");
+  Tests::runNNCacheCountLogBench(args[1]);
   return 0;
 }
 

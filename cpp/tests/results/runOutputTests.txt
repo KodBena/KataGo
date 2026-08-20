@@ -22725,6 +22725,19 @@ After search A2 (identical to A): reuses A's slot: 1
 : GPU 0 finishing, processed 0 rows 0 batches
 
 ===================================================================
+Eval cache keys depend on the models
+===================================================================
+: Initializing neural net buffer to be size 7 * 7 allowing smaller boards
+: Initializing neural net buffer to be size 7 * 7 allowing smaller boards
+After search with one model: its own slot populated, the modelless slot empty: 1
+After search with a second model: distinct key, distinct entry, same position and params: 1
+The first model's entry survives the second model's search: 1
+Distinct model names give distinct keys, equal model names give equal keys: 1
+Human model identity participates, absence is distinct from presence, name pairs do not collide: 1
+: GPU 0 finishing, processed 0 rows 0 batches
+: GPU 0 finishing, processed 0 rows 0 batches
+
+===================================================================
 Board size distribution
 ===================================================================
 2x2 7328

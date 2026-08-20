@@ -1,0 +1,7 @@
+name	n4_small
+outcome	BUILD_OK
+n_keys	4
+n_queries	100
+n_expect_member	4
+n_expect_absent	96
+note	small key set spanning the four-keys-per-bucket boundary

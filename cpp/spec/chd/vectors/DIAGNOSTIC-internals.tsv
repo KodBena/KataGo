@@ -1,0 +1,27 @@
+# NOT AN ACCEPTANCE ARTIFACT. These are internals of the archived prototype's
+# construction, recorded only as a debugging aid. A conforming implementation is
+# free to differ in every column here. Nothing checks these.
+case	outcome	n_keys	proto_bucket_count	proto_table_size	n_queries	n_expect_member	n_expect_absent	absent_landing_on_occupied_slot
+n0_empty	BUILD_OK	0	0	0	8	0	8	0
+n1_small	BUILD_OK	1	1	2	73	1	72	39
+n2_small	BUILD_OK	2	1	3	82	2	80	53
+n3_small	BUILD_OK	3	1	4	91	3	88	68
+n4_small	BUILD_OK	4	1	5	100	4	96	77
+n5_small	BUILD_OK	5	2	6	109	5	104	94
+n8_small	BUILD_OK	8	2	9	136	8	128	118
+n9_small	BUILD_OK	9	3	10	137	9	128	121
+n16_small	BUILD_OK	16	4	18	144	16	128	122
+n17_small	BUILD_OK	17	5	19	145	17	128	117
+n100_uniform	BUILD_OK	100	25	111	300	100	200	185
+n1000_uniform	BUILD_OK	1000	250	1101	3000	1000	2000	1875
+n10000_uniform	BUILD_OK	10000	2500	11001	30000	10000	20000	18554
+absent_foreign_corpus	BUILD_OK	5000	1250	5501	20000	0	20000	18214
+absent_onebit_only	BUILD_OK	5000	1250	5501	20000	0	20000	19052
+shared_hash1_distinct_buckets	BUILD_OK	1000	250	1101	2000	1000	1000	909
+shared_hash0_one_bucket	BUILD_OK	12	3	14	268	12	256	216
+extremal_keys	BUILD_OK	8	2	9	264	8	256	227
+dup_exact	BUILD_FAIL	101	0	0	0	0	0	0
+dup_hash1_same_bucket	BUILD_FAIL	2	0	0	0	0	0	0
+hash1_degenerate_corpus	BUILD_FAIL	64	0	0	0	0	0	0
+real_card5074	BUILD_OK	1203	301	1324	3609	1203	2406	2228
+real_card5455	BUILD_OK	45664	11416	50231	85664	45664	40000	36987
