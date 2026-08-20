@@ -35,6 +35,19 @@ static void checkAgreesWithNNPos(const Board& board, int nnXLen, int nnYLen) {
 
   for(int pos = 0; pos<geometry.getPolicySize(); pos++)
     testAssert(geometry.posToLoc(pos) == NNPos::posToLoc(pos,board.x_size,board.y_size,nnXLen,nnYLen));
+
+  //The off-board mask is the same fact as "posToLoc(pos) == NULL_LOC", in the word-per-position shape
+  //Search::selectBestChildToDescend's new-child scan consumes. It gets its own exhaustive check, and
+  //over the WHOLE table rather than only the live policy range, because that scan seeds its buffer
+  //from the whole table - a wrong entry there would silently exclude a legal move or admit an index
+  //that is not a board point, and no other check in this suite would see it.
+  const int32_t* offBoardPosMaskTable = geometry.getOffBoardPosMaskTable();
+  for(int pos = 0; pos<NNPos::MAX_NN_POLICY_SIZE; pos++) {
+    bool isOffBoard =
+      pos >= geometry.getPolicySize() ||
+      NNPos::posToLoc(pos,board.x_size,board.y_size,nnXLen,nnYLen) == Board::NULL_LOC;
+    testAssert(offBoardPosMaskTable[pos] == (isOffBoard ? NNPosGeometry::OFF_BOARD_POS_MASK : 0));
+  }
   for(int loc = 0; loc<Board::MAX_ARR_SIZE; loc++)
     testAssert(geometry.locToPos((Loc)loc) == NNPos::locToPos((Loc)loc,board.x_size,nnXLen,nnYLen));
 }
