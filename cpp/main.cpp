@@ -69,6 +69,10 @@ runnnsymmetriestest : Run neural net on a hardcoded rectangle board and dump sym
 runownershiptests : Run neural net search on some hardcoded positions and print avg ownership
 
 runoutputtests : Run a bunch of things and dump details to stdout
+runladdercachetests : Both legs of the ladder-cache soundness witness. "sound" is the green leg
+                      and exits 0; "stale" is the red leg and is EXPECTED TO DIE -- it deliberately
+                      caches a ladder result under a key too narrow to describe the position, and
+                      a zero exit status from it is the failure.
 runsearchtests : Run a bunch of things using a neural net and dump details to stdout
 runsearchtestsv3 : Run a bunch more things using a neural net and dump details to stdout
 runsearchtestsv8 : Run a bunch more things using a neural net and dump details to stdout
@@ -119,6 +123,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::runownershiptests(subArgs);
   else if(subcommand == "runoutputtests")
     return MainCmds::runoutputtests(subArgs);
+  else if(subcommand == "runladdercachetests")
+    return MainCmds::runladdercachetests(subArgs);
   else if(subcommand == "runsearchtests")
     return MainCmds::runsearchtests(subArgs);
   else if(subcommand == "runsearchtestsv3")
