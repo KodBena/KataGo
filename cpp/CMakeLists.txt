@@ -1027,6 +1027,7 @@ add_executable(katago
   tests/testsymmetries.cpp
   tests/testnninputs.cpp
   tests/testnnposgeometry.cpp
+  tests/testpolicymaskedargmax.cpp
   tests/testownership.cpp
   tests/testsearchcommon.cpp
   tests/testsearchnonn.cpp
