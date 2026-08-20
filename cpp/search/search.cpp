@@ -131,7 +131,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
 
   rootNode = NULL;
   nodeTable = new SearchNodeTable(params.nodeTableShardsPowerOfTwo);
-  mutexPool = new MutexPool(nodeTable->mutexPool->getNumMutexes());
+  mutexPool = new MutexPool(nodeTable->numShards);
 
   rootHistory.clear(rootBoard,rootPla,Rules(),0);
   applyHistoryModesToRootHistory();
@@ -897,11 +897,12 @@ SearchNode* Search::allocateOrFindNode(SearchThread& thread, Player nextPla, Loc
   }
 
   uint32_t nodeTableIdx = nodeTable->getIndex(childHash.hash0);
-  std::mutex& mutex = nodeTable->mutexPool->getMutex(nodeTableIdx);
-  std::lock_guard<std::mutex> lock(mutex);
+  //This is the table's only insertion path, and taking the shard is what marks it for teardown - the
+  //map below cannot be obtained without that having happened.
+  ShardedMap<SearchNode*>::LockedShard lockedShard = nodeTable->shards.lockShard(nodeTableIdx);
 
   SearchNode* child = NULL;
-  std::map<Hash128,SearchNode*>& nodeMap = nodeTable->entries[nodeTableIdx];
+  std::map<Hash128,SearchNode*>& nodeMap = lockedShard.map();
 
   while(true) {
     auto insertLoc = nodeMap.lower_bound(childHash);
@@ -977,11 +978,15 @@ void Search::removeSubtreeValueBias(SearchNode* node) {
 void Search::deleteAllOldOrAllNewTableNodesAndSubtreeValueBiasMulithreaded(bool old) {
   int numAdditionalThreads = numAdditionalThreadsToUseForTasks();
   testAssert(numAdditionalThreads >= 0);
+  //Shards that were never handed out hold no nodes, so the walk is over the occupied shards only.
+  //Shards emptied here stay listed as occupied - that costs one empty map visit next time and keeps
+  //this function from having to reason about a shard becoming empty while another thread works.
+  size_t numOccupiedShards = nodeTable->shards.getNumOccupiedShards();
   std::function<void(int)> g = [&](int threadIdx) {
-    size_t idx0 = (size_t)((uint64_t)(threadIdx) * nodeTable->entries.size() / (numAdditionalThreads+1));
-    size_t idx1 = (size_t)((uint64_t)(threadIdx+1) * nodeTable->entries.size() / (numAdditionalThreads+1));
-    for(size_t i = idx0; i<idx1; i++) {
-      std::map<Hash128,SearchNode*>& nodeMap = nodeTable->entries[i];
+    size_t idx0 = (size_t)((uint64_t)(threadIdx) * numOccupiedShards / (numAdditionalThreads+1));
+    size_t idx1 = (size_t)((uint64_t)(threadIdx+1) * numOccupiedShards / (numAdditionalThreads+1));
+    for(size_t pos = idx0; pos<idx1; pos++) {
+      std::map<Hash128,SearchNode*>& nodeMap = nodeTable->shards.getOccupiedShard(pos);
       for(auto it = nodeMap.cbegin(); it != nodeMap.cend();) {
         SearchNode* node = it->second;
         if(old == (node->nodeAge.load(std::memory_order_acquire) < searchNodeAge)) {
@@ -1002,11 +1007,12 @@ void Search::deleteAllOldOrAllNewTableNodesAndSubtreeValueBiasMulithreaded(bool 
 void Search::deleteAllTableNodesMulithreaded() {
   int numAdditionalThreads = numAdditionalThreadsToUseForTasks();
   testAssert(numAdditionalThreads >= 0);
+  size_t numOccupiedShards = nodeTable->shards.getNumOccupiedShards();
   std::function<void(int)> g = [&](int threadIdx) noexcept {
-    size_t idx0 = (size_t)((uint64_t)(threadIdx) * nodeTable->entries.size() / (numAdditionalThreads+1));
-    size_t idx1 = (size_t)((uint64_t)(threadIdx+1) * nodeTable->entries.size() / (numAdditionalThreads+1));
-    for(size_t i = idx0; i<idx1; i++) {
-      std::map<Hash128,SearchNode*>& nodeMap = nodeTable->entries[i];
+    size_t idx0 = (size_t)((uint64_t)(threadIdx) * numOccupiedShards / (numAdditionalThreads+1));
+    size_t idx1 = (size_t)((uint64_t)(threadIdx+1) * numOccupiedShards / (numAdditionalThreads+1));
+    for(size_t pos = idx0; pos<idx1; pos++) {
+      std::map<Hash128,SearchNode*>& nodeMap = nodeTable->shards.getOccupiedShard(pos);
       for(auto it = nodeMap.cbegin(); it != nodeMap.cend(); ++it) {
         delete it->second;
       }
@@ -1014,6 +1020,9 @@ void Search::deleteAllTableNodesMulithreaded() {
     }
   };
   performTaskWithThreads(&g, 0x3FFFffff);
+  //Every occupied shard was just emptied, so the table can forget which shards those were. The call
+  //refuses if that is not actually true, rather than silently losing track of surviving nodes.
+  nodeTable->shards.clearOccupancyTrackingAfterEmptyingAllShards();
 }
 
 //This function should NOT ever be called concurrently with any other threads modifying the search tree.

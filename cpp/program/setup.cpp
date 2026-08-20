@@ -724,6 +724,12 @@ vector<SearchParams> Setup::loadParams(
     if(cfg.contains("subtreeValueBiasWeightExponent"+idxStr)) params.subtreeValueBiasWeightExponent = cfg.getDouble("subtreeValueBiasWeightExponent"+idxStr, 0.0, 1.0);
     else if(cfg.contains("subtreeValueBiasWeightExponent")) params.subtreeValueBiasWeightExponent = cfg.getDouble("subtreeValueBiasWeightExponent", 0.0, 1.0);
     else params.subtreeValueBiasWeightExponent = 0.85;
+    //Number of shards (a count, not a power of two - it is used with a modulo) for the subtree value
+    //bias table and, where enabled, the eval cache table. Same role for those tables that
+    //nodeTableShardsPowerOfTwo has for the node table.
+    if(cfg.contains("subtreeValueBiasTableNumShards"+idxStr)) params.subtreeValueBiasTableNumShards = cfg.getInt("subtreeValueBiasTableNumShards"+idxStr, 1, 1 << 24);
+    else if(cfg.contains("subtreeValueBiasTableNumShards")) params.subtreeValueBiasTableNumShards = cfg.getInt("subtreeValueBiasTableNumShards", 1, 1 << 24);
+    else params.subtreeValueBiasTableNumShards = 65536;
 
     if(cfg.contains("useEvalCache"+idxStr)) params.useEvalCache = cfg.getBool("useEvalCache"+idxStr);
     else if(cfg.contains("useEvalCache"))   params.useEvalCache = cfg.getBool("useEvalCache");

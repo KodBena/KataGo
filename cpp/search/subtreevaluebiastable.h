@@ -5,7 +5,7 @@
 #include "../core/hash.h"
 #include "../core/multithread.h"
 #include "../game/board.h"
-#include "../search/mutexpool.h"
+#include "../search/shardedmap.h"
 
 struct SubtreeValueBiasEntry {
   double deltaUtilitySum = 0.0;
@@ -13,9 +13,12 @@ struct SubtreeValueBiasEntry {
   mutable std::atomic_flag entryLock = ATOMIC_FLAG_INIT;
 };
 
+//Table of subtree value bias entries, keyed by a local-pattern hash of the position around the move.
+//Sharded and occupancy-tracked exactly like the node table (see shardedmap.h): clearUnusedSynchronous
+//runs once per search, and its cost tracks the number of shards the search actually touched rather
+//than the shard count.
 struct SubtreeValueBiasTable {
-  std::vector<std::map<Hash128,std::shared_ptr<SubtreeValueBiasEntry>>> entries;
-  MutexPool* mutexPool;
+  ShardedMap<std::shared_ptr<SubtreeValueBiasEntry>> shards;
 
   SubtreeValueBiasTable(int32_t numShards);
   ~SubtreeValueBiasTable();

@@ -35,18 +35,20 @@ static void initIfNeeded() {
   isInited = true;
 }
 
-SubtreeValueBiasTable::SubtreeValueBiasTable(int32_t numShards) {
+SubtreeValueBiasTable::SubtreeValueBiasTable(int32_t numShards)
+  :shards(numShards)
+{
   initIfNeeded();
-  mutexPool = new MutexPool(numShards);
-  entries.resize(numShards);
 }
 SubtreeValueBiasTable::~SubtreeValueBiasTable() {
-  delete mutexPool;
 }
 
 void SubtreeValueBiasTable::clearUnusedSynchronous() {
-  for(size_t i = 0; i<entries.size(); i++) {
-    std::map<Hash128,std::shared_ptr<SubtreeValueBiasEntry>>& submap = entries[i];
+  //Only shards that have been handed out can hold entries, so walking the occupancy list reaches every
+  //entry this table has while touching none of the shards the search never used.
+  size_t numOccupiedShards = shards.getNumOccupiedShards();
+  for(size_t pos = 0; pos<numOccupiedShards; pos++) {
+    std::map<Hash128,std::shared_ptr<SubtreeValueBiasEntry>>& submap = shards.getOccupiedShard(pos);
     for(auto iter = submap.begin(); iter != submap.end(); /* no incr */) {
       // Anything in this map NOT used by anyone else - clear
       if(iter->second.use_count() <= 1) {
@@ -67,11 +69,12 @@ std::shared_ptr<SubtreeValueBiasEntry> SubtreeValueBiasTable::get(Player pla, Lo
     hash ^= ZOBRIST_KO_BAN[prevBoard.ko_loc];
   }
 
-  uint32_t subMapIdx = (uint32_t)(hash.hash0 % entries.size());
+  uint32_t subMapIdx = (uint32_t)(hash.hash0 % shards.getNumShards());
 
-  std::mutex& mutex = mutexPool->getMutex(subMapIdx);
-  std::lock_guard<std::mutex> lock(mutex);
-  std::shared_ptr<SubtreeValueBiasEntry>& slot = entries[subMapIdx][hash];
+  //Locking the shard is also what registers it as occupied, so the entry inserted just below cannot
+  //end up in a shard that clearUnusedSynchronous will not visit.
+  ShardedMap<std::shared_ptr<SubtreeValueBiasEntry>>::LockedShard shard = shards.lockShard(subMapIdx);
+  std::shared_ptr<SubtreeValueBiasEntry>& slot = shard.map()[hash];
   if(slot == nullptr)
     slot = std::make_shared<SubtreeValueBiasEntry>();
   return slot;
