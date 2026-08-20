@@ -2,7 +2,10 @@
 
 #include "../core/test.h"
 #include "../game/lt9_census.h" //TEMPORARY -- LT-9 census scaffolding, inert unless KATAGO_LT9_CENSUS
-#include "../game/lt9_soundkey.h" //TEMPORARY -- LT-9 sound-key scaffolding, inert unless KATAGO_LT9_CENSUS
+#include "../game/laddercache.h"
+
+#include <algorithm>
+#include <optional>
 
 using namespace std;
 
@@ -813,6 +816,25 @@ static void setRowBin(float* rowBin, int pos, int feature, float value, int posS
   rowBin[pos * posStride + feature * featureStride] = value;
 }
 
+//The sound ladder memo's store, one per thread of feature generation.
+//
+//OWNERSHIP, stated because it is a real tension rather than a settled shape. The honest owner is
+//the search whose lifetime the redundancy spans (ADR-0012 P2: derived data lives on the object
+//whose lifetime it shares), but NNInputs::fillRowV3..V7 receive no search handle, and threading
+//one in would change a public API that dataio/trainingwrite.cpp, command/evalsgf.cpp and four
+//test translation units call, reaching into cpp/search/ which sibling perf work owns. Putting it
+//on Board instead would add a member to the object BoardHistory::operator= copies per playout, a
+//measured 0.67% of cycles on this host. What makes the thread-local acceptable where P2's cancer
+//C (a module-global cache keyed on identity) is not: that cancer's harm is handing back the WRONG
+//cached value with no error, and this store structurally cannot -- every lookup revalidates its
+//entry's read set against the live board, so ownership decides hit rate and memory only, never
+//correctness. Thread lifetime is a superset of search lifetime, so nothing the search-scoped
+//version would have captured is lost.
+static LadderCache& threadLadderCache() {
+  thread_local LadderCache cache(LadderCache::DEFAULT_BUCKET_CAP, LadderCache::DEFAULT_MAX_BYTES);
+  return cache;
+}
+
 //Calls f on each location that is part of an inescapable atari, or a group that can be put into inescapable atari
 static void iterLadders(const Board& board, int nnXLen, const std::function<void(Loc,int,const vector<Loc>&)>& f) {
   int xSize = board.x_size;
@@ -832,8 +854,6 @@ static void iterLadders(const Board& board, int nnXLen, const std::function<void
   thread_local int t_lt9_iterLaddersCallCounter = 0;
   int lt9_passIndex = t_lt9_iterLaddersCallCounter % 3;
   t_lt9_iterLaddersCallCounter++;
-  vector<Loc> lt9_chainBuf;
-  vector<Loc> lt9_libBuf;
   LT9_CENSUS_INSTALL_ATEXIT();
 #endif
 
@@ -858,73 +878,55 @@ static void iterLadders(const Board& board, int nnXLen, const std::function<void
             }
           }
           if(!alreadySolved) {
-#ifdef KATAGO_LT9_CENSUS
-            //Build the chain-content key BEFORE searching, from the chain's member locations
-            //(walked via the circular next_in_chain list) plus its liberty locations -- see
-            //lt9_census.h's recordLadderDispatch doc comment for what this key does and does
-            //not capture.
-            //findLiberties is private, so liberties are re-derived here directly (empty points
-            //adjacent to any chain member) rather than reusing it -- board.cpp's own FOREACHADJ
-            //macro is likewise TU-local, so the four adjacency offsets are inlined below,
-            //matching board.cpp's own definition (x_size-relative, standard rectangular grid).
-            lt9_chainBuf.clear();
-            {
-              Loc cur = head;
-              do {
-                lt9_chainBuf.push_back(cur);
-                cur = copy.next_in_chain[cur];
-              } while(cur != head);
-            }
-            lt9_libBuf.clear();
-            {
-              int xs = copy.x_size;
-              Loc adjOffsets[4] = { (Loc)(-(xs+1)), (Loc)(-1), (Loc)(1), (Loc)(xs+1) };
-              for(Loc member : lt9_chainBuf) {
-                for(int k = 0; k < 4; k++) {
-                  Loc adj = member + adjOffsets[k];
-                  if(copy.colors[adj] == C_EMPTY)
-                    lt9_libBuf.push_back(adj);
-                }
-              }
-            }
-            vector<int> lt9_keyLocs;
-            lt9_keyLocs.reserve(lt9_chainBuf.size() + lt9_libBuf.size());
-            for(Loc l : lt9_chainBuf) lt9_keyLocs.push_back((int)l);
-            for(Loc l : lt9_libBuf) lt9_keyLocs.push_back((int)l);
-            uint64_t lt9_key = lt9census::hashLocSet(lt9_keyLocs);
+            //The sound ladder memo. The bucket key is computed from the board BEFORE the search,
+            //from the pursued chain's members and liberties -- material the search is about to
+            //walk anyway. It narrows the linear scan and carries no part of the soundness
+            //argument; the key that does is the read set the scope below records.
+            const int ladderVariant = (libs == 1) ? 1 : 2;
+            const uint64_t ladderKey = ladderBucketKey(board, loc, ladderVariant);
+            LadderCache& ladderCache = threadLadderCache();
+            std::optional<LadderAnswer> cachedAnswer = ladderCache.lookup(board, ladderKey);
 
-            //TEMPORARY -- LT-9 SOUND-KEY bracket. beginDispatch arms the read-set recording that
-            //board.cpp's lt9MarkChain/lt9MarkMove sites feed; lookup() sits exactly where a real
-            //cache's lookup would, validating a stored read-set snapshot against the live board.
-            //The real search then runs REGARDLESS, so endDispatch can compare the cached answer
-            //against the recomputed one -- that comparison is the witness, and a measurement
-            //build that short-circuited on a hit would have none.
-            lt9soundkey::beginDispatch(
-              (int)loc, libs == 1 ? 1 : 2, (int)copy.ko_loc, lt9_key, board.pos_hash.hash0, lt9_keyLocs
-            );
-            bool lt9_cachedResult = false;
-            std::vector<int> lt9_cachedWorkingMoves;
-            (void)lt9soundkey::lookup(board.colors, lt9_cachedResult, lt9_cachedWorkingMoves);
-#endif
-            //Perform search on copy so as not to mess up tracking of solved heads
             bool laddered;
-            if(libs == 1)
-              laddered = copy.searchIsLadderCaptured(loc,true,buf);
+            if(cachedAnswer.has_value() && !LadderCache::verifyEnabled()) {
+              //Reproduce exactly what the computed path leaves behind, not merely something
+              //equivalent-looking. The one-liberty variant never touches workingMoves and
+              //iterLadders does not clear it for that case, so neither do we; the two-liberty
+              //variant is preceded by a clear and then filled only when it returns true, so the
+              //entry's own list (empty when not laddered) is the exact replacement.
+              laddered = cachedAnswer->laddered;
+              if(libs != 1) {
+                workingMoves.clear();
+                for(uint8_t wi = 0; wi < cachedAnswer->numWorkingMoves; wi++)
+                  workingMoves.push_back(cachedAnswer->workingMoves[wi]);
+              }
+            }
             else {
-              workingMoves.clear();
-              laddered = copy.searchIsLadderCapturedAttackerFirst2Libs(loc,buf,workingMoves);
+              //Arm read-set recording for the duration of the search. board is the pristine
+              //pre-search state; copy is colors-identical to it here, and is what the search
+              //mutates and restores.
+              LadderReadScope readScope(board, ladderKey);
+              //Perform search on copy so as not to mess up tracking of solved heads
+              if(libs == 1)
+                laddered = copy.searchIsLadderCaptured(loc,true,buf);
+              else {
+                workingMoves.clear();
+                laddered = copy.searchIsLadderCapturedAttackerFirst2Libs(loc,buf,workingMoves);
+              }
+              LadderAnswer answer;
+              answer.laddered = laddered;
+              if(libs != 1) {
+                answer.numWorkingMoves = (uint8_t)std::min<size_t>(workingMoves.size(), 2);
+                for(uint8_t wi = 0; wi < answer.numWorkingMoves; wi++)
+                  answer.workingMoves[wi] = workingMoves[wi];
+              }
+              if(cachedAnswer.has_value())
+                LadderCache::reportVerification(*cachedAnswer, answer);
+              else
+                ladderCache.insert(std::move(readScope).finish(), answer);
             }
 #ifdef KATAGO_LT9_CENSUS
-            {
-              uint64_t lt9_expansions = LT9_CENSUS_TAKE_LADDER_EXPANSIONS();
-              LT9_CENSUS_LADDER_DISPATCH(lt9_passIndex, lt9_key, lt9_expansions);
-              std::vector<int> lt9_realWorkingMoves;
-              if(libs != 1) {
-                lt9_realWorkingMoves.reserve(workingMoves.size());
-                for(Loc wm : workingMoves) lt9_realWorkingMoves.push_back((int)wm);
-              }
-              lt9soundkey::endDispatch(board.colors, laddered, lt9_realWorkingMoves, lt9_expansions);
-            }
+            LT9_CENSUS_LADDER_DISPATCH(lt9_passIndex, ladderKey, LT9_CENSUS_TAKE_LADDER_EXPANSIONS());
 #endif
 
             chainHeadsSolved[numChainHeadsSolved] = head;

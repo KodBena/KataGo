@@ -5,7 +5,7 @@
 #ifdef KATAGO_LT9_CENSUS
 
 #include "../game/lt9_census.h"
-#include "../game/lt9_soundkey.h"
+#include "../game/laddercache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -228,14 +228,14 @@ void dumpAndReset() {
   for(size_t i = 0; i < topN; i++)
     std::fprintf(f, "key=%llu timesSeen=%llu\n", (unsigned long long)byCount[i].second, (unsigned long long)byCount[i].first);
 
-  //TEMPORARY -- the sound-key block rides in the SAME dump block as the census numbers above, so
-  //the chain-shape figures serve as a substrate check on the sound-key figures over one identical
-  //run (see the comment in this file's own dumpAndReset ledger entry).
+  //TEMPORARY -- the SHIPPED ladder memo's own hit/miss totals ride in the same dump block as the
+  //chain-shape census numbers above, so the two are read off one identical run.
   {
-    std::string skBlock = lt9soundkey::renderDump();
-    std::fwrite(skBlock.data(), 1, skBlock.size(), f);
+    uint64_t cacheHits = 0, cacheMisses = 0;
+    LadderCache::censusTotals(cacheHits, cacheMisses);
+    std::fprintf(f, "laddercache.hits=%llu\n", (unsigned long long)cacheHits);
+    std::fprintf(f, "laddercache.misses=%llu\n", (unsigned long long)cacheMisses);
   }
-  lt9soundkey::reset();
 
   std::fclose(f);
 
