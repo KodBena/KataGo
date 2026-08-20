@@ -5,11 +5,15 @@
 using namespace std;
 using namespace TestCommon;
 
-//Differential witness for BoardHistory's incrementally-maintained superKoBannedHash.
+//Differential witness for BoardHistory's superko marks: the incrementally-maintained
+//superKoBannedHash, and the marks themselves now that they are computed over a candidate set rather
+//than over the whole board.
 //
 //getSituationRulesAndKoHash used to derive the ko-mark contribution of its hash by sweeping every
 //point of the board on every call. It now consumes two hashes that BoardHistory maintains at the
-//write sites of the mark arrays instead. The two tests below observe that change directly:
+//write sites of the mark arrays instead. Separately, makeBoardMoveAssumeLegal used to decide the
+//marks themselves by testing every point of the board after every move; it now tests only the
+//points SuperKoCandidates hands it. The tests below observe both changes directly:
 //
 //  W1 - the maintained hash equals a fold recomputed over the whole array. This fails if any write
 //       to superKoBanned bypasses setSuperKoBanned/clearSuperKoBanned, i.e. if a write site was
@@ -21,11 +25,31 @@ using namespace TestCommon;
 //       (An earlier form of this test compared two test-local expressions instead; deleting the
 //       shipped function's O(1) ko_loc correction left it green, which is how that was found.)
 //
-//Both are checked at every position of a randomized corpus that is deliberately weighted toward the
-//states where the two could differ: small boards so positions repeat, positional and situational
-//superko so bans actually arise, territory scoring so the encore is entered, and ko fights so ko
-//recapture blocks and simple ko locs are live. The corpus counts how often it reached each of those
-//states and asserts floors on the counts, because a corpus of quiet openings would pass both checks
+//  W3 - the SHIPPED superKoBanned array is bit-identical to what the whole-board sweep would put
+//       there. That sweep no longer runs over the whole board: it runs over a candidate set that
+//       SuperKoCandidates resyncs against the board (see game/superkocandidates.h), and the failure
+//       mode of a carried-over set is staleness - a point that should be examined is not, and a move
+//       that superko forbids is silently permitted. Staleness produces no crash and no wrong hash;
+//       W1 and W2 would both stay green through it, because a stale set still writes a
+//       self-consistent array and hash. Only comparing against a full sweep observes it. The oracle
+//       is a transcription of the sweep as it stood before the change, so what is observed is the
+//       shipped marks against the old whole-board answer, not against a restatement of the new one.
+//
+//  W4 - W3 still holds after the Board has been changed behind the history's back. BoardHistory does
+//       not own the Board it sweeps - it is a caller-held parameter - so a candidate set maintained
+//       at BoardHistory's own place/capture sites would be correct through ordinary play and wrong
+//       here. Two flavors are constructed: scrambling stones onto and off the board with
+//       Board::setStonesTolerant, and substituting an entirely different (earlier) Board, in both
+//       cases then making a move through the history and checking W3 on the result. This is the case
+//       the pre-change code could not fail and the post-change code can, so it is the case this
+//       extension exists for.
+//
+//W1, W2 and W3 are checked at every position of a randomized corpus that is deliberately weighted
+//toward the states in which the checked things could differ: small boards so positions repeat,
+//positional and situational superko so bans actually arise, territory scoring so the encore is
+//entered, and ko fights so ko recapture blocks and simple ko locs are live. W4 is constructed on top
+//of that corpus at intervals. The corpus counts how often it reached each of those states and
+//asserts floors on the counts, because a corpus of quiet openings would pass every check above
 //while witnessing nothing. The floors sit at 63-65% of the counts this fixed seed produces, i.e.
 //tight enough that any single category dropping by more than about half again - a 2x regression
 //included - fails here rather than silently reducing this test to a tautology. The remaining third
@@ -43,6 +67,11 @@ namespace {
     int64_t numWithKoRecapBlock = 0;
     int64_t numWithSimpleKoLoc = 0;
     int64_t numKoLocBannedPairsChecked = 0;
+    int64_t numFullSweepComparisons = 0;
+    int64_t numWithNeverOccupiedSuicidePoint = 0;
+    int64_t numWithNeverOccupiedCandidateBanned = 0;
+    int64_t numOutOfBandScrambleChecks = 0;
+    int64_t numOutOfBandSubstitutedBoardChecks = 0;
   };
 
   //The fold over the whole array, recomputed from scratch. This is what the maintained hash claims
@@ -54,6 +83,47 @@ namespace {
         h ^= Board::ZOBRIST_KO_LOC_HASH[i];
     }
     return h;
+  }
+
+  //Transcriptions of the two BoardHistory internals the pre-change sweep called. koHashOccursInHistory
+  //is transcribed for the rootKoHashTable == NULL case, which is the case this corpus produces: every
+  //makeBoardMoveAssumeLegal below passes NULL, so the shipped function reduces to exactly this scan.
+  Hash128 referenceKoHashAfterMoveNonEncore(const Rules& rules, Hash128 posHashAfterMove, Player pla) {
+    if(rules.koRule == Rules::KO_SITUATIONAL || rules.koRule == Rules::KO_SIMPLE)
+      return posHashAfterMove ^ Board::ZOBRIST_PLAYER_HASH[pla];
+    else
+      return posHashAfterMove;
+  }
+  bool referenceKoHashOccursInHistory(const BoardHistory& hist, Hash128 koHash) {
+    for(size_t i = 0; i<hist.koHashHistory.size(); i++)
+      if(hist.koHashHistory[i] == koHash)
+        return true;
+    return false;
+  }
+
+  //A full transcription of the superko marking sweep as it stood BEFORE this change: every point of
+  //the board tested in turn, no candidate set anywhere. This is the oracle for W3. It answers for
+  //hist.presumedNextMovePla, because that is the player the shipped marks were computed for.
+  void referenceSuperKoBannedByFullSweep(const Board& board, const BoardHistory& hist, bool out[Board::MAX_ARR_SIZE]) {
+    for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
+      out[i] = false;
+    Player nextPla = hist.presumedNextMovePla;
+    for(int y = 0; y<board.y_size; y++) {
+      for(int x = 0; x<board.x_size; x++) {
+        Loc loc = Location::getLoc(x,y,board.x_size);
+        if(board.colors[loc] != C_EMPTY)
+          out[loc] = false;
+        else if(!hist.wasEverOccupiedOrPlayed[loc] && !board.isSuicide(loc,nextPla))
+          out[loc] = false;
+        else if(board.isIllegalSuicide(loc,nextPla,hist.rules.multiStoneSuicideLegal) || loc == board.ko_loc)
+          out[loc] = false;
+        else {
+          Hash128 posHashAfterMove = board.getPosHashAfterMove(loc,nextPla);
+          Hash128 koHashAfterMove = referenceKoHashAfterMoveNonEncore(hist.rules,posHashAfterMove,getOpp(nextPla));
+          out[loc] = referenceKoHashOccursInHistory(hist,koHashAfterMove);
+        }
+      }
+    }
   }
 
   //A full transcription of getSituationRulesAndKoHash as it stood BEFORE this change: the ko-mark
@@ -142,6 +212,51 @@ namespace {
       BoardHistory::getSituationRulesAndKoHash(board,hist,nextPlayer,drawEquivalentWinsForWhite,hist.modes) ==
       referenceSituationRulesAndKoHashBySweep(board,hist,nextPlayer,drawEquivalentWinsForWhite,hist.modes)
     );
+
+    //W3: the shipped marks are what the whole-board sweep would have produced. Restricted to the
+    //state in which the sweep is what put them there: in the encore a different rule writes them, and
+    //at a position with no moves played yet nothing has written them at all. Under simple ko in the
+    //main phase nothing writes them either, and that they are consequently all clear is checked
+    //rather than assumed.
+    if(hist.encorePhase == 0 && hist.moveHistory.size() > 0) {
+      if(hist.rules.koRule != Rules::KO_SIMPLE) {
+        bool expected[Board::MAX_ARR_SIZE];
+        referenceSuperKoBannedByFullSweep(board,hist,expected);
+        for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
+          testAssert(hist.isSuperKoBanned((Loc)i) == expected[i]);
+        stats.numFullSweepComparisons += 1;
+
+        //Coverage of the one point class for which "empty and a stone was once here" - the obvious
+        //and WRONG candidate predicate - is too narrow: a point that never held a stone, where
+        //playing would nonetheless be suicide, so the move can still repeat a position. Two counts,
+        //because they say different things and both are floored. The first is how often such a point
+        //exists at all, i.e. how often the non-obvious half of the predicate is exercised. The second
+        //is how often one of them is ACTUALLY superko-banned - each of those positions is one where
+        //the narrow predicate would have permitted a move superko forbids, so a nonzero floor on it
+        //is what keeps this corpus able to reject that predicate rather than merely visit it.
+        bool anyNeverOccupiedSuicide = false;
+        bool anyNeverOccupiedBanned = false;
+        for(int y = 0; y<board.y_size; y++) {
+          for(int x = 0; x<board.x_size; x++) {
+            Loc loc = Location::getLoc(x,y,board.x_size);
+            if(board.colors[loc] != C_EMPTY || hist.wasEverOccupiedOrPlayed[loc])
+              continue;
+            if(board.isSuicide(loc,hist.presumedNextMovePla))
+              anyNeverOccupiedSuicide = true;
+            if(hist.isSuperKoBanned(loc))
+              anyNeverOccupiedBanned = true;
+          }
+        }
+        if(anyNeverOccupiedSuicide)
+          stats.numWithNeverOccupiedSuicidePoint += 1;
+        if(anyNeverOccupiedBanned)
+          stats.numWithNeverOccupiedCandidateBanned += 1;
+      }
+      else {
+        for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
+          testAssert(!hist.isSuperKoBanned((Loc)i));
+      }
+    }
 
     stats.numPositionsChecked += 1;
     if(hist.getSuperKoBannedHash() != Hash128())
@@ -266,6 +381,51 @@ namespace {
         checkPosition(board,cleared,pla,drawEquivalentWinsForWhite,stats);
       }
 
+      //W4: change the Board behind the history's back, then make a move through the history and
+      //check W3 on the result. The history is handed a Board by its caller and has no hook into it,
+      //so a candidate set maintained at the history's own place/capture sites would be stale exactly
+      //here - and stale in the silent direction, permitting a move superko forbids.
+      if(rand.nextBool(0.05)) {
+        bool substituteAnEarlierBoard = rand.nextBool(0.5);
+        Board oobBoard = board;
+        BoardHistory oobHist = hist;
+        if(substituteAnEarlierBoard) {
+          //Not a mutation of the board at all: a different Board object entirely, one the history's
+          //marks were never computed against.
+          oobBoard = hist.getRecentBoard(rand.nextInt(1,3));
+        }
+        else {
+          //Stones appearing and disappearing at points the history was never told about, including
+          //points it has never seen a stone on.
+          vector<Move> placements;
+          int numPlacements = rand.nextInt(1,4);
+          for(int p = 0; p<numPlacements; p++) {
+            Loc loc = Location::getLoc(rand.nextInt(0,xSize-1),rand.nextInt(0,ySize-1),xSize);
+            int roll = rand.nextInt(0,2);
+            placements.push_back(Move(loc,roll == 0 ? C_EMPTY : roll == 1 ? P_BLACK : P_WHITE));
+          }
+          oobBoard.setStonesTolerant(placements);
+        }
+        //Any move that the BOARD accepts - the history's own legality is not the point here, and its
+        //superko marks are stale by construction at this instant.
+        Loc oobLoc = Board::PASS_LOC;
+        int startIdx = rand.nextInt(0,xSize*ySize-1);
+        for(int k = 0; k<xSize*ySize; k++) {
+          int idx = (startIdx + k) % (xSize*ySize);
+          Loc loc = Location::getLoc(idx % xSize,idx / xSize,xSize);
+          if(oobBoard.isLegal(loc,pla,rules.multiStoneSuicideLegal)) {
+            oobLoc = loc;
+            break;
+          }
+        }
+        oobHist.makeBoardMoveAssumeLegal(oobBoard,oobLoc,pla,NULL,true);
+        checkPosition(oobBoard,oobHist,getOpp(pla),drawEquivalentWinsForWhite,stats);
+        if(substituteAnEarlierBoard)
+          stats.numOutOfBandSubstitutedBoardChecks += 1;
+        else
+          stats.numOutOfBandScrambleChecks += 1;
+      }
+
       //The non-encore branch corrects for the case where the simple ko loc is itself superko-banned.
       //A history's own recompute always clears the ban at its own board's ko loc, so that case cannot
       //arise from play - it only arises because the function is static over an arbitrary (board,hist)
@@ -316,9 +476,14 @@ void Tests::runSuperKoBannedHashTests() {
   report("  in encore phase 2                ", stats.numInEncore2, 47000);
   report("  with a ko recapture block        ", stats.numWithKoRecapBlock, 5900);
   report("  constructed ko-loc-is-banned pairs", stats.numKoLocBannedPairsChecked, 360);
+  report("  compared against a full sweep    ", stats.numFullSweepComparisons, 83000);
+  report("  with a never-occupied suicide pt ", stats.numWithNeverOccupiedSuicidePoint, 15000);
+  report("  never-occupied point actually banned", stats.numWithNeverOccupiedCandidateBanned, 22);
+  report("  out-of-band board scrambles      ", stats.numOutOfBandScrambleChecks, 2300);
+  report("  out-of-band substituted boards   ", stats.numOutOfBandSubstitutedBoardChecks, 2350);
   //Not floored, and printed without one on purpose: this count is 0 by construction, because a
-  //history's own recompute always clears the ban at its own board's ko loc. The constructed pairs
-  //on the line above are what cover that branch instead.
+  //history's own recompute always clears the ban at its own board's ko loc. The constructed
+  //ko-loc-is-banned pairs counted above are what cover that branch instead.
   cout << "  with the ko loc itself banned    " << " " << stats.numWithKoLocAlsoBanned
        << " (0 by construction, not floored)" << endl;
 }

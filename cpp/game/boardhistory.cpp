@@ -931,28 +931,34 @@ void BoardHistory::makeBoardMoveAssumeLegal(Board& board, Loc moveLoc, Player mo
   if(moveLoc != Board::PASS_LOC)
     wasEverOccupiedOrPlayed[moveLoc] = true;
 
-  //Mark all locations that are superko-illegal for the next player, by iterating and testing each point.
+  //Mark all locations that are superko-illegal for the next player.
   Player nextPla = getOpp(movePla);
   if(encorePhase <= 0 && rules.koRule != Rules::KO_SIMPLE) {
     assert(koRecapBlockHash == Hash128());
-    for(int y = 0; y<board.y_size; y++) {
-      for(int x = 0; x<board.x_size; x++) {
-        Loc loc = Location::getLoc(x,y,board.x_size);
-        //Cannot be superko banned if it's not a pseudolegal move in the first place, or we would already ban the move under simple ko.
-        if(board.colors[loc] != C_EMPTY)
-          setSuperKoBanned(loc,false);
-        //Also cannot be superko banned if a stone was never there or played there before AND the move is not suicide, because that means
-        //the move results in a new stone there and if no stone was ever there in the past the it must be a new position.
-        else if(!wasEverOccupiedOrPlayed[loc] && !board.isSuicide(loc,nextPla))
-          setSuperKoBanned(loc,false);
-        else if(board.isIllegalSuicide(loc,nextPla,rules.multiStoneSuicideLegal) || loc == board.ko_loc)
-          setSuperKoBanned(loc,false);
-        else {
-          Hash128 posHashAfterMove = board.getPosHashAfterMove(loc,nextPla);
-          Hash128 koHashAfterMove = getKoHashAfterMoveNonEncore(rules, posHashAfterMove, getOpp(nextPla));
-          setSuperKoBanned(loc,koHashOccursInHistory(koHashAfterMove,rootKoHashTable));
-        }
-      }
+    //Every point starts unbanned, and only the candidates below can end up banned. The two cheap
+    //tests that used to clear the overwhelming majority of points one at a time - "not empty" and
+    //"never occupied or played AND not suicide" - are exactly what excludes a point from being a
+    //candidate, so running them per point is redundant with asking for the candidates at all. See
+    //superkocandidates.h: the candidate set is a superset of the bannable points, resynced against
+    //this very board before it is handed over, and the surviving tests below are unchanged.
+    clearSuperKoBanned();
+    Loc candidates[Board::MAX_ARR_SIZE];
+    int numCandidates = superKoCandidates.resync(board,wasEverOccupiedOrPlayed,candidates);
+    for(int i = 0; i<numCandidates; i++) {
+      Loc loc = candidates[i];
+      //The two surviving tests, in the order they had before, so that what is left of the sweep is a
+      //deletion from it rather than a rearrangement of it. A candidate is already known to be empty.
+      //Cannot be superko banned if a stone was never there or played there before AND the move is not
+      //suicide, because that means the move results in a new stone there and if no stone was ever
+      //there in the past then it must be a new position.
+      if(!wasEverOccupiedOrPlayed[loc] && !board.isSuicide(loc,nextPla))
+        continue;
+      if(board.isIllegalSuicide(loc,nextPla,rules.multiStoneSuicideLegal) || loc == board.ko_loc)
+        continue;
+      Hash128 posHashAfterMove = board.getPosHashAfterMove(loc,nextPla);
+      Hash128 koHashAfterMove = getKoHashAfterMoveNonEncore(rules, posHashAfterMove, getOpp(nextPla));
+      if(koHashOccursInHistory(koHashAfterMove,rootKoHashTable))
+        setSuperKoBanned(loc,true);
     }
   }
   else if(encorePhase > 0) {

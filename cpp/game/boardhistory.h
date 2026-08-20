@@ -5,6 +5,7 @@
 #include "../core/hash.h"
 #include "../game/board.h"
 #include "../game/rules.h"
+#include "../game/superkocandidates.h"
 
 struct KoHashTable;
 
@@ -86,6 +87,12 @@ private:
   //for that reason - a direct writer could desynchronize them.
   bool superKoBanned[Board::MAX_ARR_SIZE];
   Hash128 superKoBannedHash;
+  //The points the per-move sweep that recomputes superKoBanned still has to examine. Private for the
+  //same reason as the marks themselves, and owned by the same object as the marks it gates. It holds
+  //no invariant across moves that anyone has to maintain: see superkocandidates.h - every read of it
+  //resyncs it against the board first, so no place/capture site, here or in Board, has to know it
+  //exists.
+  SuperKoCandidates superKoCandidates;
 public:
   //Is the next player forbidden from playing at loc due to superko?
   bool isSuperKoBanned(Loc loc) const { return superKoBanned[loc]; }
