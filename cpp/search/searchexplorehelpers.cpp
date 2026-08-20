@@ -2,9 +2,9 @@
 
 #include <cstdint>
 #include <cstring>
-#include <limits>
 
 #include "../core/fancymath.h"
+#include "../search/policymaskedargmax.h"
 #include "../search/searchnode.h"
 
 //------------------------
@@ -13,16 +13,15 @@
 
 //Both reasons a policy position can be excluded from the new-child scan in
 //Search::selectBestChildToDescend - "a child already exists at this position" and "this position is
-//not a board point at all" - are recorded as the same all-bits-set word, because that scan only ever
-//asks whether a position is still a candidate, never why it is not. All-bits-set read as a signed
-//integer is -1, which is also exactly the sentinel sort key that loses to every real candidate there.
+//not a board point at all" - are recorded as the same word, because that scan only ever asks whether
+//a position is still a candidate, never why it is not.
 static constexpr int32_t NOT_A_NEW_CHILD_CANDIDATE = NNPosGeometry::OFF_BOARD_POS_MASK;
-//The two properties that scan actually relies on, stated where they can be checked rather than left
-//to be inferred from the value: OR-ing this word over any sort key must yield this word (so one OR
-//excludes a position outright), and it must lose to every candidate key (those are non-negative).
+//Two producers of that word - a geometry table and this file - and one consumer, which requires the
+//exact all-bits-set pattern rather than merely something nonzero. Checked here, once, rather than
+//left as a coincidence three files apart.
 static_assert(
-  (NOT_A_NEW_CHILD_CANDIDATE | 0x7FFFFFFF) == NOT_A_NEW_CHILD_CANDIDATE && NOT_A_NEW_CHILD_CANDIDATE < 0,
-  "The exclusion word must be all bits set, and must be negative so that every candidate sort key beats it"
+  NOT_A_NEW_CHILD_CANDIDATE == PolicyMaskedArgmax::EXCLUDED,
+  "The word this file marks a taken position with must be the word PolicyMaskedArgmax excludes on"
 );
 
 static double cpuctExploration(double totalChildWeight, const SearchParams& searchParams) {
@@ -598,6 +597,11 @@ void Search::selectBestChildToDescend(
         continue;
 
       Loc moveLoc = nnPosGeometry.posToLoc(movePos);
+      //Surviving the exclusion test above is what makes this a board point: the buffer was seeded
+      //with the geometry's not-a-board-point positions where this loop used to test moveLoc against
+      //NULL_LOC itself. Said here because the seeding is far away, and because a NULL_LOC reaching
+      //isAllowedRootMove or indexing avoidMoveUntilByLoc below would be silent, not a crash.
+      assert(moveLoc != Board::NULL_LOC);
 
       //Special logic for the root
       if(isRoot) {
@@ -624,60 +628,19 @@ void Search::selectBestChildToDescend(
     }
   }
   else {
-    //The steady state, and the loop this shape exists for. With none of the three filters above live,
-    //whether a policy position is a candidate is decided entirely by masks over the policy vector -
-    //a child already exists there, it is not a board point, its prob is negative (illegal) - so the
-    //scan is a masked argmax and nothing else. It is written here as branchless word-wise arithmetic
-    //rather than as a loop of conditional skips, because those skips are data-dependent and
-    //unpredictable (which positions already have children, and which moves are illegal, differ at
-    //every node) and were measured as the largest single branch-mispredict site in the process.
-    //Nothing below is architecture-specific and nothing is conditional on a build flag: the shape is
-    //chosen so that a compiler's own vectoriser can take the first loop, and so that the scalar code
-    //it falls back to where it cannot is still branch-free.
-    //
-    //A position's sort key is its policy prob's own IEEE-754 bit pattern read as a signed 32-bit
-    //integer. Over non-negative floats that reading is order-preserving and injective, so the largest
-    //key is the largest prob, and the FIRST index attaining the largest key is the first index
-    //attaining the largest prob - exactly the move the conditional loop above picks, ties included,
-    //since its strict greater-than never lets a later equal prob displace an earlier one. A position
-    //that is not a candidate takes the key NOT_A_NEW_CHILD_CANDIDATE, which is below every candidate
-    //key (those are >= 0) and equal to none of them, so it can neither win nor be mistaken for the
-    //winner. Two IEEE details are handled rather than assumed away:
-    //  - A negative zero prob IS a candidate for the conditional loop (-0.0f < 0 is false) and would
-    //    beat that loop's -1.0f starting value, yet its bit pattern read as an integer is INT32_MIN.
-    //    Adding +0.0f first normalises -0.0f to +0.0f, and is exact and value-preserving for every
-    //    other float.
-    //  - A NaN prob is likewise not skipped by the conditional loop, but can never win there either,
-    //    because every comparison against a NaN is false. Here it fails the prob >= 0.0f test and is
-    //    excluded outright, which reaches the same outcome: never selected, never recorded.
-    //The prob finally reported is re-read from policyProbs rather than carried through the key, so the
-    //exact bits the conditional loop would have reported are the bits that leave this function.
-    //The order-preserving reading of a float's bits as an integer is a fact about IEEE-754 binary32
-    //and two's-complement integers, not about C++ in general, so say so where a port would trip over
-    //it rather than leaving it to be discovered as a wrong move choice.
-    static_assert(
-      std::numeric_limits<float>::is_iec559 && sizeof(float) == sizeof(int32_t),
-      "The policy sort key reads a float's bits as an integer, which orders correctly only for IEEE-754 binary32"
-    );
+    //The steady state, and the case this shape exists for. With none of the three filters above
+    //live, whether a policy position is a candidate is decided entirely by masks over the policy
+    //vector - a child already exists there, it is not a board point, its prob is negative (illegal)
+    //- so the scan is a masked argmax and nothing else. PolicyMaskedArgmax is that operation: see
+    //its header for why it is branchless arithmetic rather than a loop of conditional skips, and
+    //for the tie-breaking, NaN and negative-zero cases it preserves. It is separated from this
+    //function so that a test can observe that it picks what the conditional loop above picks -
+    //Tests::runPolicyMaskedArgmaxTests does exactly that, over values no game position produces.
     int32_t policyKeyBuf[NNPos::MAX_NN_POLICY_SIZE];
-    int32_t bestPolicyKey = NOT_A_NEW_CHILD_CANDIDATE;
-    for(int movePos = 0; movePos<policySize; movePos++) {
-      float nnPolicyProb = policyProbs[movePos] + 0.0f;
-      int32_t policyKey;
-      static_assert(sizeof(policyKey) == sizeof(nnPolicyProb), "The policy sort key must be as wide as the prob whose bits it is");
-      std::memcpy(&policyKey,&nnPolicyProb,sizeof(policyKey));
-      policyKey |= posExcludedBuf[movePos] | -(int32_t)(nnPolicyProb >= 0.0f ? 0 : 1);
-      policyKeyBuf[movePos] = policyKey;
-      bestPolicyKey = policyKey > bestPolicyKey ? policyKey : bestPolicyKey;
-    }
-    if(bestPolicyKey != NOT_A_NEW_CHILD_CANDIDATE) {
-      int bestNewMovePos = 0;
-      while(bestNewMovePos < policySize && policyKeyBuf[bestNewMovePos] != bestPolicyKey)
-        bestNewMovePos += 1;
-      //bestPolicyKey came out of this buffer over this range, so it is in it. Reaching the end would
-      //mean the two loops disagreed about what they scanned, which is not a thing to paper over.
-      if(bestNewMovePos >= policySize)
-        throw StringError("Search::selectBestChildToDescend: the best policy key is absent from the buffer it was taken from");
+    int bestNewMovePos = PolicyMaskedArgmax::find(policySize,policyProbs,posExcludedBuf,policyKeyBuf);
+    if(bestNewMovePos != PolicyMaskedArgmax::NO_POS) {
+      //Re-read rather than carrying the prob through the argmax, so the exact bits the conditional
+      //loop would have reported are the bits that leave this function.
       bestNewNNPolicyProb = policyProbs[bestNewMovePos];
       bestNewMoveLoc = nnPosGeometry.posToLoc(bestNewMovePos);
     }

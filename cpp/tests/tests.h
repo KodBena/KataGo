@@ -46,6 +46,9 @@ namespace Tests {
   //testnnposgeometry.cpp
   void runNNPosGeometryTests();
 
+  //testpolicymaskedargmax.cpp
+  void runPolicyMaskedArgmaxTests();
+
   //testnninputs.cpp
   void runNNInputsV3V4Tests();
   void runExcludeTerritoryAtariNNInputsTests();
