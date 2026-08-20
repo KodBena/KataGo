@@ -1,11 +1,28 @@
 #include "../search/search.h"
 
+#include <cstdint>
+#include <cstring>
+
 #include "../core/fancymath.h"
 #include "../search/searchnode.h"
 
 //------------------------
 #include "../core/using.h"
 //------------------------
+
+//Both reasons a policy position can be excluded from the new-child scan in
+//Search::selectBestChildToDescend - "a child already exists at this position" and "this position is
+//not a board point at all" - are recorded as the same all-bits-set word, because that scan only ever
+//asks whether a position is still a candidate, never why it is not. All-bits-set read as a signed
+//integer is -1, which is also exactly the sentinel sort key that loses to every real candidate there.
+static constexpr int32_t NOT_A_NEW_CHILD_CANDIDATE = NNPosGeometry::OFF_BOARD_POS_MASK;
+//The two properties that scan actually relies on, stated where they can be checked rather than left
+//to be inferred from the value: OR-ing this word over any sort key must yield this word (so one OR
+//excludes a position outright), and it must lose to every candidate key (those are non-negative).
+static_assert(
+  (NOT_A_NEW_CHILD_CANDIDATE | 0x7FFFFFFF) == NOT_A_NEW_CHILD_CANDIDATE && NOT_A_NEW_CHILD_CANDIDATE < 0,
+  "The exclusion word must be all bits set, and must be negative so that every candidate sort key beats it"
+);
 
 static double cpuctExploration(double totalChildWeight, const SearchParams& searchParams) {
   return searchParams.cpuctExploration +
@@ -449,7 +466,13 @@ void Search::selectBestChildToDescend(
     parentUtility, parentWeightPerVisit, parentUtilityStdevFactor
   );
 
-  bool posesWithChildBuf[NNPos::MAX_NN_POLICY_SIZE] = { }; // Initialize all to false
+  //Which policy positions are not candidates for a new child: 0 while a position still is one,
+  //NOT_A_NEW_CHILD_CANDIDATE once it is not. Seeded with the positions that are not board points at
+  //all - a fact of the geometry, constant for the whole search - and then marked below as existing
+  //children are found. One word per position rather than one bool because the scan that reads it is
+  //word-wise arithmetic; see that scan for why it is.
+  int32_t posExcludedBuf[NNPos::MAX_NN_POLICY_SIZE];
+  std::memcpy(posExcludedBuf, nnPosGeometry.getOffBoardPosMaskTable(), sizeof(posExcludedBuf));
   bool antiMirror = searchParams.antiMirror && mirroringPla != C_EMPTY && isMirroringSinceSearchStart(thread.history,0);
 
   double exploreScaling;
@@ -493,7 +516,7 @@ void Search::selectBestChildToDescend(
       bestChildMoveLoc = moveLoc;
     }
 
-    posesWithChildBuf[getPos(moveLoc)] = true;
+    posExcludedBuf[getPos(moveLoc)] = NOT_A_NEW_CHILD_CANDIDATE;
   }
 
   const std::vector<int>& avoidMoveUntilByLoc = thread.pla == P_BLACK ? avoidMoveUntilByLocBlack : avoidMoveUntilByLocWhite;
@@ -505,7 +528,10 @@ void Search::selectBestChildToDescend(
     for(const auto& pair: node.evalCacheEntry->firstExploreEvals) {
       Loc moveLoc = pair.first;
       int movePos = getPos(moveLoc);
-      bool alreadyTried = posesWithChildBuf[movePos];
+      //Widened from "already tried" to "not a candidate", which over the indices this loop reads is
+      //the same set: movePos here is getPos of a real move Loc, and every such index maps back to that
+      //Loc, so the not-a-board-point entries the buffer also carries are never among them.
+      bool alreadyTried = posExcludedBuf[movePos] != 0;
       if(alreadyTried)
         continue;
 
@@ -556,41 +582,96 @@ void Search::selectBestChildToDescend(
   //A descent never resizes the board, so the geometry built for the root board is the geometry of
   //the board this thread is looking at. Checked here rather than assumed, at the site that relies on it.
   assert(nnPosGeometry.matchesBoardSize(thread.board));
-  for(int movePos = 0; movePos<getPolicySize(); movePos++) {
-    bool alreadyTried = posesWithChildBuf[movePos];
-    if(alreadyTried)
-      continue;
-
-    //Quit immediately for illegal moves
-    float nnPolicyProb = policyProbs[movePos];
-    if(nnPolicyProb < 0)
-      continue;
-
-    Loc moveLoc = nnPosGeometry.posToLoc(movePos);
-    if(moveLoc == Board::NULL_LOC)
-      continue;
-
-    //Special logic for the root
-    if(isRoot) {
-      assert(thread.board.pos_hash == rootBoard.pos_hash);
-      assert(thread.pla == rootPla);
-      if(!isAllowedRootMove(moveLoc))
+  const int policySize = getPolicySize();
+  if(isRoot || antiMirror || avoidMoveUntilByLoc.size() > 0) {
+    //At least one filter that is not a property of the policy vector is live: the root move filter and
+    //the avoid-move list reject moves for reasons the policy vector does not carry, and anti-mirror
+    //rewrites the very prob the comparison is made on. One conditional pass, one branch per rejection.
+    for(int movePos = 0; movePos<policySize; movePos++) {
+      if(posExcludedBuf[movePos] != 0)
         continue;
-    }
-    if(avoidMoveUntilByLoc.size() > 0) {
-      assert(avoidMoveUntilByLoc.size() >= Board::MAX_ARR_SIZE);
-      int untilDepth = avoidMoveUntilByLoc[moveLoc];
-      if(thread.history.moveHistory.size() - rootHistory.moveHistory.size() < untilDepth)
+
+      //Quit immediately for illegal moves
+      float nnPolicyProb = policyProbs[movePos];
+      if(nnPolicyProb < 0)
         continue;
-    }
 
-    if(antiMirror) {
-      maybeApplyAntiMirrorPolicy(nnPolicyProb, moveLoc, policyProbs, node.nextPla, &thread);
-    }
+      Loc moveLoc = nnPosGeometry.posToLoc(movePos);
 
-    if(nnPolicyProb > bestNewNNPolicyProb) {
-      bestNewNNPolicyProb = nnPolicyProb;
-      bestNewMoveLoc = moveLoc;
+      //Special logic for the root
+      if(isRoot) {
+        assert(thread.board.pos_hash == rootBoard.pos_hash);
+        assert(thread.pla == rootPla);
+        if(!isAllowedRootMove(moveLoc))
+          continue;
+      }
+      if(avoidMoveUntilByLoc.size() > 0) {
+        assert(avoidMoveUntilByLoc.size() >= Board::MAX_ARR_SIZE);
+        int untilDepth = avoidMoveUntilByLoc[moveLoc];
+        if(thread.history.moveHistory.size() - rootHistory.moveHistory.size() < untilDepth)
+          continue;
+      }
+
+      if(antiMirror) {
+        maybeApplyAntiMirrorPolicy(nnPolicyProb, moveLoc, policyProbs, node.nextPla, &thread);
+      }
+
+      if(nnPolicyProb > bestNewNNPolicyProb) {
+        bestNewNNPolicyProb = nnPolicyProb;
+        bestNewMoveLoc = moveLoc;
+      }
+    }
+  }
+  else {
+    //The steady state, and the loop this shape exists for. With none of the three filters above live,
+    //whether a policy position is a candidate is decided entirely by masks over the policy vector -
+    //a child already exists there, it is not a board point, its prob is negative (illegal) - so the
+    //scan is a masked argmax and nothing else. It is written here as branchless word-wise arithmetic
+    //rather than as a loop of conditional skips, because those skips are data-dependent and
+    //unpredictable (which positions already have children, and which moves are illegal, differ at
+    //every node) and were measured as the largest single branch-mispredict site in the process.
+    //Nothing below is architecture-specific and nothing is conditional on a build flag: the shape is
+    //chosen so that a compiler's own vectoriser can take the first loop, and so that the scalar code
+    //it falls back to where it cannot is still branch-free.
+    //
+    //A position's sort key is its policy prob's own IEEE-754 bit pattern read as a signed 32-bit
+    //integer. Over non-negative floats that reading is order-preserving and injective, so the largest
+    //key is the largest prob, and the FIRST index attaining the largest key is the first index
+    //attaining the largest prob - exactly the move the conditional loop above picks, ties included,
+    //since its strict greater-than never lets a later equal prob displace an earlier one. A position
+    //that is not a candidate takes the key NOT_A_NEW_CHILD_CANDIDATE, which is below every candidate
+    //key (those are >= 0) and equal to none of them, so it can neither win nor be mistaken for the
+    //winner. Two IEEE details are handled rather than assumed away:
+    //  - A negative zero prob IS a candidate for the conditional loop (-0.0f < 0 is false) and would
+    //    beat that loop's -1.0f starting value, yet its bit pattern read as an integer is INT32_MIN.
+    //    Adding +0.0f first normalises -0.0f to +0.0f, and is exact and value-preserving for every
+    //    other float.
+    //  - A NaN prob is likewise not skipped by the conditional loop, but can never win there either,
+    //    because every comparison against a NaN is false. Here it fails the prob >= 0.0f test and is
+    //    excluded outright, which reaches the same outcome: never selected, never recorded.
+    //The prob finally reported is re-read from policyProbs rather than carried through the key, so the
+    //exact bits the conditional loop would have reported are the bits that leave this function.
+    int32_t policyKeyBuf[NNPos::MAX_NN_POLICY_SIZE];
+    int32_t bestPolicyKey = NOT_A_NEW_CHILD_CANDIDATE;
+    for(int movePos = 0; movePos<policySize; movePos++) {
+      float nnPolicyProb = policyProbs[movePos] + 0.0f;
+      int32_t policyKey;
+      static_assert(sizeof(policyKey) == sizeof(nnPolicyProb), "The policy sort key must be as wide as the prob whose bits it is");
+      std::memcpy(&policyKey,&nnPolicyProb,sizeof(policyKey));
+      policyKey |= posExcludedBuf[movePos] | -(int32_t)(nnPolicyProb >= 0.0f ? 0 : 1);
+      policyKeyBuf[movePos] = policyKey;
+      bestPolicyKey = policyKey > bestPolicyKey ? policyKey : bestPolicyKey;
+    }
+    if(bestPolicyKey != NOT_A_NEW_CHILD_CANDIDATE) {
+      int bestNewMovePos = 0;
+      while(bestNewMovePos < policySize && policyKeyBuf[bestNewMovePos] != bestPolicyKey)
+        bestNewMovePos += 1;
+      //bestPolicyKey came out of this buffer over this range, so it is in it. Reaching the end would
+      //mean the two loops disagreed about what they scanned, which is not a thing to paper over.
+      if(bestNewMovePos >= policySize)
+        throw StringError("Search::selectBestChildToDescend: the best policy key is absent from the buffer it was taken from");
+      bestNewNNPolicyProb = policyProbs[bestNewMovePos];
+      bestNewMoveLoc = nnPosGeometry.posToLoc(bestNewMovePos);
     }
   }
   if(bestNewMoveLoc != Board::NULL_LOC) {

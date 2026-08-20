@@ -7,6 +7,7 @@
 #define NEURALNET_NNPOSGEOMETRY_H_
 
 #include <cassert>
+#include <cstdint>
 
 #include "../game/board.h"
 #include "../neuralnet/nninputs.h"
@@ -61,6 +62,18 @@ struct NNPosGeometry {
     return posToLocTable[pos];
   }
 
+  //A word-per-position restatement of "posToLoc(pos) == Board::NULL_LOC": OFF_BOARD_POS_MASK, which is
+  //-1, i.e. a word with every bit set, for a policy index that is not a board point (off the board
+  //within the neural net's extent, or past the end of the policy vector), and 0 for one that is. The
+  //same fact as posToLocTable, derived from it at construction rather than defined a second time, in
+  //the shape a whole-policy-vector scan can consume as arithmetic instead of a per-element branch - see
+  //the new-child scan in Search::selectBestChildToDescend, the one caller. The whole table is handed
+  //out rather than one entry because that scan wants every entry.
+  static constexpr int32_t OFF_BOARD_POS_MASK = -1;
+  inline const int32_t* getOffBoardPosMaskTable() const {
+    return offBoardPosMaskTable;
+  }
+
   //Whether this geometry is the one for this board and this extent - i.e. whether the cached
   //tables still describe the live geometry. False means some writer changed the geometry
   //without rebuilding, and every lookup after that point would be answering about a board that
@@ -89,6 +102,7 @@ private:
   int policySize;
 
   Loc posToLocTable[NNPos::MAX_NN_POLICY_SIZE];
+  int32_t offBoardPosMaskTable[NNPos::MAX_NN_POLICY_SIZE];
   int locToPosTable[Board::MAX_ARR_SIZE];
 };
 
