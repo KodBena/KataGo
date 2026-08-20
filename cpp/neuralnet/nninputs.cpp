@@ -1,6 +1,7 @@
 #include "../neuralnet/nninputs.h"
 
 #include "../core/test.h"
+#include "../game/lt9_census.h" //TEMPORARY -- LT-9 census scaffolding, inert unless KATAGO_LT9_CENSUS
 
 using namespace std;
 
@@ -822,6 +823,18 @@ static void iterLadders(const Board& board, int nnXLen, const std::function<void
   Board copy(board);
   vector<Loc> buf;
   vector<Loc> workingMoves;
+#ifdef KATAGO_LT9_CENSUS
+  //TEMPORARY -- LT-9 census scaffolding: iterLadders is always invoked exactly 3x per NN eval,
+  //in order (current board, prev board, prev-prev board -- see the fillRowV* callers), with no
+  //other caller anywhere in the tree, so a thread-local call counter mod 3 recovers the pass
+  //index without touching every call site's signature.
+  thread_local int t_lt9_iterLaddersCallCounter = 0;
+  int lt9_passIndex = t_lt9_iterLaddersCallCounter % 3;
+  t_lt9_iterLaddersCallCounter++;
+  vector<Loc> lt9_chainBuf;
+  vector<Loc> lt9_libBuf;
+  LT9_CENSUS_INSTALL_ATEXIT();
+#endif
 
   for(int y = 0; y<ySize; y++) {
     for(int x = 0; x<xSize; x++) {
@@ -844,6 +857,41 @@ static void iterLadders(const Board& board, int nnXLen, const std::function<void
             }
           }
           if(!alreadySolved) {
+#ifdef KATAGO_LT9_CENSUS
+            //Build the chain-content key BEFORE searching, from the chain's member locations
+            //(walked via the circular next_in_chain list) plus its liberty locations -- see
+            //lt9_census.h's recordLadderDispatch doc comment for what this key does and does
+            //not capture.
+            //findLiberties is private, so liberties are re-derived here directly (empty points
+            //adjacent to any chain member) rather than reusing it -- board.cpp's own FOREACHADJ
+            //macro is likewise TU-local, so the four adjacency offsets are inlined below,
+            //matching board.cpp's own definition (x_size-relative, standard rectangular grid).
+            lt9_chainBuf.clear();
+            {
+              Loc cur = head;
+              do {
+                lt9_chainBuf.push_back(cur);
+                cur = copy.next_in_chain[cur];
+              } while(cur != head);
+            }
+            lt9_libBuf.clear();
+            {
+              int xs = copy.x_size;
+              Loc adjOffsets[4] = { (Loc)(-(xs+1)), (Loc)(-1), (Loc)(1), (Loc)(xs+1) };
+              for(Loc member : lt9_chainBuf) {
+                for(int k = 0; k < 4; k++) {
+                  Loc adj = member + adjOffsets[k];
+                  if(copy.colors[adj] == C_EMPTY)
+                    lt9_libBuf.push_back(adj);
+                }
+              }
+            }
+            vector<int> lt9_keyLocs;
+            lt9_keyLocs.reserve(lt9_chainBuf.size() + lt9_libBuf.size());
+            for(Loc l : lt9_chainBuf) lt9_keyLocs.push_back((int)l);
+            for(Loc l : lt9_libBuf) lt9_keyLocs.push_back((int)l);
+            uint64_t lt9_key = lt9census::hashLocSet(lt9_keyLocs);
+#endif
             //Perform search on copy so as not to mess up tracking of solved heads
             bool laddered;
             if(libs == 1)
@@ -852,6 +900,9 @@ static void iterLadders(const Board& board, int nnXLen, const std::function<void
               workingMoves.clear();
               laddered = copy.searchIsLadderCapturedAttackerFirst2Libs(loc,buf,workingMoves);
             }
+#ifdef KATAGO_LT9_CENSUS
+            LT9_CENSUS_LADDER_DISPATCH(lt9_passIndex, lt9_key, LT9_CENSUS_TAKE_LADDER_EXPANSIONS());
+#endif
 
             chainHeadsSolved[numChainHeadsSolved] = head;
             chainHeadsSolvedValue[numChainHeadsSolved] = laddered;

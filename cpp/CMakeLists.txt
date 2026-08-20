@@ -608,6 +608,10 @@ else()
   set(_katago_auto_fetch_default OFF)
 endif()
 option(KATAGO_AUTO_FETCH_DEPS "Automatically fetch missing dependencies into <build dir>/deps (Windows/Linux use vcpkg)." ${_katago_auto_fetch_default})
+# TEMPORARY -- LT-9 ladder/area redundancy census scaffolding (audit-reports/exp-lt9-ladder-census.md).
+# Off by default; not intended to ship. Gates cpp/game/lt9_census.{h,cpp} and a handful of
+# #ifdef KATAGO_LT9_CENSUS call sites in cpp/game/board.cpp and cpp/neuralnet/nninputs.cpp.
+option(KATAGO_LT9_CENSUS "Build with temporary LT-9 ladder/area redundancy census instrumentation (see audit-reports/exp-lt9-ladder-census.md). Not for shipping builds." OFF)
 # Inside the build directory (NOT the source tree), so configure never writes into a checkout and
 # separate build directories can't race on a shared vcpkg clone. Override to a common location if
 # you want fetched deps shared across build dirs.
@@ -1015,6 +1019,7 @@ add_executable(katago
   game/boardhistory.cpp
   game/superkocandidates.cpp
   game/graphhash.cpp
+  game/lt9_census.cpp #TEMPORARY -- inert unless KATAGO_LT9_CENSUS is set; see the option() above
   dataio/sgf.cpp
   dataio/numpywrite.cpp
   dataio/poswriter.cpp
@@ -1116,6 +1121,10 @@ add_executable(katago
   command/writetrainingdata.cpp
   main.cpp
   )
+
+if(KATAGO_LT9_CENSUS)
+  target_compile_definitions(katago PRIVATE KATAGO_LT9_CENSUS)
+endif()
 
 if(USE_BACKEND STREQUAL "CUDA")
   target_compile_definitions(katago PRIVATE USE_CUDA_BACKEND)

@@ -14,6 +14,7 @@
 
 #include "../core/rand.h"
 #include "../core/test.h"
+#include "../game/lt9_census.h" //TEMPORARY -- LT-9 census scaffolding, inert unless KATAGO_LT9_CENSUS
 
 using namespace std;
 
@@ -1668,6 +1669,7 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
     if(stackIdx <= -1) {
       assert(stackIdx == -1);
       ko_loc = ko_loc_saved;
+      LT9_CENSUS_LADDER_EXPANSIONS((uint64_t)searchNodeCount);
       return returnValue;
     }
 
@@ -1682,6 +1684,7 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
         undo(records[stackIdx]);
         stackIdx -= 1;
       }
+      LT9_CENSUS_LADDER_EXPANSIONS((uint64_t)searchNodeCount);
       return false;
     }
 
@@ -2002,6 +2005,11 @@ void Board::calculateAreaForPla(
   //Returns the loc serving as the current tip node ("tailTarget") of the linked list.
 
   Loc buildRegionQueue[MAX_ARR_SIZE];
+#ifdef KATAGO_LT9_CENSUS
+  //TEMPORARY -- LT-9 census scaffolding: total region-BFS nodes processed by this
+  //calculateAreaForPla call, our "node expansion" work-unit analog for the area side.
+  uint64_t lt9_totalRegionQueueNodes = 0;
+#endif
 
   auto buildRegion = [
     pla,opp,isMultiStoneSuicideLegal,
@@ -2009,6 +2017,9 @@ void Board::calculateAreaForPla(
     &vitalForPlaHeadsLists,
     &vitalStart,&vitalLen,&numInternalSpacesMax2,&containsOpp,
     &buildRegionQueue,
+#ifdef KATAGO_LT9_CENSUS
+    &lt9_totalRegionQueueNodes,
+#endif
     this,
     &nextEmptyOrOpp](Loc initialLoc, int regionIdx) -> Loc {
 
@@ -2071,6 +2082,9 @@ void Board::calculateAreaForPla(
     }
 
     assert(buildRegionQueueTail < MAX_ARR_SIZE);
+#ifdef KATAGO_LT9_CENSUS
+    lt9_totalRegionQueueNodes += (uint64_t)buildRegionQueueTail;
+#endif
     return tailTarget;
   };
 
@@ -2241,6 +2255,9 @@ void Board::calculateAreaForPla(
       }
     }
   }
+
+  //TEMPORARY -- LT-9 census scaffolding.
+  LT9_CENSUS_AREA_CALL(pla == P_WHITE ? 1 : 0, pos_hash.hash0, pos_hash.hash1, lt9_totalRegionQueueNodes);
 }
 
 
