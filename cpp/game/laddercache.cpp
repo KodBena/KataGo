@@ -26,8 +26,7 @@ namespace {
 
   //Verification mode is a process-wide arming switch, read on the hit path. It is a relaxed
   //atomic rather than a plain bool because a test arms it from one thread and feature generation
-  //reads it from another.
-  //Verification arming. KATAGO_LADDER_CACHE_VERIFY=1 turns it on for a whole process without a
+  //reads it from another. KATAGO_LADDER_CACHE_VERIFY=1 turns it on for a whole process without a
   //patched binary, which is what lets the soundness re-check run against the SHIPPED mechanism
   //over a real corpus (ADR-0011 Rule 3's shipped-binding requirement). It changes cost only: with
   //it armed the search runs on hits too and its answer is compared against the cached one. No
@@ -41,6 +40,9 @@ namespace {
   //TEMPORARY -- LT-9 census totals; see laddercache.h.
   std::atomic<uint64_t> g_censusHits{0};
   std::atomic<uint64_t> g_censusMisses{0};
+  //How often the byte budget forced a wholesale store clear. A bound whose bite is never measured
+  //is a number nobody has checked, so this is counted rather than assumed.
+  std::atomic<uint64_t> g_censusBudgetClears{0};
 #endif
 
   uint64_t mixHash(uint64_t a, uint64_t b) {
@@ -167,9 +169,10 @@ std::optional<LadderAnswer> LadderCache::lookup(const Board& board, uint64_t buc
 }
 
 #ifdef KATAGO_LT9_CENSUS
-void LadderCache::censusTotals(uint64_t& hits, uint64_t& misses) {
+void LadderCache::censusTotals(uint64_t& hits, uint64_t& misses, uint64_t& budgetClears) {
   hits = g_censusHits.load(std::memory_order_relaxed);
   misses = g_censusMisses.load(std::memory_order_relaxed);
+  budgetClears = g_censusBudgetClears.load(std::memory_order_relaxed);
 }
 #endif
 
@@ -184,8 +187,12 @@ void LadderCache::insert(LadderReadSet&& readSet, const LadderAnswer& answer) {
   //the whole store is dropped rather than partially evicted: every entry is independently valid,
   //so dropping any subset costs hit rate and nothing else, and one wholesale drop keeps the
   //accounting exact instead of tracking per-entry sizes through evictions.
-  if(bytesUsed_ + readSet.heapBytes() > maxBytes_)
+  if(bytesUsed_ + readSet.heapBytes() > maxBytes_) {
+#ifdef KATAGO_LT9_CENSUS
+    g_censusBudgetClears.fetch_add(1, std::memory_order_relaxed);
+#endif
     clear();
+  }
 
   std::vector<Entry>& bucket = buckets_[readSet.bucketKey()];
   if(bucket.size() >= bucketCap_) {

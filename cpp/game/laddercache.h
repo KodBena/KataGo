@@ -194,7 +194,7 @@ public:
 #ifdef KATAGO_LT9_CENSUS
   //TEMPORARY -- process-wide totals across every per-thread cache, for the LT-9 census dump.
   //Behind the census's own default-OFF option because it costs a shared atomic on the hit path.
-  static void censusTotals(uint64_t& hits, uint64_t& misses);
+  static void censusTotals(uint64_t& hits, uint64_t& misses, uint64_t& budgetClears);
 #endif
   size_t numBuckets() const { return buckets_.size(); }
   void clear();

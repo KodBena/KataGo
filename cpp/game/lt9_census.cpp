@@ -231,10 +231,11 @@ void dumpAndReset() {
   //TEMPORARY -- the SHIPPED ladder memo's own hit/miss totals ride in the same dump block as the
   //chain-shape census numbers above, so the two are read off one identical run.
   {
-    uint64_t cacheHits = 0, cacheMisses = 0;
-    LadderCache::censusTotals(cacheHits, cacheMisses);
+    uint64_t cacheHits = 0, cacheMisses = 0, cacheBudgetClears = 0;
+    LadderCache::censusTotals(cacheHits, cacheMisses, cacheBudgetClears);
     std::fprintf(f, "laddercache.hits=%llu\n", (unsigned long long)cacheHits);
     std::fprintf(f, "laddercache.misses=%llu\n", (unsigned long long)cacheMisses);
+    std::fprintf(f, "laddercache.budgetClears=%llu\n", (unsigned long long)cacheBudgetClears);
   }
 
   std::fclose(f);
