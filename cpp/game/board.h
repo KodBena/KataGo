@@ -362,6 +362,20 @@ struct Board
   int findLibertyGainingCaptures(Loc loc, std::vector<Loc>& buf, int bufStart, int bufIdx) const;
   bool hasLibertyGainingCaptures(Loc loc) const;
 
+#ifdef KATAGO_LT9_CENSUS
+  //TEMPORARY -- LT-9 sound-ladder-cache-key instrumentation; see game/lt9_soundkey.h for the two
+  //closure rules these implement and the soundness argument that rests on them. Declared only
+  //under the census's default-OFF CMake option, so a normal build is unchanged. Both are const:
+  //they only READ the board, contributing points to the current dispatch's read set.
+  //lt9MarkChain(p): RULE-B at p -- chain(p) + adj(chain(p)), and the same closure for every
+  //  non-empty point in adj(chain(p)), because findLibertyGainingCaptures consults the liberty
+  //  count of EVERY adjacent opposing chain and walks the liberties of any in atari.
+  //lt9MarkMove(m): the composite for a point the search tests or plays -- m, adj(m), and
+  //  chain(a) + adj(chain(a)) for each non-empty a in adj(m).
+  void lt9MarkChain(Loc p) const;
+  void lt9MarkMove(Loc m) const;
+#endif
+
   void calculateAreaForPla(
     Player pla,
     bool safeBigTerritories,
