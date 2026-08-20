@@ -455,19 +455,32 @@ void Search::downweightBadChildrenAndNormalizeWeight(
 
   assert(numChildren <= NNPos::MAX_NN_POLICY_SIZE);
   double stdevs[NNPos::MAX_NN_POLICY_SIZE];
+
+  //Ensure some minimum variance for stability regardless of how we change the above formula
+  static const double minVariance = 0.00000001;
+
+  //Batched, order-independent: each stdevs[i] depends only on statsBuf[i].weightAdjusted, with no
+  //cross-element dependency, so this pass can be pulled out of the sequential summation below and
+  //given to the compiler as a tight, vectorizable elementwise loop. IEEE-754 sqrt is correctly
+  //rounded regardless of scalar or packed (vsqrtpd-style) execution, so every stdevs[i] is bit-exact
+  //with what the original interleaved loop computed.
+  for(int i = 0; i<numChildren; i++) {
+    if(statsBuf[i].stats.visits == 0)
+      continue;
+    double weight = statsBuf[i].weightAdjusted;
+    double precision = 1.5 * sqrt(weight);
+    stdevs[i] = sqrt(minVariance + 1.0 / precision);
+  }
+
+  //Kept as its own sequential pass, in the same iteration order as before: this is a running FP
+  //reduction (simpleValueSum), and reordering it would change rounding and move the output digest.
   double simpleValueSum = 0.0;
   for(int i = 0; i<numChildren; i++) {
     int64_t numVisits = statsBuf[i].stats.visits;
     assert(numVisits >= 0);
     if(numVisits == 0)
       continue;
-
     double weight = statsBuf[i].weightAdjusted;
-    double precision = 1.5 * sqrt(weight);
-
-    //Ensure some minimum variance for stability regardless of how we change the above formula
-    static const double minVariance = 0.00000001;
-    stdevs[i] = sqrt(minVariance + 1.0 / precision);
     simpleValueSum += statsBuf[i].selfUtility * weight;
   }
 
