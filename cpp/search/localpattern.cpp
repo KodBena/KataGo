@@ -76,8 +76,19 @@ Hash128 LocalPatternHasher::getHash(const Board& board, Loc loc, Player pla) con
         int x2 = dx + xCenter;
         int xy2 = y2 * xSize + x2;
         hash ^= zobristLocalPattern[(int)board.colors[loc2] * xSize * ySize + xy2];
-        if((board.colors[loc2] == P_BLACK || board.colors[loc2] == P_WHITE) && board.getNumLiberties(loc2) == 1)
-          hash ^= zobristAtari[xy2];
+        //Branchless atari test: loc2 is always on-board here (dxMin/dxMax/dyMin/dyMax above keep the
+        //window clamped within [0,x_size)x[0,y_size)), so calling getNumLiberties unconditionally is
+        //memory-safe even for empty points - its result is simply discarded by the mask when the point
+        //isn't a stone. isStone/isAtari are 0 or 1, so atariMask is all-0s or all-1s: bit-exact with the
+        //conditional XOR it replaces.
+        {
+          Color c2 = board.colors[loc2];
+          uint64_t isStone = (uint64_t)(c2 == P_BLACK || c2 == P_WHITE);
+          uint64_t isAtari = (uint64_t)(board.getNumLiberties(loc2) == 1);
+          uint64_t atariMask = -(isStone & isAtari);
+          hash.hash0 ^= (zobristAtari[xy2].hash0 & atariMask);
+          hash.hash1 ^= (zobristAtari[xy2].hash1 & atariMask);
+        }
       }
     }
   }
