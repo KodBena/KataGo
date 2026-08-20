@@ -97,15 +97,28 @@ double Search::getExploreSelectionValueInverse(
   return childWeight;
 }
 
-static void maybeApplyWideRootNoise(
+void Search::maybeApplyWideRootNoise(
   double& childUtility,
   float& nnPolicyProb,
-  const SearchParams& searchParams,
+  int movePos,
+  const float* policyProbs,
   SearchThread* thread,
   const SearchNode& parent
-) {
-  //For very large wideRootNoise, go ahead and also smooth out the policy
-  nnPolicyProb = (float)pow(nnPolicyProb, 1.0 / (4.0*searchParams.wideRootNoise + 1.0));
+) const {
+  //For very large wideRootNoise, go ahead and also smooth out the policy.
+  //pow(nnPolicyProb,1/(4*wideRootNoise+1)) depends only on this per-search-constant exponent and the
+  //root policy array - identical inputs give identical pow results - so it's precomputed once per
+  //search generation into wideRootNoiseAdjPolicyProbs (see maybeRecomputeExistingNNOutput) rather than
+  //recomputed on every descend. Use the cache when it's been published for this exact array; otherwise
+  //(the brief window before the elected thread publishes it) fall back to computing it directly here -
+  //both paths compute the identical formula over the identical inputs, so the result is byte-identical
+  //either way, and only the frequency of the fallback affects performance, never correctness.
+  if(wideRootNoiseAdjPolicyProbsSrc.load(std::memory_order_acquire) == policyProbs) {
+    nnPolicyProb = wideRootNoiseAdjPolicyProbs[movePos];
+  }
+  else {
+    nnPolicyProb = (float)pow(nnPolicyProb, 1.0 / (4.0*searchParams.wideRootNoise + 1.0));
+  }
   if(thread->rand.nextBool(0.5)) {
     double bonus = searchParams.wideRootNoise * std::fabs(thread->rand.nextGaussian());
     if(parent.nextPla == P_WHITE)
@@ -204,7 +217,7 @@ double Search::getExploreSelectionValueOfChild(
     }
 
     if(searchParams.wideRootNoise > 0.0 && nnPolicyProb >= 0) {
-      maybeApplyWideRootNoise(childUtility, nnPolicyProb, searchParams, thread, parent);
+      maybeApplyWideRootNoise(childUtility, nnPolicyProb, movePos, parentPolicyProbs, thread, parent);
     }
   }
   if(isDuringSearch && antiMirror && nnPolicyProb >= 0 && countEdgeVisit) {
@@ -218,6 +231,8 @@ double Search::getExploreSelectionValueOfChild(
 double Search::getNewExploreSelectionValue(
   const SearchNode& parent,
   double exploreScaling,
+  int movePos,
+  const float* policyProbs,
   float nnPolicyProb,
   double fpuValue,
   double parentWeightPerVisit,
@@ -238,7 +253,7 @@ double Search::getNewExploreSelectionValue(
         return FUTILE_VISITS_PRUNE_VALUE;
     }
     if(searchParams.wideRootNoise > 0.0) {
-      maybeApplyWideRootNoise(childUtility, nnPolicyProb, searchParams, thread, parent);
+      maybeApplyWideRootNoise(childUtility, nnPolicyProb, movePos, policyProbs, thread, parent);
     }
   }
   return getExploreSelectionValue(exploreScaling,nnPolicyProb,childWeight,childUtility,parent.nextPla);
@@ -562,6 +577,7 @@ void Search::selectBestChildToDescend(
       double selectionValue = getNewExploreSelectionValue(
         node,
         exploreScaling,
+        movePos,policyProbs,
         nnPolicyProb,cacheAvgUtility,
         parentWeightPerVisit,
         maxChildWeight,
@@ -649,6 +665,7 @@ void Search::selectBestChildToDescend(
     double selectionValue = getNewExploreSelectionValue(
       node,
       exploreScaling,
+      getPos(bestNewMoveLoc),policyProbs,
       bestNewNNPolicyProb,fpuValue,
       parentWeightPerVisit,
       maxChildWeight,

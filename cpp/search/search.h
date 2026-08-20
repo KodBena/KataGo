@@ -1,6 +1,7 @@
 #ifndef SEARCH_SEARCH_H_
 #define SEARCH_SEARCH_H_
 
+#include <atomic>
 #include <memory>
 #include <unordered_set>
 
@@ -174,6 +175,16 @@ struct Search {
   SearchNodeTable* nodeTable;
   MutexPool* mutexPool;
   SubtreeValueBiasTable* subtreeValueBiasTable;
+
+  //Root-only cache of pow(nnPolicyProb,1/(4*searchParams.wideRootNoise+1)) for the whole root policy
+  //array, keyed by the array pointer it was built from (see maybeApplyWideRootNoise). Rebuilt at most
+  //once per search generation, by the single thread that wins the nodeAge race in
+  //maybeRecomputeExistingNNOutput; the key is compared with acquire/release ordering so a reader either
+  //sees a fully-populated table or (rare: before the winner publishes it, or right after beginSearch
+  //resets the key) falls back to computing pow directly - both give the identical byte-for-byte result,
+  //so correctness never depends on which happens, only performance does.
+  std::vector<float> wideRootNoiseAdjPolicyProbs;
+  std::atomic<const float*> wideRootNoiseAdjPolicyProbsSrc;
 
   //Thread pool
   int numThreadsSpawned;
@@ -574,6 +585,14 @@ private:
   double getExploreScalingHuman(
     double totalChildWeight
   ) const;
+  void maybeApplyWideRootNoise(
+    double& childUtility,
+    float& nnPolicyProb,
+    int movePos,
+    const float* policyProbs,
+    SearchThread* thread,
+    const SearchNode& parent
+  ) const;
   double getExploreSelectionValue(
     double exploreScaling,
     double nnPolicyProb,
@@ -601,6 +620,8 @@ private:
   double getNewExploreSelectionValue(
     const SearchNode& parent,
     double exploreScaling,
+    int movePos,
+    const float* policyProbs,
     float nnPolicyProb,
     double fpuValue,
     double parentWeightPerVisit,
