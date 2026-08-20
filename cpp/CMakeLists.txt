@@ -1138,6 +1138,7 @@ add_executable(katago
   command/benchmark.cpp
   command/benchmarknn.cpp
   command/benchnncachepolicy.cpp
+  command/cachecompact.cpp
   command/chdvectordriver.cpp
   command/contribute.cpp
   command/dumponnx.cpp

@@ -133,6 +133,37 @@ partial tail is repaired by the next write, not by the read.
 A missing file is not an error. Attaching a context nothing has ever written gives you an empty level 0,
 which is a perfectly good thing to analyze against and then dump.
 
+### Compacting a context's files
+
+Both files are append-only, so a context that is dumped many times over a long study accumulates one
+block per dump even though most of those blocks re-state positions the file already holds. `cache_dump`
+already compacts each store on your behalf when it grows past about four times its live set of distinct
+keys (the `compacted` field in its response, above), so ordinary use is self-bounding and needs nothing
+further from you.
+
+For a context nobody is actively studying - end of day, before an archive copy, before shipping a
+prepared cache alongside a model - you can compact it directly from the shell instead of waiting for the
+next `cache_dump` to notice:
+
+```
+./katago nncachecompact -cache-dir /some/existing/directory -context card-5455 -model MODEL_FILE
+```
+
+This rewrites `<context>.nncounts` and `<context>.<model>.nnevals` down to one block each holding the
+merged live set, via the same `compactIfNeeded` the engine calls internally - `-multiple` sets the
+trigger (default 1, meaning "compact now, whenever there is anything to gain"; pass 4 to match the
+engine's own amortised default and only rewrite when an attached engine would have). It reports each
+store's size before and after and whether it actually rewrote the file; "nothing needed doing" is printed
+as its own outcome, not as success or failure.
+
+**This requires exclusive access to the context**, the same assumption `cache_dump`'s in-process
+compaction relies on: both file formats assume a single writer and neither has a lock file or a
+reader/writer protocol (see the WHY comments atop `neuralnet/nncachecountlog.h` and
+`neuralnet/nnevalcontainer.h`). Running `nncachecompact` against a context that any engine process
+currently has attached is unsafe - a rewrite landing underneath a live writer is exactly the interleaved,
+half-written file the append-only format's checksums exist to detect after the fact, not before it. Make
+sure nothing has the context attached before running it.
+
 ### The session shape
 
 ```

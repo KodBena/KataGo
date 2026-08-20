@@ -44,6 +44,9 @@ match : Run self-play match games based on a config, more efficient than gtp due
 version : Print version and exit.
 
 analysis : Runs an engine designed to analyze entire games in parallel.
+nncachecompact : Compact a persisted NN-cache context's on-disk files (its count log and its
+                 evaluation container) in place. Requires exclusive access -- do not run against
+                 a context an engine process has attached, see -help.
 tuner : (OpenCL only) Run tuning to find and optimize parameters that work on your GPU.
 
 ---Selfplay training subcommands---------
@@ -122,6 +125,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::runnncachebench(subArgs);
   else if(subcommand == "benchnncachepolicy")
     return MainCmds::benchnncachepolicy(subArgs);
+  else if(subcommand == "nncachecompact")
+    return MainCmds::nncachecompact(subArgs);
   // The cpp/spec/chd conformance driver. Deliberately absent from printHelp: it is an
   // instrument check_vectors.py drives, not an operator verb.
   else if(subcommand == "chdvectordriver")
