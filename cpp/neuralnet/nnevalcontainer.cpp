@@ -567,10 +567,30 @@ void walkBlockHeaderArray(
     );
 }
 
-// How much of a region this pass is willing to leave resident behind itself before it starts
+// How much of a region a scan is willing to leave resident behind itself before it starts
 // telling the kernel to forget it. See checksumRegion for why the drop happens INSIDE the
 // stream rather than once per block.
 const int64_t DROP_BEHIND_CHUNK_BYTES = 8 << 20;
+
+// WHETHER THE BLOCK VISITOR WILL READ THESE BYTES AGAIN after the checksum stream has passed
+// over them. It decides WHEN the pages are dropped, and getting it wrong is expensive in one
+// direction and unbounded in the other -- which is why it is a parameter each scan states
+// rather than one policy for all three.
+enum class BlockRegionReuse {
+  // The visitor reads no payload. The checksum stream is the only pass these bytes will ever
+  // get, so they are dropped AS THEY ARE CONSUMED and the resident footprint is bounded by
+  // DROP_BEHIND_CHUNK_BYTES whatever the block's size. This is the framing scan the write
+  // path takes every fifteen minutes and the key-set scan an attach takes, which are the two
+  // that meet a 10-20 GB card.
+  None,
+  // The visitor re-reads the region's payloads -- the full read, which decodes them. Dropping
+  // mid-stream would send it straight back to the device for bytes it is about to want, so
+  // the drop waits for the block to finish and the footprint is bounded by one block instead.
+  // That is a weaker bound, and it is the right one HERE: a full read holds every decoded
+  // entry in memory, so a container too large to keep one block resident was never going to
+  // survive this path anyway.
+  VisitorRereadsPayloads,
+};
 
 // Streams `regionBytes` bytes from `f`'s current position -- which the caller states as
 // `regionStartOffset`, since a drop-behind needs absolute offsets -- through a bounded
@@ -595,16 +615,19 @@ const int64_t DROP_BEHIND_CHUNK_BYTES = 8 << 20;
 bool checksumRegion(
   NNCacheFileHandle& f,
   int64_t regionStartOffset,
+  int64_t dropFromOffset,
   int64_t regionBytes,
   uint64_t seed,
+  BlockRegionReuse reuse,
   std::vector<uint8_t>& buf,
   uint64_t& ret,
   bool& readFailed
 ) {
   NNCacheFileChecksum sum(seed);
   buf.resize(STREAM_BUFFER_BYTES);
+  const bool dropAsConsumed = reuse == BlockRegionReuse::None;
   int64_t left = regionBytes;
-  int64_t consumedFrom = regionStartOffset;
+  int64_t consumedFrom = dropFromOffset;
   int64_t consumedTo = regionStartOffset;
   while(left > 0) {
     const size_t want = (size_t)std::min<int64_t>(left, (int64_t)buf.size());
@@ -615,7 +638,7 @@ bool checksumRegion(
     sum.update(buf.data(), want);
     left -= (int64_t)want;
     consumedTo += (int64_t)want;
-    if(consumedTo - consumedFrom >= DROP_BEHIND_CHUNK_BYTES) {
+    if(dropAsConsumed && consumedTo - consumedFrom >= DROP_BEHIND_CHUNK_BYTES) {
       f.dropCachedRange(consumedFrom, consumedTo - consumedFrom);
       consumedFrom = consumedTo;
     }
@@ -636,6 +659,7 @@ ScanResult scanContainer(
   uint64_t contextHash,
   const std::string& modelInternalName,
   int modelVersion,
+  BlockRegionReuse reuse,
   OnBlock onBlock
 ) {
   ScanResult result;
@@ -763,7 +787,12 @@ ScanResult scanContainer(
     const int64_t regionStart = offset + (int64_t)BLOCK_HEADER_BYTES;
     uint64_t actualChecksum = 0;
     bool readFailed = false;
-    if(!checksumRegion(f, regionStart, regionBytes, contextHash, streamBuffer, actualChecksum, readFailed)) {
+    // THE HEADER ARRAY IS EXEMPT FROM THE DROP even when the payloads are not, because the
+    // scan itself re-reads it two lines below: it sits at the start of the region, and
+    // dropping it as the stream passes over it would guarantee a re-fetch of every block's
+    // index on every scan. It is 32 bytes per entry against the payloads it indexes.
+    if(!checksumRegion(f, regionStart, regionStart + headersBytes, regionBytes, contextHash,
+                       reuse, streamBuffer, actualChecksum, readFailed)) {
       if(readFailed)
         throw StringError(
           "NNEvalContainer: could not read the entries of a block of " + path + " at offset " +
@@ -838,6 +867,8 @@ ScannedEntries scanEntries(
   std::vector<uint8_t> entryPayload;
   out.scan = scanContainer(
     path, context, contextHash, modelInternalName, modelVersion,
+    // The full read re-reads every payload to decode it, so the drop waits for the block.
+    BlockRegionReuse::VisitorRereadsPayloads,
     [&](std::FILE* f, const uint8_t* headerArray, uint32_t entryCount,
         int64_t /*headerArrayFileOffset*/, int64_t /*payloadRegionFileOffset*/, uint64_t totalPayloadBytes) {
       walkBlockHeaderArray(
@@ -897,6 +928,8 @@ ScanResult scanFraming(
 ) {
   return scanContainer(
     path, context, contextHash, modelInternalName, modelVersion,
+    // The framing scan reads no payload at all, so nothing it streams is ever wanted again.
+    BlockRegionReuse::None,
     [&](std::FILE* /*f*/, const uint8_t* headerArray, uint32_t entryCount,
         int64_t /*headerArrayFileOffset*/, int64_t /*payloadRegionFileOffset*/,
         uint64_t totalPayloadBytes) {
@@ -925,6 +958,8 @@ ScannedLocations scanLocations(
   KeyIndex indexOfKey;
   out.scan = scanContainer(
     path, context, contextHash, modelInternalName, modelVersion,
+    // The key-set scan reads no payload, so payload pages are dropped as they are consumed.
+    BlockRegionReuse::None,
     [&](std::FILE* /*f*/, const uint8_t* headerArray, uint32_t entryCount,
         int64_t headerArrayFileOffset, int64_t payloadRegionFileOffset, uint64_t totalPayloadBytes) {
       walkBlockHeaderArray(
