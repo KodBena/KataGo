@@ -262,18 +262,18 @@ void testEachContextsEarningsReachThatContextsCountLogAndNoOthers() {
 
   // Each key is PRESENTED once and then evaluated: observe() is the door a request goes
   // through, and the set beside it is what that request did with the result.
-  table->observe(earnedByA, NNCacheAttribution::toContext(cardA));
+  (void)table->present(earnedByA, NNCacheAttribution::toContext(cardA));
   table->set(outputFor(earnedByA), NNCacheAttribution::toContext(cardA));
-  table->observe(alsoEarnedByA, NNCacheAttribution::toContext(cardA));
+  (void)table->present(alsoEarnedByA, NNCacheAttribution::toContext(cardA));
   table->set(outputFor(alsoEarnedByA), NNCacheAttribution::toContext(cardA));
-  table->observe(earnedByB, NNCacheAttribution::toContext(cardB));
+  (void)table->present(earnedByB, NNCacheAttribution::toContext(cardB));
   table->set(outputFor(earnedByB), NNCacheAttribution::toContext(cardB));
 
   // Two more presentations of A's key, both answered from cache, so the count that lands in
   // A's file is a number and not a zero that any wiring would produce.
   shared_ptr<NNOutput> got;
   for(int again = 0; again < 2; again++) {
-    table->observe(earnedByA, NNCacheAttribution::toContext(cardA));
+    (void)table->present(earnedByA, NNCacheAttribution::toContext(cardA));
     testAssert(table->get(earnedByA, got));
   }
 
@@ -335,11 +335,11 @@ void testAnEntryWithNoAttributableContextIsCountedAndNotGuessedIntoOne() {
   const NNCacheContextResolution resolution =
     table->cacheContexts().resolveForRequest(std::optional<string>());
   testAssert(!resolution.attribution().value().isToContext());
-  table->observe(orphan, resolution.attribution().value());
+  (void)table->present(orphan, resolution.attribution().value());
   table->set(outputFor(orphan), resolution.attribution().value());
-  table->observe(secondOrphan, resolution.attribution().value());
+  (void)table->present(secondOrphan, resolution.attribution().value());
   table->set(outputFor(secondOrphan), resolution.attribution().value());
-  table->observe(attributed, NNCacheAttribution::toContext(cardA));
+  (void)table->present(attributed, NNCacheAttribution::toContext(cardA));
   table->set(outputFor(attributed), NNCacheAttribution::toContext(cardA));
 
   const NNCacheAttributionLedger ledger = table->harvestAttribution();
@@ -405,7 +405,7 @@ void testACacheWithNoAttachedContextIsExactlyWhatItWasBefore() {
 void testASingleLevelTableStillObservesUnderAContext() {
   unique_ptr<NNCacheTable> table = defaultLevelOne(10);
   const NNCacheContextId card = table->attachCacheContext("card-5455");
-  table->observe(nthKey(31), NNCacheAttribution::toContext(card));
+  (void)table->present(nthKey(31), NNCacheAttribution::toContext(card));
   table->set(outputFor(nthKey(31)), NNCacheAttribution::toContext(card));
 
   // The attribution IS recorded -- the earnings are known.

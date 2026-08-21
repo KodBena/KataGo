@@ -299,14 +299,14 @@ void Tests::runNNCacheTwoLevelBench() {
 
   // ARM D: WHAT OBSERVATION COUNTING COSTS ON THE PATH MCTS HAMMERS.
   //
-  // NNEvaluator::evaluate calls NNCacheTable::observe once per request, before any level is
+  // NNEvaluator::evaluate mints one NNCachePresentation per demand via NNCacheTable::present, before any level is
   // consulted, so the added cost sits on the same loop the arms above measure. Three states,
   // because they are three different costs and a single figure would hide the one that
   // matters most:
   //
   //   D0 NO CONTEXT EVER ATTACHED. The overwhelmingly common configuration -- plain katago
   //   play, no cache directory -- and the one the design is REQUIRED to leave
-  //   indistinguishable from baseline. observe() is inlined and the ledger pointer is null for
+  //   indistinguishable from baseline. present() is inlined and the ledger pointer is null for
   //   the life of the process, so what is being measured is one always-not-taken branch.
   //
   //   D1 A CONTEXT ATTACHED, THE REQUEST NAMING NONE. One more test and no work: an
@@ -316,7 +316,7 @@ void Tests::runNNCacheTwoLevelBench() {
   //   32-byte rows, one increment. This is what a study session actually pays.
   //
   // MEASURED AS A DIFFERENCE IN ONE PROCESS, INTERLEAVED REP BY REP against the same loop
-  // WITHOUT the observe call, over the same key stream, against the same table. That is a
+  // WITHOUT the mint, over the same key stream, against the same table. That is a
   // stronger protocol than an A/B across two builds for this particular quantity, and
   // deliberately so: a cross-build A/B of a few nanoseconds is exactly the shape a compiler
   // flag mismatch fakes, and this project has already been handed one fake 2x regression that
@@ -326,7 +326,7 @@ void Tests::runNNCacheTwoLevelBench() {
   // The baseline arm is measured FIRST in each rep and the observing arm SECOND, and then the
   // order is reversed on odd reps, so a warm-up asymmetry cannot be read as the effect.
   {
-    cout << "arm D: what NNCacheTable::observe costs per evaluation request, as a difference "
+    cout << "arm D: what NNCacheTable::present costs per evaluation request, as a difference "
          << "measured in one process against the same loop without it." << endl;
 
     // A plain single-level table: level 0 is irrelevant to this arm, and using one would put
@@ -354,7 +354,7 @@ void Tests::runNNCacheTwoLevelBench() {
         }
         else {
           for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
-            plain->observe(missQueries[(size_t)i], unattributed);
+            (void)plain->present(missQueries[(size_t)i], unattributed);
             if(plain->get(missQueries[(size_t)i], got)) found++;
           }
           obs = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
@@ -394,7 +394,7 @@ void Tests::runNNCacheTwoLevelBench() {
           }
           else {
             for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
-              plain->observe(missQueries[(size_t)i], *arms[arm]);
+              (void)plain->present(missQueries[(size_t)i], *arms[arm]);
               if(plain->get(missQueries[(size_t)i], got)) found++;
             }
             obs = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;

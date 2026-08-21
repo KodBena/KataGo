@@ -34,7 +34,30 @@ namespace {
 //-------------------------------------------------------------------------------------
 
 const char FILE_MAGIC[8] = {'K','G','C','N','T','L','O','G'};
-const uint32_t FORMAT_VERSION = 1;
+// VERSION 2 IS THE OBSERVATION CURRENCY, AND THE BUMP IS THE WHOLE MIGRATION.
+//
+// The bytes did not move: a record is the same 24 bytes at the same offsets as version 1. What
+// changed is WHAT THE NUMBER IN THEM MEANS -- version 1 counted RETRIEVALS (a hit on a key some
+// earlier dump had already stored), version 2 counts OBSERVATIONS (every presentation of the
+// position, hit or miss). The observation count is the larger of the two for every key that was
+// ever evaluated fresh.
+//
+// SO A VERSION-1 FILE IS REFUSED RATHER THAN READ, by the check verifyFileHeader already
+// carries. Read, it would be SUMMED additively with new blocks and handed to
+// NNCacheDiskAdmission::minObservations and NNCacheLevelZeroBound::minObservations as though it
+// were one currency -- a threshold silently met by a number that is part retrievals and part
+// observations. That is exactly the hazard the retired "minLookups" wire key is refused for
+// (analysiscacheactions.cpp): a key whose MEANING changed cannot be honoured compatibly. The
+// principle would be worth little applied at the JSON boundary, where a client gets an error
+// message, and not at the disk boundary, where the operator has real files and would get
+// nothing (audit finding F2).
+//
+// WHAT AN OPERATOR WITH VERSION-1 FILES DOES: delete the .nncounts and keep the .nnevals. The
+// evaluations are unaffected -- they are a different file in a different format -- and the
+// counts rebuild from the next session's traffic, which is what the cross-session bootstrap is
+// for. No migration is offered because none is possible: retrievals cannot be converted into
+// observations by any function of the retrievals.
+const uint32_t FORMAT_VERSION = 2;
 const size_t FILE_HEADER_BYTES = 32;
 const size_t BLOCK_HEADER_BYTES = 32;
 const size_t RECORD_BYTES = 24;
@@ -104,7 +127,18 @@ void verifyFileHeader(const uint8_t* hdr, const std::string& path, const std::st
   if(version != FORMAT_VERSION)
     throw StringError(
       "NNCacheCountLog: " + path + " is format version " + Global::uint64ToString(version) +
-      " and this build reads version " + Global::uint64ToString(FORMAT_VERSION) + " only."
+      " and this build reads version " + Global::uint64ToString(FORMAT_VERSION) + " only." +
+      (version == 1
+         ? std::string(
+             " Version 1 counted RETRIEVALS -- cache hits for a key an earlier dump had already "
+             "stored -- and version 2 counts OBSERVATIONS, every presentation of the position, "
+             "hit or miss. The bytes line up and the meaning does not, so reading it would sum "
+             "two different currencies into one threshold. There is no migration: retrievals "
+             "cannot be converted into observations. Delete this .nncounts and keep the "
+             ".nnevals beside it -- the evaluations are unaffected and the counts rebuild from "
+             "the next session's traffic."
+           )
+         : std::string())
     );
   const uint32_t headerBytes = get32(hdr + 12);
   if(headerBytes != (uint32_t)FILE_HEADER_BYTES)

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 
 using namespace std;
 
@@ -25,7 +26,8 @@ NNResultBuf::NNResultBuf()
     // If no symmetry is specified, it will use default or random based on config.
     symmetry(NNInputs::SYMMETRY_NOTSPECIFIED),
     policyOptimism(0.0),
-    cacheAttribution()
+    cacheAttribution(),
+    cachePresentationRole(NNCachePresentationRole::ThePresentation)
 {}
 
 NNResultBuf::~NNResultBuf() {
@@ -1155,11 +1157,19 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
   // symmetry rather than set once by the caller. All of these evaluations are the same query's,
   // earned by the same context, and every one of them sets an entry (skipCache is on).
   const NNCacheAttribution attributionForEverySymmetry = buf.cacheAttribution;
+  // AND THEY ARE ONE PRESENTATION, NOT numSymmetriesToSample OF THEM. Every iteration below
+  // computes the same cache key -- NNInputs::getHash does not fold in symmetry, which is
+  // exactly why skipCache is set -- so the position has COME UP ONCE and the count log must say
+  // once. The first iteration is the presentation and the rest serve it; without this the
+  // default seen-twice admission cleared itself in-session at numSymmetriesToSample >= 2. See
+  // NNCachePresentationRole (nncacheobservations.h) for the whole account.
   for(int i = 0; i<numSymmetriesToSample; i++) {
     std::swap(symmetryIndexes[i], symmetryIndexes[rand.nextInt(i,SymmetryHelpers::NUM_SYMMETRIES-1)]);
     nnInputParams.symmetry = symmetryIndexes[i];
     bool skipCacheThisIteration = true; // Skip cache since there's no guarantee which symmetry is in the cache
     buf.cacheAttribution = attributionForEverySymmetry;
+    buf.cachePresentationRole =
+      i == 0 ? NNCachePresentationRole::ThePresentation : NNCachePresentationRole::ServesACountedPresentation;
     evaluate(
       board, history, nextPlayer, sgfMeta,
       nnInputParams,
@@ -1215,6 +1225,13 @@ void NNEvaluator::evaluate(
   // a caller that supplies none is unattributed, which is counted and reported.
   const NNCacheAttribution cacheAttribution = buf.cacheAttribution;
   buf.cacheAttribution = NNCacheAttribution::noAttributableContext();
+  // THE PRESENTATION ROLE IS CONSUMED IN THE SAME BREATH, AND FOR A SHARPER VERSION OF THE SAME
+  // REASON. A stale tag files one query's earnings under the previous query's card; a stale
+  // role SILENTLY STOPS COUNTING a later, unrelated request, because its unsafe value is the
+  // sticky one. Taking it out of the buffer at entry makes that unrepresentable rather than
+  // something every fan-out caller has to remember to clear on its way out.
+  const NNCachePresentationRole presentationRole = buf.cachePresentationRole;
+  buf.cachePresentationRole = NNCachePresentationRole::ThePresentation;
 
   if(board.x_size > nnXLen || board.y_size > nnYLen)
     throw StringError("NNEvaluator was configured with nnXLen = " + Global::intToString(nnXLen) +
@@ -1257,13 +1274,40 @@ void NNEvaluator::evaluate(
   // BEFORE THE EARLY RETURN, deliberately: a hit is a presentation. This is the whole defect
   // the old retrieval currency had in the other direction, where a MISS was not one.
   //
-  // COST WHEN NOTHING IS ATTACHED: one predictable branch, inlined. See NNCacheTable::observe.
-  if(nnCacheTable != nullptr)
-    nnCacheTable->observe(nnHash, cacheAttribution);
+  // THE PRESENTATION IS MINTED HERE, and every cache interaction below is driven from it
+  // rather than from the bare hash -- which is what makes "this position was presented and not
+  // counted" unwritable on this path rather than merely unwritten.
+  //
+  // AND ONE evaluate() IS NOT ALWAYS ONE DEMAND, which is why WHICH mint is a decision and not
+  // an assumption. averageMultipleSymmetries re-enters this function once per symmetry for a
+  // single root query, and every one of those iterations computes the SAME nnHash --
+  // NNInputs::getHash does not fold in symmetry, which is precisely why that path passes
+  // skipCache. Counting each of them wrote N observations of one position for one query and
+  // cleared a seen-twice threshold inside the session that evaluated it. The operator has ruled
+  // that this is ONE demand (ledger row 1814); NNCachePresentationRole carries the whole
+  // account.
+  //
+  // COST WHEN NO CONTEXT IS ATTACHED: one predictable branch, inlined -- see
+  // NNCacheTable::present. The role test is a second predictable branch on a value that is
+  // ThePresentation for every ordinary path.
+  //
+  // A TABLELESS EVALUATOR (nnCacheSizePowerOfTwo negative) has no table to mint from, so the
+  // presentation is an optional here and every cache interaction below is already guarded by
+  // the same null test it always was. Dereferenced with * and not .value(): the optional is
+  // engaged under exactly the condition every use of it is already guarded by, and .value()
+  // would add a second check and a throw path to the loop MCTS hammers for a state that cannot
+  // occur.
+  std::optional<NNCachePresentation> presentation;
+  if(nnCacheTable != nullptr) {
+    presentation =
+      presentationRole == NNCachePresentationRole::ThePresentation
+        ? nnCacheTable->present(nnHash, cacheAttribution)
+        : nnCacheTable->presentAgainForSameRequest(nnHash);
+  }
 
   bool hadResultWithoutOwnerMap = false;
   shared_ptr<NNOutput> resultWithoutOwnerMap;
-  if(nnCacheTable != nullptr && !skipCache && nnCacheTable->get(nnHash,buf.result)) {
+  if(nnCacheTable != nullptr && !skipCache && nnCacheTable->get(*presentation, buf.result)) {
     if(!(includeOwnerMap && buf.result->whiteOwnerMap == NULL))
     {
       m_numCacheHits.fetch_add(1, std::memory_order_relaxed);
@@ -1623,7 +1667,9 @@ void NNEvaluator::evaluate(
   // that earned it -- which is the context the request named, carried here on the buffer.
   // With no context attached anywhere this is the same store it always was.
   buf.result->nnHash = nnHash;
+  // THROUGH THE PRESENTATION, so the store is of the position this call presented and the two
+  // cannot come apart: NNCacheTable::set refuses a payload whose hash is not the presented key.
   if(nnCacheTable != nullptr)
-    nnCacheTable->set(buf.result, cacheAttribution);
+    nnCacheTable->set(*presentation, buf.result, cacheAttribution);
 
 }

@@ -927,8 +927,44 @@ json cacheDumpExecute(
     // whose evaluations the admission predicate below will not write. That is deliberate and
     // it is what makes a seen-twice policy reachable at all: the count written now is what the
     // NEXT session adds to.
-    const NNCacheCountLogAppendResult appended =
-      log.appendDump(NNCacheObservationDelta::takeFor(eval.cacheTable(), record.contextId));
+    // THE TAKE IS HELD IN A NAMED LOCAL RATHER THAN NESTED INTO THE APPEND, AND THAT IS THE
+    // WHOLE OF THE FIX FOR A REAL LOSS WINDOW.
+    //
+    // Written as `appendDump(takeFor(...))` the take runs during argument evaluation, so every
+    // persisted mark has already advanced by the time appendDump takes its lock, scans for a
+    // torn tail, opens the file -- and throws on any of those. Those observations are then
+    // gone: there is no re-arm, hasUnpersistedObservationCountsFor reports false, and the next
+    // dump will not offer them again. The client saw an error and could not learn from it how
+    // much of its session that error cost.
+    //
+    // COUNTED AND REPORTED RATHER THAN RE-ARMED, and the choice is deliberate. Re-arming would
+    // mean pushing the taken rows back into the ledger after a failure -- a second, rarely
+    // exercised write path into an exact structure, running on the way out of an error, which
+    // is the recovery-path-that-is-never-tested shape ADR-0012 P5 declines. What a client can
+    // actually act on is the SIZE of the loss, and that is knowable without any new machinery:
+    // the delta is in hand, so the refusal says how many rows and how many observations went
+    // with it (ADR-0002 -- the loss is said, not silent). A client that cares re-runs the
+    // session; a client that does not at least knows what it dropped.
+    const NNCacheObservationDelta delta = NNCacheObservationDelta::takeFor(eval.cacheTable(), record.contextId);
+    NNCacheCountLogAppendResult appended;
+    try {
+      appended = log.appendDump(delta);
+    }
+    catch(const StringError& e) {
+      int64_t observationsLost = 0;
+      int64_t rowsLost = 0;
+      if(delta.ledger().isObserved()) {
+        rowsLost = (int64_t)delta.ledger().entries().size();
+        for(size_t i = 0; i < delta.ledger().entries().size(); i++)
+          observationsLost += (int64_t)delta.ledger().entries()[i].observations;
+      }
+      throw StringError(
+        string(e.what()) + " This dump had already taken the counts it was about to write, and "
+        "they are not re-armed: " + Global::int64ToString(rowsLost) + " key(s) carrying " +
+        Global::int64ToString(observationsLost) + " observation(s) of context \"" +
+        request.context + "\" are lost from the record. Nothing else about this context changed."
+      );
+    }
     const bool compacted = log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple());
     json counts;
     counts["bytesAppended"] = appended.bytesAppended;

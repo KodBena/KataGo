@@ -507,14 +507,17 @@ class NNCacheTable {
   // See nncacheobservations.h for what an observation IS and why the currency is this and
   // not retrievals. What belongs here is only the door and its cost.
 
-  // RECORDS ONE PRESENTATION of this position under `attribution`. Thread-safe, and NOT
-  // virtual: observing is the same act for every table shape, and no table shape has any say
-  // in it.
+  // MINTS THE PRESENTATION OF THIS POSITION, COUNTING IT. Thread-safe, and NOT virtual:
+  // presenting is the same act for every table shape, and no table shape has any say in it.
   //
-  // THE ONE DOOR, AND IT IS CALLED ONCE PER EVALUATION REQUEST -- by NNEvaluator::evaluate,
-  // immediately after the position's hash is final and before any level is consulted. Hit or
-  // miss, get or skipCache-set, one request is one observation; see nncacheobservations.h for
-  // the three reasons this is not folded into get() and set() instead.
+  // THE COUNTED ACT IS THE VALUE THIS RETURNS, and the request-path get() and set() below take
+  // one and nothing else -- so on that surface a position cannot be looked up or stored without
+  // having been counted, rather than the counting being a call a caller must remember to pair
+  // with them. See NNCachePresentation for what that replaced and why.
+  //
+  // CALLED ONCE PER DEMAND -- by NNEvaluator::evaluate, immediately after the position's hash
+  // is final and before any level is consulted. Hit or miss, get or skipCache-set, one demand
+  // is one observation.
   //
   // THE COST WHEN NOTHING IS ATTACHED IS ONE PREDICTABLE BRANCH. The ledger is allocated by
   // the first attachCacheContext and by nothing else, so plain play -- no cache directory, no
@@ -532,9 +535,51 @@ class NNCacheTable {
   // is null for the life of the process and a call that is never made. Out of line it would be
   // an unconditional call on the path MCTS hammers, which is a cost the default configuration
   // has no reason to pay for a feature it does not use (ADR-0009).
-  void observe(Hash128 nnHash, const NNCacheAttribution& attribution) {
+  [[nodiscard]] NNCachePresentation present(Hash128 nnHash, const NNCacheAttribution& attribution) {
     if(observations_ != nullptr)
       recordObservation(nnHash, attribution);
+    return NNCachePresentation(nnHash);
+  }
+
+  // THE SAME VALUE WITHOUT COUNTING, for an evaluation that SERVES a demand some earlier call
+  // already counted rather than being one.
+  //
+  // ITS ONLY CALLER IS A FAN-OUT, and there is exactly one today:
+  // NNEvaluator::averageMultipleSymmetries runs N forward passes of ONE key for one root query,
+  // and the operator has ruled that this is one demand and not N (ledger row 1814). The first
+  // iteration calls present(); every later one calls this. That choice is a line at the call
+  // site, which is the whole reason there are two named mints rather than one call with a bool:
+  // a future fan-out must WRITE which its evaluations are, where a reviewer can see it.
+  //
+  // It is not a hole in the counting. Reaching it requires already believing the demand was
+  // counted, and saying so by name, in a function that is fanning one request out.
+  [[nodiscard]] NNCachePresentation presentAgainForSameRequest(Hash128 nnHash) {
+    return NNCachePresentation(nnHash);
+  }
+
+  // THE REQUEST PATH'S LOOKUP AND STORE: they take a presentation and no other key.
+  //
+  // Non-virtual and inline. They forward to the virtuals below, which is where every table
+  // shape's real work is and which is unchanged -- so this costs the hot path nothing and
+  // changes no dispatch. What it buys is that the request path cannot express a lookup for a
+  // position it never presented.
+  bool get(const NNCachePresentation& presentation, std::shared_ptr<NNOutput>& ret) {
+    return get(presentation.key(), ret);
+  }
+  void set(
+    const NNCachePresentation& presentation,
+    const std::shared_ptr<NNOutput>& p,
+    const NNCacheAttribution& attribution
+  ) {
+    // The presentation and the payload must be of the same position, or the entry is filed
+    // under a key nobody asked about. Cheap, always-taken-the-same-way, and it catches the one
+    // way these two arguments can disagree (ADR-0002).
+    if(presentation.key() != p->nnHash)
+      throw StringError(
+        "NNCacheTable::set: the presentation and the evaluation are of different positions. "
+        "Storing this would file the evaluation under a key no request ever asked about."
+      );
+    set(p, attribution);
   }
 
   // Exactly the rows a dump of `context` appends: one per key this context has presented since

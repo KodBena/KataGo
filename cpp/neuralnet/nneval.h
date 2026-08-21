@@ -72,6 +72,19 @@ struct NNResultBuf {
   // where two independent facts are remembered by convention.
   NNCacheAttribution cacheAttribution;
 
+  // WHETHER THIS EVALUATION IS THE REQUEST, OR ONE OF SEVERAL SERVING ONE REQUEST.
+  //
+  // It rides this buffer for exactly the reason the tag above it does, and it is CONSUMED at
+  // the top of evaluate() in the same statement and against the same hazard: the buffer is
+  // reused for every evaluation a thread ever makes, so a role left standing would be spent by
+  // whichever evaluation came next -- and this one's unsafe value is the STICKY direction, so
+  // a stale ServesACountedPresentation would silently stop counting a later, unrelated request.
+  //
+  // Defaults to ThePresentation, which is what every caller that never heard of this leaves it
+  // as and what every ordinary path is. See NNCachePresentationRole for the defect that made it
+  // necessary and for what it deliberately does not foreclose.
+  NNCachePresentationRole cachePresentationRole;
+
   NNResultBuf();
   ~NNResultBuf();
   NNResultBuf(const NNResultBuf& other) = delete;

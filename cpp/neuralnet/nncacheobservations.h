@@ -13,9 +13,20 @@
 // admission gates on.
 //
 // WHAT AN OBSERVATION IS, IN ONE SENTENCE, because everything else here is a consequence of
-// it: one evaluation request for one position, under one context, counted once whether the
-// cache answered it or a forward pass had to. It is a WOULD-HAVE-BEEN-COMPUTED FORWARD PASS,
-// not a cache hit.
+// it: one DEMAND for one position, under one context, counted once whether the cache answered
+// it or a forward pass had to.
+//
+// A DEMAND, NOT A FORWARD PASS, and the distinction is the operator's own ruling (ledger row
+// 1814) rather than a reading chosen here. The two coincide almost everywhere and come apart on
+// exactly one shipped path: averageMultipleSymmetries runs N forward passes of ONE key for one
+// root query. Under "forward passes" that is N; under "demands" it is 1. The ruling is 1 --
+// one query asked about one position once, and the N passes are how the engine chose to answer
+// it -- because the number this log exists to feed is "how much work would carrying this
+// position save the NEXT session", and carrying it saves that query once however many passes it
+// was averaged over. In-search TRANSPOSITIONS are a different matter and remain separate
+// demands: each is a genuinely separate arrival at the position.
+//
+// It is emphatically not a CACHE HIT, which is what this log used to count; see below.
 //
 // WHY THE CURRENCY CHANGED, stated once here so no reader has to reconstruct it. The count
 // log used to record RETRIEVALS: a hit for a key some earlier dump had already stored. That
@@ -28,16 +39,20 @@
 // and the threshold is reachable. (Ledger rows 1651/1654 named the confusion; 1717/1722
 // ratified this currency.)
 //
-// WHERE AN OBSERVATION IS COUNTED, AND WHY THERE IS EXACTLY ONE DOOR. It is counted by
-// NNCacheTable::observe, called once per evaluation request by NNEvaluator::evaluate,
-// immediately after the position's hash is final and before any level is consulted. It is
-// deliberately NOT counted inside get() and set():
+// WHERE AN OBSERVATION IS COUNTED. At the MINT of an NNCachePresentation (see below) --
+// NNCacheTable::present -- which NNEvaluator::evaluate performs once, immediately after the
+// position's hash is final and before any level is consulted. The presentation is then the only
+// thing the request-path get and set will accept, so on that surface presenting a position and
+// counting it are one act rather than two that a caller must remember to pair.
+//
+// IT IS DELIBERATELY NOT COUNTED INSIDE get() AND set(), and the three reasons are worth
+// keeping because they are what the mint had to satisfy:
 //
 //   A REQUEST IS ONE PRESENTATION EVEN WHEN IT MAKES TWO CALLS. An ordinary miss makes a get
 //   and then a set of the evaluation it computed; the ownership-map fall-through in
 //   NNEvaluator::evaluate makes a get, rejects the hit, and sets a fuller result. Counting
 //   both calls would make one fresh evaluation read as two observations -- and the whole
-//   point of the currency is that ONE fresh evaluation is ONE observation, so that a second
+//   point of the currency is that ONE fresh demand is ONE observation, so that a second
 //   SESSION is what carries a key over a seen-twice threshold.
 //
 //   AND A REQUEST IS ONE PRESENTATION EVEN WHEN IT MAKES NO GET. A caller passing skipCache
@@ -47,7 +62,19 @@
 //   context's own container (NNCacheEntryProvenance::LoadedFromContainer); nobody asked for
 //   those positions. Counting them would make attach -> detach -> attach with no traffic
 //   raise every loaded key's count by one per cycle, when the ratified contract is that such
-//   a cycle is a tracking NO-OP.
+//   a cycle is a tracking NO-OP. Under the mint this one is foreclosed rather than avoided:
+//   that fill holds no presentation and cannot obtain one, because minting is the table's own
+//   act and the fill has nothing to present.
+//
+// WHAT THE FIRST VERSION OF THIS FILE GOT WRONG, kept here because the correction is the
+// reason the type exists. It counted in a single line inside evaluate() and asserted, in
+// capitals, "COUNTED HERE AND NOWHERE ELSE". An out-of-frame audit reproduced from the code
+// that this was already false: averageMultipleSymmetries re-enters evaluate() once per symmetry
+// for one root query, all N iterations compute the identical key, and each one counted. The
+// three arguments above were all correct and all insufficient -- they established that get/set
+// is the wrong seam, and stopped one step short of making the right seam unforgeable. That step
+// is NNCachePresentation, and the two named mints are where a fan-out now has to say which it
+// is (ledger row 1814 rules that answer: one demand).
 //
 // WHAT THIS STRUCTURE HOLDS IS THE UNPERSISTED DELTA, NOT THE LIFETIME TOTAL. The lifetime
 // total's one home is the context's .nncounts file, which is an additive log: a dump appends
@@ -64,24 +91,41 @@
 // that way). Ranges are across the three rounds, not error bars:
 //
 //   NO CONTEXT ATTACHED -- plain play, the overwhelmingly common configuration:
-//     +0.9 to +1.4 ns per evaluation request, against an ~10.8 ns lookup loop. That is the
+//     +0.4 to +0.5 ns per evaluation request, against an ~10.8 ns lookup loop. That is the
 //     inlined null test on a pointer that stays null for the life of the process, and it is
 //     the whole of what the default configuration pays.
-//   A CONTEXT ATTACHED, THE REQUEST NAMING NONE: +1.9 to +2.1 ns. One more test and no work.
-//   A CONTEXT ATTACHED AND NAMED: +64.6 to +67.7 ns. This is the real cost, and it is paid
+//   A CONTEXT ATTACHED, THE REQUEST NAMING NONE: +1.8 to +2.1 ns. One more test and no work.
+//   A CONTEXT ATTACHED AND NAMED: +53.9 to +56.7 ns. This is the real cost, and it is paid
 //     only by the deployment this feature exists for.
+//
+// THESE ARE THE POST-MINT FIGURES. An earlier revision counted through a bare
+// NNCacheTable::observe(hash, attribution) call and measured +0.9-1.4 / +1.9-2.1 / +64.6-67.7 on
+// the same three arms; introducing NNCachePresentation and routing get/set through it moved
+// nothing outside the run-to-run spread these arms already show. That is the expected result and
+// it is stated because it was not assumed: the presentation is a 16-byte move-only value the
+// compiler elides into the same register the hash was already in, and the request-path get/set
+// are inline forwards to the same virtuals.
 //
 // THE 65 ns IS ATTRIBUTED RATHER THAN LEFT AS A LUMP (arm D3, the recorder alone, same three
 // rounds): at a table size that fits in L2, with the same lock and the same probe length, one
-// observe costs 17.1-17.4 ns; at the production 2^20 rows it costs 29.3-30.7 ns. So roughly
-// 12-13 ns is the random access into 33.5 MB -- irreducible for an exact per-key count -- and
-// roughly 17 ns is the pooled mutex plus the mix and the compare. The ~35 ns between D3's 30
-// and arm D's 65 is the two loops evicting each other's lines, which is a property of a
-// measurement that runs them back to back and is reported rather than netted out.
+// observe costs 17.3-17.5 ns; at the production 2^20 rows it costs 35.5-36.8 ns. So roughly
+// 18-19 ns is the random access into 33.5 MB -- irreducible for an exact per-key count -- and
+// roughly 17 ns is the pooled mutex plus the mix and the compare.
+//
+// THE ~19 ns BETWEEN D3's 36 AND ARM D's 55 IS NOT ACCOUNTED FOR, AND THAT IS SAID RATHER THAN
+// EXPLAINED AWAY. The HYPOTHESIS is the two structures evicting each other's lines -- arm D
+// walks a cache table and the ledger in the same loop where D3 walks the ledger alone -- and it
+// is consistent with the gap's size. NOTHING MEASURED IT: no profiler was run, no cache-miss
+// count was ever observed, and no arm isolates it. The same posture nncachetwolevel.h already
+// takes for its own 5 ns ("the effect is measured; the explanation below is not"), for the same
+// reason: an explanation stated with the confidence of a measurement is the thing a later
+// reader acts on without re-checking. The arm that would settle it runs the two loops against
+// deliberately disjoint memory and compares; anyone acting on the hypothesis should build it
+// first.
 //
 // WHY IT IS PAID RATHER THAN ENGINEERED AWAY, and what would change that. It buys the whole
-// mechanism: 65 ns against the 2.4-2.8 ms forward pass a carried position avoids, which is a
-// ratio of about 1:40,000. The ~17 ns of lock IS removable, by a lock-free row protocol -- a
+// mechanism: 55 ns against the 2.4-2.8 ms forward pass a carried position avoids, which is a
+// ratio of about 1:45,000. The ~17 ns of lock IS removable, by a lock-free row protocol -- a
 // 32-bit tag word claimed by CAS, published release/acquire after the key and the context
 // index are written, with the count an atomic. THE REASON IT IS FILED AND NOT BUILT is not the
 // arithmetic: it is that this structure must be EXACT and its consuming take
@@ -97,6 +141,100 @@
 // observation that cannot be given a row is REFUSED and counted in unrecordedObservations()
 // rather than overwriting somebody else's row (ADR-0002). The same posture the attribution
 // recorder and the two-level hit ledger already carry, for the same reason.
+
+//-------------------------------------------------------------------------------------
+// The presentation itself, as a value
+//-------------------------------------------------------------------------------------
+
+// ONE POSITION, PRESENTED ONCE, AS A VALUE THAT HAS ALREADY BEEN COUNTED.
+//
+// WHY THE COUNTED ACT IS A VALUE AND NOT A CALL. The first version of this file counted in a
+// single line inside NNEvaluator::evaluate and asserted, in capitals, that this was "the one
+// door". An out-of-frame audit found the assertion already false in shipped code -- see
+// NNCachePresentationRole below for the defect -- and the reason it could be false is that
+// nothing but prose held the door. A counted call is a convention every future presenting path
+// must be told about; a counted VALUE is one the compiler asks for. The request-path
+// NNCacheTable::get and NNCacheTable::set take one of these and nothing else, so "present a
+// position without counting it" is not an expression on that surface (ADR-0000 Rule 2a).
+//
+// MOVE-ONLY, so one presentation cannot be silently duplicated into two. It is minted by
+// exactly two NNCacheTable calls and by nothing else -- present(), which counts, and
+// presentAgainForSameRequest(), which does not -- and having two named mints is the point: a
+// caller that fans one request out over several evaluations has to WRITE which one each of them
+// is, at the call site, in a line a reviewer can see (NNEvaluator::averageMultipleSymmetries is
+// the only such caller today).
+//
+// WHAT IT DOES NOT CLOSE, stated rather than left for the next audit. The raw
+// NNCacheTable::get(Hash128, ...) / set(shared_ptr) virtuals remain public: they are how the
+// decorator shapes compose one another (nncacheadmission.cpp, nncachetrace.cpp, and the
+// two-level table's calls into level 1) and how ~144 test call sites drive the tables directly.
+// A request-path caller could still reach them -- but only by re-deriving a bare Hash128 it has
+// no other reason to hold, which is the "wrong word written at the call site" standard this
+// codebase already accepts for NNCacheObservationDelta::ofDeltaRows. Closing it outright means
+// a composition permit threaded through every table shape and a test seam for the 144 sites,
+// which is a hot-path signature change and is filed rather than done here.
+class NNCachePresentation {
+ public:
+  NNCachePresentation(NNCachePresentation&&) noexcept = default;
+  NNCachePresentation& operator=(NNCachePresentation&&) noexcept = default;
+  NNCachePresentation(const NNCachePresentation&) = delete;
+  NNCachePresentation& operator=(const NNCachePresentation&) = delete;
+
+  // The position this presentation is of. Handing out the key is not a hole: what the type
+  // protects is the ACT of presenting, and a caller holding this has already performed it.
+  [[nodiscard]] Hash128 key() const { return key_; }
+
+ private:
+  friend class NNCacheTable;
+  explicit NNCachePresentation(Hash128 key) : key_(key) {}
+  Hash128 key_;
+};
+
+//-------------------------------------------------------------------------------------
+// Whether an evaluation IS the presentation, or only serves one
+//-------------------------------------------------------------------------------------
+
+// A CLOSED TWO-CASE DISPOSITION, because "one request is one observation" is a claim about
+// REQUESTS and NNEvaluator::evaluate is not always one.
+//
+// THE DEFECT THIS TYPE EXISTS FOR, found by an out-of-frame audit of the first version of this
+// file and reproduced from the code rather than argued: NNEvaluator::averageMultipleSymmetries
+// re-enters evaluate() once PER SYMMETRY for a single root query, with skipCache on and with
+// the same cache attribution deliberately re-supplied each time. NNInputs::getHash folds in
+// board, rules, komi and the search-shape flags and NOT symmetry -- which is exactly WHY that
+// path passes skipCache, since the cache cannot tell the symmetries apart -- so all N
+// iterations present the IDENTICAL key. Counting each one made a single root visit at
+// rootNumSymmetriesToSample = 8 write eight observations of one position in one session, which
+// clears the default minObservations(2) threshold inside the very session that evaluated it:
+// verbatim the outcome this file says the currency exists to prevent. The old retrieval
+// currency was accidentally immune (skipCache means no get(), so no retrieval), so the
+// inflation was introduced by the currency change and by nothing before it.
+//
+// WHY THIS AND NOT A BOOL, and why not "just don't count skipCache". A bool on the buffer would
+// be a second fact remembered by convention with no name; and a skipCache-shaped rule would be
+// wrong in the other direction, because a lone skipCache caller IS a presentation and must
+// count. The distinction is not about the cache at all -- it is about whether this evaluation
+// is the request or is one of several serving one request -- and only the caller that fans out
+// knows, so only that caller can say.
+//
+// WHAT IT DOES NOT CLOSE, named rather than left for the next audit to find. The safe case is
+// the DEFAULT, so a future fan-out path that forgets to say so over-counts rather than
+// under-counts -- loud in the file, but wrong. The construction that would foreclose the class
+// outright is a move-only presentation VALUE minted where the hash is computed and required by
+// type to reach get()/set(), so that a fan-out has to decide explicitly whether its N
+// evaluations are one presentation or N. That is the fix this type stops one step short of; it
+// is not built here because it changes the signature of evaluate() at the fifteen call sites
+// NNResultBuf::cacheAttribution's own comment enumerates, for no behavioural change at any of
+// them. REVISIT the moment a second fan-out path exists: two callers with the same obligation
+// and no compiler holding them to it is where this stops being adequate.
+enum class NNCachePresentationRole {
+  // This evaluation IS the request. The default, and what every ordinary path is.
+  ThePresentation,
+  // This evaluation is one of several the caller is running for ONE request, and that request
+  // has already been counted. Set by NNEvaluator::averageMultipleSymmetries for every iteration
+  // after its first, and by nothing else today.
+  ServesACountedPresentation,
+};
 
 //-------------------------------------------------------------------------------------
 // The values

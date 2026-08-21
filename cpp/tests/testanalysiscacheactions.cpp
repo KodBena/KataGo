@@ -520,12 +520,12 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
   const NNCacheContextId contextId = attachments.attachmentFor(model, CONTEXT).contextId;
   const NNCacheAttribution attribution = NNCacheAttribution::toContext(contextId);
   for(int serial = 1; serial <= 3; serial++) {
-    eval.cacheTable().observe(nthKey(serial), attribution);
+    (void)eval.cacheTable().present(nthKey(serial), attribution);
     eval.cacheTable().set(makeOutput(serial, serial == 2), attribution);
   }
   shared_ptr<NNOutput> got;
   for(int again = 0; again < 2; again++) {
-    eval.cacheTable().observe(nthKey(1), attribution);
+    (void)eval.cacheTable().present(nthKey(1), attribution);
     testAssert(eval.cacheTable().get(nthKey(1), got));
   }
 
@@ -761,10 +761,10 @@ void testCountsAreDumpedPerContextWithTwoContextsAttached(RealEngineCache& engin
   // the only one of the two with anything to write.
   shared_ptr<NNOutput> got;
   for(int again = 0; again < 2; again++) {
-    eval.cacheTable().observe(nthKey(401), NNCacheAttribution::toContext(idA));
+    (void)eval.cacheTable().present(nthKey(401), NNCacheAttribution::toContext(idA));
     testAssert(eval.cacheTable().get(nthKey(401), got));
   }
-  eval.cacheTable().observe(nthKey(451), NNCacheAttribution::toContext(idB));
+  (void)eval.cacheTable().present(nthKey(451), NNCacheAttribution::toContext(idB));
   eval.cacheTable().set(makeOutput(451, false), NNCacheAttribution::toContext(idB));
 
   // A'S DUMP, with B attached. It writes A's observations...
@@ -860,7 +860,7 @@ void testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(RealEngineCache& engine
   const int prewarmedSerials[3] = {501, 501, 502};
   shared_ptr<NNOutput> unused;
   for(int i = 0; i < 3; i++) {
-    eval.cacheTable().observe(nthKey(prewarmedSerials[i]), NNCacheAttribution::toContext(prewarmedId));
+    (void)eval.cacheTable().present(nthKey(prewarmedSerials[i]), NNCacheAttribution::toContext(prewarmedId));
     testAssert(eval.cacheTable().get(nthKey(prewarmedSerials[i]), got));
   }
   (void)unused;
@@ -899,7 +899,7 @@ void testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(RealEngineCache& engine
   (void)cacheAttachExecute(*engine.hosts, model, attachments, attachAll(card));
   const NNCacheContextId secondId = attachments.attachmentFor(model, card).contextId;
   for(int i = 0; i < 3; i++) {
-    eval.cacheTable().observe(nthKey(prewarmedSerials[i]), NNCacheAttribution::toContext(secondId));
+    (void)eval.cacheTable().present(nthKey(prewarmedSerials[i]), NNCacheAttribution::toContext(secondId));
     testAssert(eval.cacheTable().get(nthKey(prewarmedSerials[i]), got));
   }
   testAssert(eval.cacheTable().unpersistedKeysFor(secondId).empty());          // still silent
@@ -1039,17 +1039,17 @@ void testCacheStatsReportsObservationsAndTheyDifferFromRetrievals() {
   shared_ptr<NNOutput> got;
   // The two requests that evaluated: one presentation each, and the set that followed is not a
   // second one -- see nncacheobservations.h for why the door is per request.
-  table.observe(nthKey(401), attribution);
+  (void)table.present(nthKey(401), attribution);
   table.set(makeOutput(401, false), attribution);
-  table.observe(nthKey(402), attribution);
+  (void)table.present(nthKey(402), attribution);
   table.set(makeOutput(402, false), attribution);
   // The requests that hit.
   for(int i = 0; i < 3; i++) {
-    table.observe(nthKey(401), attribution);
+    (void)table.present(nthKey(401), attribution);
     testAssert(table.get(nthKey(401), got));
   }
   for(int i = 0; i < 2; i++) {
-    table.observe(nthKey(402), attribution);
+    (void)table.present(nthKey(402), attribution);
     testAssert(table.get(nthKey(402), got));
   }
 
