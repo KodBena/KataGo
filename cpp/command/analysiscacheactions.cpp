@@ -154,6 +154,8 @@ std::string cacheSwapConcurrencyRefusal(const std::string& action, int64_t openR
 //
 // The refusal names the new key and states the change, so a client reading it can act without
 // consulting anything else. It is a boundary teaching surface, not a deprecation shim.
+namespace {
+
 const char* const RETIRED_LOOKUPS_KEY = "minLookups";
 
 // WHAT AN ABSENT cache_dump "admission" MEANS, as one number with one home so the decoder,
@@ -173,6 +175,8 @@ string retiredLookupsKeyRefusal(const string& where) {
     "evaluated fresh now counts higher, so accepting this key as an alias would admit strictly "
     "more to disk than you asked for and no response field would say so.";
 }
+
+}  // namespace
 
 CacheActionDecode<CacheAttachRequest> decodeCacheAttach(const json& request) {
   const std::optional<string> unexpected = firstUnexpectedKey(request, cacheAttachRequestKeys());
@@ -1056,7 +1060,10 @@ json cacheStatsExecute(
         contextTotal += (int64_t)contextObservations.entries()[j].observations;
       context["observedKeys"] = (int64_t)contextObservations.entries().size();
       context["observationsThisSession"] = contextTotal;
-      context["unpersistedObservations"] =
+      // A BOOLEAN, AND NAMED AS ONE. It is the same question cache_detach's refusal asks, asked
+      // without consuming the answer; a name that read as a count would invite a client to
+      // compare it against observedKeys, which it is not (ADR-0012 P11).
+      context["hasUnpersistedObservations"] =
         eval.cacheTable().hasUnpersistedObservationCountsFor(record.contextId);
     }
     json sources = json::array();

@@ -58,28 +58,30 @@
 // structure ever holding a number it did not itself count.
 //
 // WHAT IT COSTS, MEASURED, AND WHERE THE COST GOES. runnncachetwolevelbench's arm D, on this
-// box, minima of 11 interleaved rep-pairs of 1e6 requests each, both arms in one process
-// against the same table and the same key stream (so no cross-build flag mismatch can enter
-// the difference -- this project has been handed one fake 2x regression that way):
+// box: three rounds, each the minimum of 11 interleaved rep-pairs of 1e6 requests, both arms
+// in one process against the same table and the same key stream (so no cross-build flag
+// mismatch can enter the difference -- this project has been handed one fake 2x regression
+// that way). Ranges are across the three rounds, not error bars:
 //
 //   NO CONTEXT ATTACHED -- plain play, the overwhelmingly common configuration:
-//     +1.1 ns per evaluation request, against an 11 ns lookup loop. That is the inlined null
-//     test on a pointer that stays null for the life of the process, and it is the whole of
-//     what the default configuration pays.
-//   A CONTEXT ATTACHED, THE REQUEST NAMING NONE: +2.0 ns. One more test and no work.
-//   A CONTEXT ATTACHED AND NAMED: +54.9 ns. This is the real cost, and it is paid only by the
-//     deployment this feature exists for.
+//     +0.9 to +1.4 ns per evaluation request, against an ~10.8 ns lookup loop. That is the
+//     inlined null test on a pointer that stays null for the life of the process, and it is
+//     the whole of what the default configuration pays.
+//   A CONTEXT ATTACHED, THE REQUEST NAMING NONE: +1.9 to +2.1 ns. One more test and no work.
+//   A CONTEXT ATTACHED AND NAMED: +64.6 to +67.7 ns. This is the real cost, and it is paid
+//     only by the deployment this feature exists for.
 //
-// THE 54.9 ns IS ATTRIBUTED RATHER THAN LEFT AS A LUMP (arm D3, the recorder alone): at a table
-// size that fits in L2, with the same lock and the same probe length, one observe costs 18.6
-// ns; at the production 2^20 rows it costs 37.3 ns. So roughly 19 ns is the random access into
-// 33.5 MB -- irreducible for an exact per-key count -- and roughly 19 ns is the pooled mutex
-// plus the mix and the compare. The remainder of arm D's figure is the two loops competing for
-// cache, which is a property of the measurement, not of the structure.
+// THE 65 ns IS ATTRIBUTED RATHER THAN LEFT AS A LUMP (arm D3, the recorder alone, same three
+// rounds): at a table size that fits in L2, with the same lock and the same probe length, one
+// observe costs 17.1-17.4 ns; at the production 2^20 rows it costs 29.3-30.7 ns. So roughly
+// 12-13 ns is the random access into 33.5 MB -- irreducible for an exact per-key count -- and
+// roughly 17 ns is the pooled mutex plus the mix and the compare. The ~35 ns between D3's 30
+// and arm D's 65 is the two loops evicting each other's lines, which is a property of a
+// measurement that runs them back to back and is reported rather than netted out.
 //
 // WHY IT IS PAID RATHER THAN ENGINEERED AWAY, and what would change that. It buys the whole
-// mechanism: 55 ns against the 2.4-2.8 ms forward pass a carried position avoids, which is a
-// ratio of about 1:45,000. The ~19 ns of lock IS removable, by a lock-free row protocol -- a
+// mechanism: 65 ns against the 2.4-2.8 ms forward pass a carried position avoids, which is a
+// ratio of about 1:40,000. The ~17 ns of lock IS removable, by a lock-free row protocol -- a
 // 32-bit tag word claimed by CAS, published release/acquire after the key and the context
 // index are written, with the count an atomic. THE REASON IT IS FILED AND NOT BUILT is not the
 // arithmetic: it is that this structure must be EXACT and its consuming take
@@ -87,7 +89,7 @@
 // openRequestsAtDump, so a dump can run with requests in flight. A mutex makes the take/observe
 // race safe by construction; the lock-free version has to get the take's read-modify-write of
 // the persisted mark right against a concurrent increment, which is the band-aid-on-band-aid
-// shape ADR-0012 P5 declines without a witnessed need. Build it when a measurement shows 19 ns
+// shape ADR-0012 P5 declines without a witnessed need. Build it when a measurement shows 17 ns
 // per request mattering to something; the bench that would show it is arm D3.
 //
 // EXACT, NOT A SKETCH. Every row carries the FULL 128-bit key and the context index beside
