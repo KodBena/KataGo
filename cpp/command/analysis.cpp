@@ -519,12 +519,23 @@ int MainCmds::analysis(const vector<string>& args) {
 
   //THE STARTUP ATTACH, and its position is the point of it: after every model is loaded and the
   //registry exists, and BEFORE a single analysis thread is started, so no request can ever be
-  //served by a leaf whose configured context is not yet on its cache. A refusal here propagates
-  //out of this command and the engine does not start -- which is the whole intent, because a
+  //served by a leaf whose configured context is not yet on its cache. A refusal here is a
+  //REFUSAL, not a crash: caught HERE, at exactly this call, and turned into a clean exit(1)
+  //with the refusal message on stderr, rather than an uncaught StringError escaping to the
+  //platform's default terminate handler (abort()/SIGABRT on Linux -- there is no top-level
+  //catch in main.cpp). The engine still does not start, which is the whole intent, because a
   //leaf silently serving from an empty cache while the operator believes it is attached is the
-  //failure this feature exists to notice.
-  for(const string& line: analysisCacheStartupAttach(modelHosts, cacheAttachments, cacheLifecycle))
-    logger.write(line);
+  //failure this feature exists to notice; only the EXIT STATUS a supervisor sees changes. This
+  //catch is scoped to this one call on purpose: every other refusal and every genuine crash
+  //elsewhere in this command is untouched.
+  try {
+    for(const string& line: analysisCacheStartupAttach(modelHosts, cacheAttachments, cacheLifecycle))
+      logger.write(line);
+  }
+  catch(const StringError& e) {
+    cerr << e.what() << endl;
+    return 1;
+  }
 
   //THE PERIODIC DUMP. Constructed here, beside the state it dumps and the mutex that guards it,
   //and STARTED only after the startup attach above has succeeded -- there is nothing to dump
