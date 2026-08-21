@@ -762,7 +762,17 @@ void testEvalContainerACorruptBlockHeaderDoesNotProduceAPartialApplication() {
 
 // A torn tail must be repaired by the WRITER before it appends, or every later dump lands at
 // an offset no loader reaches and is silently lost while every call reports success.
-void testEvalContainerTornTailIsRepairedBeforeTheNextAppend() {
+//
+// AND THE REPAIR IS A TRUNCATION, which is asserted here as a property of the FILE rather
+// than as a fact about which function was called. Three observations say it, and together
+// they say it exactly: the surviving prefix is byte-for-byte what stood there before the
+// tear (a rewrite would have re-encoded it into one collapsed block, changing those bytes);
+// the file's new length is that prefix plus the appended block and not one byte more; and
+// the append reports rewroteTheFile false with a positive discard count. The reason to
+// assert this rather than leave it to the byte counts of a bench: at the deployment's 10-20
+// GB per card, a repair that quietly went back to rewriting would cost a full card written
+// to flash for every engine killed mid-dump, and nothing else in this suite would notice.
+void testEvalContainerTornTailIsRepairedByTruncationBeforeTheNextAppend() {
   ScopedTempDir dir;
   const NNEvalContainer container = containerIn(dir, "repair");
 
@@ -770,6 +780,9 @@ void testEvalContainerTornTailIsRepairedBeforeTheNextAppend() {
   const shared_ptr<NNOutput> b = makeOutput(2, 1, 9, 9, false);
   container.appendBlock({asStored(a), asStored(b)});
   const int64_t sizeAfterOneDump = sizeOf(container.path());
+  // The bytes that MUST survive the repair unchanged, captured before anything is torn.
+  const vector<uint8_t> intactPrefix = readBytesAt(container.path(), 0, (size_t)sizeAfterOneDump);
+
   const shared_ptr<NNOutput> c = makeOutput(3, 1, 19, 19, false);
   container.appendBlock({asStored(c)});
   truncateTo(container.path(), sizeOf(container.path()) - 5);
@@ -778,11 +791,19 @@ void testEvalContainerTornTailIsRepairedBeforeTheNextAppend() {
   const shared_ptr<NNOutput> d = makeOutput(4, 1, 19, 19, true);
   const NNEvalContainerAppendResult appended = container.appendBlock({asStored(d)});
   testAssert(appended.tornTailBytesDiscarded == tornBytes);
-  testAssert(appended.rewroteTheFile == true);
+  testAssert(appended.rewroteTheFile == false);
+
+  // The surviving prefix, unchanged. A rewrite would have replaced these bytes with a
+  // re-encoding of the live set, so this is the assertion that distinguishes the two
+  // repairs rather than merely observing that one of them happened.
+  testAssert(readBytesAt(container.path(), 0, (size_t)sizeAfterOneDump) == intactPrefix);
+  // And nothing beyond the prefix but the one block just appended.
+  testAssert(sizeOf(container.path()) == sizeAfterOneDump + appended.bytesAppended);
 
   const NNEvalContainerContents contents = container.load();
   testAssert(contents.tail() == NNEvalContainerTail::Intact);
-  // The repair collapsed the surviving prefix into one block; the new dump is the second.
+  // The surviving prefix is the first dump's own block, still one block; the new dump is the
+  // second.
   testAssert(contents.blocksApplied() == 2);
   assertSameEvaluation(*a, entryFor(contents, 1));
   assertSameEvaluation(*b, entryFor(contents, 2));
@@ -790,6 +811,35 @@ void testEvalContainerTornTailIsRepairedBeforeTheNextAppend() {
   // THE POINT OF THE TEST: the dump written after the torn tail is readable. Without the
   // repair this entry is what goes missing, silently.
   assertSameEvaluation(*d, entryFor(contents, 4));
+}
+
+// The state truncation newly makes reachable: a container whose INTACT PART IS EMPTY. A
+// crash during the very first dump leaves a file that exists and carries nothing this build
+// can read, and the repair shortens it to zero bytes -- where the rewrite it replaced would
+// have left a fresh header behind. The next append must write that header rather than
+// append a block to a headerless file, and a file that never gets its header is one no
+// loader will ever accept, silently, forever.
+void testEvalContainerRepairsAContainerWhoseIntactPartIsEmpty() {
+  ScopedTempDir dir;
+  const NNEvalContainer container = containerIn(dir, "emptyintact");
+
+  const shared_ptr<NNOutput> a = makeOutput(1, 1, 19, 19, true);
+  container.appendBlock({asStored(a)});
+  // A crash before even the file header was whole: everything after a few bytes is gone.
+  truncateTo(container.path(), 12);
+
+  const shared_ptr<NNOutput> b = makeOutput(2, 1, 19, 19, false);
+  const NNEvalContainerAppendResult appended = container.appendBlock({asStored(b)});
+  testAssert(appended.tornTailBytesDiscarded == 12);
+  testAssert(appended.rewroteTheFile == false);
+  // The header is part of what was appended, because the file had none left.
+  testAssert(sizeOf(container.path()) == appended.bytesAppended);
+
+  const NNEvalContainerContents contents = container.load();
+  testAssert(contents.tail() == NNEvalContainerTail::Intact);
+  testAssert(contents.blocksApplied() == 1);
+  testAssert(!hasEntryFor(contents, 1));
+  assertSameEvaluation(*b, entryFor(contents, 2));
 }
 
 // Compaction preserves the merged live set -- including the never-lose-an-ownermap rule --
@@ -1035,7 +1085,8 @@ void Tests::runNNEvalContainerTests() {
   testEvalContainerAFileFromALaterVersionIsRefusedNotSilentlyRead();
   testEvalContainerAWholeButCorruptBlockIsRejectedByItsChecksum();
   testEvalContainerACorruptBlockHeaderDoesNotProduceAPartialApplication();
-  testEvalContainerTornTailIsRepairedBeforeTheNextAppend();
+  testEvalContainerTornTailIsRepairedByTruncationBeforeTheNextAppend();
+  testEvalContainerRepairsAContainerWhoseIntactPartIsEmpty();
   testEvalContainerCompactionPreservesTheLiveSetAndSurvivesAStaleTemp();
   testEvalContainerRefusesWhatItCannotHonor();
 

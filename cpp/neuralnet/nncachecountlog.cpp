@@ -603,6 +603,15 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   const bool overMultiple = liveSet > 0 && scan.recordsApplied > (int64_t)liveSetMultiple * liveSet;
   if(!torn && !overMultiple)
     return false;
+  // A TORN TAIL ALONE IS REPAIRED BY TRUNCATION, NEVER BY COMPACTION -- the same rule the
+  // evaluation container states, for the same reason: the size trigger did not fire, so
+  // nothing here authorises rewriting a log the operator did not ask to have rewritten.
+  // Compaction, when it IS authorised below, subsumes the repair: it writes a fresh file
+  // from the intact part and the torn tail goes with the old inode.
+  if(torn && !overMultiple) {
+    NNCacheFileTruncate::toLength(path_, scan.intactEndOffset);
+    return true;
+  }
   // DELEGATES rather than rewriting here. "Rewrite this log" has exactly one home; a
   // second call to rewriteAsOneBlock at this site would be a second statement of the same
   // act, and a change to either one would silently leave the other saying the old thing.
@@ -667,9 +676,22 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheObservation
   // silently lost while every call reported success.
   const ScanResult scan = scanLog(path_, context_, contextHash_);
   if(scan.tornTailBytes > 0) {
-    rewriteAsOneBlock(path_, scan.rows, scan.unattributedObservations, contextHash_);
+    // TRUNCATION, NOT A REWRITE, and the reason is the SHARED CONTRACT rather than this
+    // file's own size. The evaluation container repairs a torn tail by shortening back to
+    // the end of the last intact block, because at 10-20 GB per card a rewrite per killed
+    // dump is a flash-wear problem; a count log is megabytes and would not have forced the
+    // change on its own. But the two formats state ONE torn-tail contract -- same framing,
+    // same checksum, same "the reader never repairs and the writer always does" -- and a
+    // repair that meant a different operation in each of them would make that one sentence
+    // two. The surviving bytes are the same either way: the rewrite re-encoded the merged
+    // rows, which are derived from this same intact prefix, and neither keeps a byte of the
+    // torn tail. See NNCacheFileTruncate for the crash story and for why this does not
+    // compact.
+    NNCacheFileTruncate::toLength(path_, scan.intactEndOffset);
     result.tornTailBytesDiscarded = scan.tornTailBytes;
-    result.rewroteTheFile = true;
+    // Shortened, not rewritten; a repair is recognised by tornTailBytesDiscarded being
+    // positive, and this stays false so the two facts do not collapse into one.
+    result.rewroteTheFile = false;
   }
 
   // EVERY ROW THE DELTA CARRIES, including a key observed exactly once, and including a row
@@ -700,11 +722,18 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheObservation
 
   const std::vector<uint8_t> block = encodeBlock(rows, ledger.unrecordedObservations(), contextHash_, path_);
 
-  const bool fileExists = FileUtils::exists(path_);
-  ScopedFile f(path_, fileExists ? "ab" : "wb");
+  // A LOG WHOSE INTACT PART IS EMPTY NEEDS A HEADER, exactly as an absent one does, and the
+  // question is asked of the SCAN rather than of the filesystem for that reason. A crash
+  // during the very first dump leaves a file that exists and carries nothing this build can
+  // read, and the truncation above has just shortened it to zero bytes; opening that with
+  // "ab" would append a block to a file with no header, which no loader would accept. The
+  // rewrite this replaced wrote a fresh header in that case, and this is where that duty now
+  // lives.
+  const bool needsFileHeader = !scan.fileExists || scan.intactEndOffset == 0;
+  ScopedFile f(path_, needsFileHeader ? "wb" : "ab");
   if(!f.isOpen())
     throw StringError("NNCacheCountLog: could not open " + path_ + " for appending.");
-  if(!fileExists) {
+  if(needsFileHeader) {
     uint8_t fileHeader[FILE_HEADER_BYTES];
     encodeFileHeader(fileHeader, contextHash_);
     if(std::fwrite(fileHeader, 1, FILE_HEADER_BYTES, f.get()) != FILE_HEADER_BYTES)
@@ -718,7 +747,7 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheObservation
     throw StringError("NNCacheCountLog: could not fsync " + path_ + ".");
   // A newly created file needs its directory entry forced too; an append to an existing one
   // does not, because the entry is already durable.
-  if(!fileExists)
+  if(!scan.fileExists)
     syncDirectoryOf(path_);
   return result;
 }

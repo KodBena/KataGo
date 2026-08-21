@@ -118,6 +118,17 @@ void overwriteBytesAt(const string& path, int64_t offset, const vector<uint8_t>&
   fclose(f);
 }
 
+// The first `count` bytes of a file, for an assertion that a repair left them alone.
+vector<uint8_t> readBytesAt(const string& path, int64_t offset, size_t count) {
+  vector<uint8_t> bytes(count);
+  FILE* f = fopen(path.c_str(), "rb");
+  testAssert(f != NULL);
+  testAssert(fseek(f, (long)offset, SEEK_SET) == 0);
+  testAssert(count == 0 || fread(bytes.data(), 1, count, f) == count);
+  fclose(f);
+  return bytes;
+}
+
 //-------------------------------------------------------------------------------------
 // The tests
 //-------------------------------------------------------------------------------------
@@ -343,23 +354,32 @@ void testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved() {
 
 // A torn tail must be repaired by the WRITER before it appends, or every later dump lands
 // at an offset no loader reaches and is silently lost while every call reports success.
-void testCountLogTornTailIsRepairedBeforeTheNextAppend() {
+//
+// AND THE REPAIR IS A TRUNCATION, asserted as a property of the FILE: the surviving prefix
+// is byte-for-byte what stood there before the tear, and the new length is that prefix plus
+// the appended block. This log's own files are megabytes, so nothing here is about write
+// volume -- it is about the two formats stating ONE torn-tail contract, which is only one
+// contract if both of them keep it.
+void testCountLogTornTailIsRepairedByTruncationBeforeTheNextAppend() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "repair");
 
   log.appendDump(deltaOf({{1, 10}, {2, 20}}, 0));
   const int64_t sizeAfterOneDump = sizeOf(log.path());
+  const vector<uint8_t> intactPrefix = readBytesAt(log.path(), 0, (size_t)sizeAfterOneDump);
   log.appendDump(deltaOf({{3, 30}}, 0));
   truncateTo(log.path(), sizeOf(log.path()) - 5);
   const int64_t tornBytes = sizeOf(log.path()) - sizeAfterOneDump;
 
   const NNCacheCountLogAppendResult appended = log.appendDump(deltaOf({{4, 40}}, 0));
   testAssert(appended.tornTailBytesDiscarded == tornBytes);
-  testAssert(appended.rewroteTheFile == true);
+  testAssert(appended.rewroteTheFile == false);
+  testAssert(readBytesAt(log.path(), 0, (size_t)sizeAfterOneDump) == intactPrefix);
+  testAssert(sizeOf(log.path()) == sizeAfterOneDump + appended.bytesAppended);
 
   const NNCacheCountLogContents contents = log.load();
   testAssert(contents.tail() == NNCacheCountLogTail::Intact);
-  // The repair collapsed the surviving prefix into one block; the new dump is the second.
+  // The surviving prefix is the first dump's own block; the new dump is the second.
   testAssert(contents.blocksApplied() == 2);
   testAssert(rowFor(contents, 1).observations == 10);
   testAssert(rowFor(contents, 2).observations == 20);
@@ -557,7 +577,7 @@ void Tests::runNNCacheCountLogTests() {
   testCountLogTornTailIsDiscardedAndThePrefixSurvives();
   testCountLogAWholeButCorruptBlockIsRejectedByItsChecksum();
   testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved();
-  testCountLogTornTailIsRepairedBeforeTheNextAppend();
+  testCountLogTornTailIsRepairedByTruncationBeforeTheNextAppend();
   testCountLogCompactionPreservesTotalsAndSurvivesACrash();
   testCountLogOrdersByLookupsAndNotBySessions();
   testCountLogRefusesWhatItCannotHonor();

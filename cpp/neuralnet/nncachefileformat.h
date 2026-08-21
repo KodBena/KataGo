@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 // The three facts that every on-disk cache file in this family shares, in one home.
 //
@@ -28,9 +29,16 @@
 //   notions of "card-5455". This one is not merely economical to share -- sharing it is the
 //   contract.
 //
-//   THE DURABILITY PRIMITIVES. Both formats' crash story is append-plus-fsync with an
-//   atomic rename for rewrites, and both need a file handle that survives a throw between
-//   opening and closing. One RAII handle and one directory fsync, not two.
+//   THE DURABILITY PRIMITIVES. Both formats' crash story is append-plus-fsync, an atomic
+//   rename for rewrites, and a TRUNCATION back to the end of the last intact block for
+//   torn-tail repair; and both need a file handle that survives a throw between opening
+//   and closing. One RAII handle, one directory fsync and one truncation, not two.
+//
+//   THE PAGE-CACHE POSTURE. Both formats are streamed front to back and neither is ever
+//   re-read: the deployment's corpus is ~100 GB against a machine that cannot cache a
+//   fraction of it, so every byte either format reads is a byte of somebody else's working
+//   set evicted unless the kernel is told otherwise. The advice is one fact about how this
+//   file family is used, not two.
 //
 // Nothing here knows what either format's records mean. It is the byte layer under both.
 
@@ -133,6 +141,37 @@ class NNCacheFileHandle {
   bool isOpen() const { return file_ != nullptr; }
   std::FILE* get() const { return file_; }
 
+  // THE READ POSTURE FOR A FILE THAT IS STREAMED ONCE AND NEVER RE-READ. Call this
+  // immediately after opening for reading and before the first read; it does two things
+  // that are one decision:
+  //
+  //   A LARGE STDIO BUFFER, because the default one is the filesystem's block size --
+  //   4096 bytes on the deployment's filesystem -- and that is the granularity every read
+  //   and every seek inside this file then takes. MEASURED, on a 44.5 MB three-block
+  //   container: 12,111 read syscalls, of which 11,426 were 4096 bytes. The bytes fetched
+  //   from the device were already exactly the file's size -- the kernel's readahead sees
+  //   to that -- so what the small buffer costs is syscalls, and at the deployment's
+  //   10-20 GB per card that is millions of them per load.
+  //
+  //   POSIX_FADV_SEQUENTIAL, which says the same thing to the kernel that the buffer says
+  //   to stdio.
+  //
+  // Returns false if the buffer could not be installed, so a caller that cares can say so;
+  // the advice itself is best-effort and is a no-op where the platform has none.
+  bool useSequentialStreamBuffer();
+
+  // Tells the kernel that `bytes` bytes from `offset` are done with and need not be kept in
+  // page cache. This is DROP-BEHIND, and it is the only thing standing between a container
+  // load and the eviction of the machine's working set: the corpus is ~100 GB against a page
+  // cache that holds a fraction of one card, so a load that leaves its bytes resident buys
+  // nothing (they are never re-read) and costs everything else that was cached.
+  //
+  // Best-effort and silent: a kernel that declines, or a platform with no such call, leaves
+  // the pages resident, which is a performance fact and never a correctness one. It is also
+  // deliberately NOT fsync-coupled -- this is only ever called on a handle opened for
+  // reading, where there is nothing dirty to lose.
+  void dropCachedRange(int64_t offset, int64_t bytes);
+
   // Flushes the stdio buffer and then forces the bytes to the device. Returns false, rather
   // than throwing, so the caller names the file in its own message.
   bool flushAndSync();
@@ -141,8 +180,15 @@ class NNCacheFileHandle {
   // Idempotent.
   bool closeNow();
 
+  // The stdio buffer useSequentialStreamBuffer installs, in bytes.
+  static size_t sequentialStreamBufferBytes();
+
  private:
   std::FILE* file_;
+  // The storage setvbuf was handed. It is owned HERE because setvbuf does not copy: the
+  // buffer must outlive every read through the stream, and the only object whose lifetime
+  // is already exactly that is this handle.
+  std::vector<char> buffer_;
 };
 
 namespace NNCacheFileSync {
@@ -154,6 +200,42 @@ namespace NNCacheFileSync {
   // -- so on Windows the rename's durability is whatever the filesystem gives, which is
   // stated here rather than assumed away.
   void directoryOf(const std::string& path);
+}
+
+// TORN-TAIL REPAIR: shortening a file back to the end of its last intact block.
+//
+// WHAT THIS REPLACES AND WHY IT IS NOT A MICRO-OPTIMISATION. Both formats used to repair a
+// torn tail by rewriting the whole file through a temp sibling and an atomic rename -- the
+// same machinery compaction uses. That is correct and it is ruinously expensive here,
+// because of the lifecycle rather than the format: engines are long-lived and arbitrarily
+// SIGKILLed, interval dumps run every fifteen minutes, and a per-card container reaches
+// 10-20 GB. Every kill that lands inside a dump therefore cost a full rewrite of the card at
+// the next dump -- tens of gigabytes written to flash to discard a few kilobytes that were
+// going to be discarded either way, since the rewrite path already threw the torn bytes
+// away. Truncation discards exactly the same bytes and writes none.
+//
+// THE SURVIVING DATA IS BYTE-FOR-BYTE THE SAME, and that is what makes the substitution
+// legitimate rather than merely cheaper: the rewrite re-encoded the live set, which is a
+// SUBSET of the intact prefix (last-wins merging drops superseded entries); truncation keeps
+// the intact prefix itself. Neither keeps a byte of the torn tail. What truncation does NOT
+// do is compact -- the file keeps its superseded entries -- and that is correct, because
+// compaction is a separate decision with its own trigger, and a repair that silently
+// compacted would make every kill a compaction.
+//
+// THE CRASH STORY. ftruncate is a metadata operation the filesystem journals; a crash during
+// it leaves the file at its old length or its new one, and the old length is simply the torn
+// tail again, which the next append repairs identically. The fsync afterwards is what makes
+// the new length durable rather than merely visible, so a crash right after the repair
+// cannot resurrect the tail and strand the block appended past it.
+namespace NNCacheFileTruncate {
+  // Shortens `path` to exactly `bytes` and forces the new length to the device. Throws
+  // StringError naming the file, the length and the errno if it cannot -- a repair that
+  // silently did not happen would let the next append land past a torn tail, which is the
+  // one outcome the repair exists to prevent (ADR-0002).
+  //
+  // Refuses a negative length, and refuses to GROW a file: this is a repair primitive, and
+  // ftruncate's zero-filling extension has no reading in either format.
+  void toLength(const std::string& path, int64_t bytes);
 }
 
 //-------------------------------------------------------------------------------------

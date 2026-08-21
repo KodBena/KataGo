@@ -605,6 +605,14 @@ ScanResult scanContainer(
   if(!f.isOpen())
     return result;  // Absent is a normal answer: no dump has happened here yet.
   result.fileExists = true;
+  // THE READ POSTURE FOR THIS WHOLE FUNCTION, set once before the first read. Every byte
+  // below is read exactly once, front to back, and never re-read, so the two things this
+  // asks for are the two things that are true: read in large strides, and do not keep what
+  // has been read. See NNCacheFileHandle::useSequentialStreamBuffer for the measurement that
+  // sized the buffer. The return is deliberately not checked -- a stream that kept its
+  // default buffer reads the same bytes more slowly, which is not a fact any caller of this
+  // function can act on.
+  (void)f.useSequentialStreamBuffer();
 
   const int64_t fileSize = sizeOfOpenFile(f.get(), path);
   if(!seekTo(f.get(), 0))
@@ -723,8 +731,16 @@ ScanResult scanContainer(
 
     result.blocksApplied += 1;
     result.entriesApplied += (int64_t)entryCount;
+    const int64_t blockStart = offset;
     offset += (int64_t)BLOCK_HEADER_BYTES + regionBytes;
     result.intactEndOffset = offset;
+    // DROP-BEHIND, one block at a time. The block has been checksummed, its header array
+    // read and its visitor run, so nothing below will look at these bytes again -- and at
+    // 10-20 GB per card against a page cache that holds a fraction of one, keeping them
+    // would evict the machine's working set to hold bytes nobody will read. Per block rather
+    // than once at the end, so the resident footprint stays bounded by one block DURING the
+    // load and not merely after it.
+    f.dropCachedRange(blockStart, offset - blockStart);
     // The visitor was free to seek; the next block header is read from where the framing
     // says it is, never from wherever the visitor left the handle.
     if(!seekTo(f.get(), offset))
@@ -768,6 +784,43 @@ ScannedEntries scanEntries(
     }
   );
   return out;
+}
+
+// The FRAMING-ONLY read: where the intact part of the file ends, and nothing else.
+//
+// It is the cheapest of the three scans and it is what the TORN-TAIL REPAIR needs, which is
+// the only question the write path asks before it appends. It still reads and checksums
+// every byte -- that is what "intact" means and there is no cheaper sound answer, since a
+// block header can checksum correctly over a payload that never reached the device -- and it
+// still WALKS every block's header array, so every refusal a malformed file can earn is
+// still earned here, at the same moment it was before. What it does not do is read a payload
+// or build an entry: it holds nothing per entry beyond the header array the scan already
+// read.
+//
+// WHAT THIS REPLACED, because the difference is the whole point: appendBlock used to ask
+// scanEntries, which decodes every payload in the file into a heap NNOutput and merges them
+// into the live set, purely to hand that live set to a rewrite. At the deployment's 10-20 GB
+// per card that is the entire card materialised in memory, on every dump, to decide whether
+// the last few kilobytes were torn -- and on a machine smaller than the card it is not slow
+// but impossible.
+ScanResult scanFraming(
+  const std::string& path,
+  const std::string& context,
+  uint64_t contextHash,
+  const std::string& modelInternalName,
+  int modelVersion
+) {
+  return scanContainer(
+    path, context, contextHash, modelInternalName, modelVersion,
+    [&](std::FILE* /*f*/, const uint8_t* headerArray, uint32_t entryCount,
+        int64_t /*headerArrayFileOffset*/, int64_t /*payloadRegionFileOffset*/,
+        uint64_t totalPayloadBytes) {
+      walkBlockHeaderArray(
+        headerArray, entryCount, totalPayloadBytes, path,
+        [](uint32_t /*i*/, const DecodedEntryHeader& /*h*/, int64_t /*payloadOffset*/) {}
+      );
+    }
+  );
 }
 
 // The KEY-SET read: 32 bytes per entry, no payload decoded and none held.
@@ -1218,6 +1271,17 @@ void NNEvalContainer::readEntriesInto(
       h.hasOwnerMap ? sink.ownerMapFor(i, (size_t)h.nnXLen * (size_t)h.nnYLen) : NULL;
     decodePayloadInto(out, h, payload.data(), path_);
   }
+
+  // Everything this pass touched is now decoded into the caller's memory and will never be
+  // re-read from the file, so the pages it pulled in are dropped rather than left to evict
+  // the machine's working set. Whole-file rather than per-range, because the pass visits
+  // scattered offsets and the ranges it did NOT touch hold nothing anyway.
+  //
+  // NO LARGE SEQUENTIAL BUFFER HERE, unlike every scan: this reads a selection at scattered
+  // offsets in ascending order, and a megabyte of readahead per two-kilobyte entry would
+  // fetch far more than it used. The buffer is a decision about a streaming read and this is
+  // not one.
+  f.dropCachedRange(0, fileSize);
 }
 
 NNEvalContainerContents NNEvalContainer::compact() const {
@@ -1269,6 +1333,15 @@ bool NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
   const bool overMultiple = liveSet > 0 && scan.scan.entriesApplied > (int64_t)liveSetMultiple * liveSet;
   if(!torn && !overMultiple)
     return false;
+  // A TORN TAIL ALONE IS REPAIRED BY TRUNCATION, NEVER BY COMPACTION. The two are separate
+  // decisions and only one of them was made here: the size trigger did not fire, so nothing
+  // authorises rewriting a card the operator did not ask to have rewritten. Compaction, when
+  // it IS authorised below, subsumes the repair -- it writes a fresh file from the intact
+  // part and the torn tail is gone with the old inode.
+  if(torn && !overMultiple) {
+    NNCacheFileTruncate::toLength(path_, scan.scan.intactEndOffset);
+    return true;
+  }
   // DELEGATES rather than rewriting here, so "rewrite this container" has exactly one home
   // and a change to it cannot leave this path saying the old thing. The cost is one extra
   // scan on the compacting path, on an explicitly-invoked dump. It delegates to the UNLOCKED
@@ -1309,11 +1382,25 @@ NNEvalContainerAppendResult NNEvalContainer::appendBlock(
   // Scan first. A torn tail must be repaired BEFORE anything is appended: an append past a
   // torn tail lands at an offset no loader ever reaches, so every subsequent dump would be
   // silently lost while every call reported success.
-  const ScannedEntries scan = scanEntries(path_, context_, contextHash_, modelInternalName_, modelVersion_);
-  if(scan.scan.tornTailBytes > 0) {
-    rewriteAsOneBlock(path_, scan.entries, contextHash_, modelVersion_, modelInternalName_);
-    result.tornTailBytesDiscarded = scan.scan.tornTailBytes;
-    result.rewroteTheFile = true;
+  //
+  // THE FRAMING SCAN AND NOT THE FULL READ, because the only thing this needs from the file
+  // is where its intact part ends. The full read decoded every payload in the file into the
+  // heap to hand the live set to a rewrite; there is no rewrite here to hand it to.
+  const ScanResult scan = scanFraming(path_, context_, contextHash_, modelInternalName_, modelVersion_);
+  if(scan.tornTailBytes > 0) {
+    // TRUNCATION, NOT A REWRITE. The bytes that survive are identical either way -- the
+    // rewrite re-encoded the live set, which is a subset of this same intact prefix, and
+    // neither keeps a byte of the torn tail -- so the whole difference is what reaches the
+    // device: a metadata operation here, and the entire 10-20 GB card there. Under a
+    // lifecycle where engines are arbitrarily SIGKILLed and dump every fifteen minutes, that
+    // was a full card rewritten to flash for every kill that landed inside a dump. See
+    // NNCacheFileTruncate for the crash story and for why this does not compact.
+    NNCacheFileTruncate::toLength(path_, scan.intactEndOffset);
+    result.tornTailBytesDiscarded = scan.tornTailBytes;
+    // The file was SHORTENED, not rewritten, and the two are different facts an operator
+    // reads differently: this stays false, and a repair is recognised by
+    // tornTailBytesDiscarded being positive.
+    result.rewroteTheFile = false;
   }
 
   const auto entryAt = [&entries](size_t i) -> const NNOutput& { return *entries[i]; };
@@ -1321,11 +1408,18 @@ NNEvalContainerAppendResult NNEvalContainer::appendBlock(
   // dump never leaves a half-written block behind.
   const PreparedBlock block = prepareBlock(entries.size(), entryAt, contextHash_, path_);
 
-  const bool fileExists = FileUtils::exists(path_);
-  NNCacheFileHandle f(path_, fileExists ? "ab" : "wb");
+  // A FILE WHOSE INTACT PART IS EMPTY NEEDS A HEADER, exactly as an absent one does, and the
+  // question is asked of the SCAN rather than of the filesystem for that reason. Two states
+  // reach here holding a file that exists and carries nothing this build can read: a crash
+  // during the very first dump, which the truncation above has just shortened to zero bytes,
+  // and a zero-byte file left by anything else. Opening either with "ab" would append a
+  // block to a file with no file header, which no loader would ever accept -- the rewrite
+  // this replaced wrote a fresh header in that case, and this is where that duty now lives.
+  const bool needsFileHeader = !scan.fileExists || scan.intactEndOffset == 0;
+  NNCacheFileHandle f(path_, needsFileHeader ? "wb" : "ab");
   if(!f.isOpen())
     throw StringError("NNEvalContainer: could not open " + path_ + " for appending.");
-  if(!fileExists) {
+  if(needsFileHeader) {
     const std::vector<uint8_t> fileHeader = encodeFileHeader(contextHash_, modelVersion_, modelInternalName_);
     if(std::fwrite(fileHeader.data(), 1, fileHeader.size(), f.get()) != fileHeader.size())
       throw StringError("NNEvalContainer: could not write the header of " + path_ + ".");
@@ -1337,7 +1431,7 @@ NNEvalContainerAppendResult NNEvalContainer::appendBlock(
     throw StringError("NNEvalContainer: could not fsync " + path_ + ".");
   // A newly created file needs its directory entry forced too; an append to an existing one
   // does not, because the entry is already durable.
-  if(!fileExists)
+  if(!scan.fileExists)
     NNCacheFileSync::directoryOf(path_);
   return result;
 }

@@ -4,11 +4,13 @@
 
 #ifdef _WIN32
 #include <io.h>
+#include <fcntl.h>
 #include <windows.h>
 #else
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #endif
 
 #include <cerrno>
@@ -55,6 +57,15 @@ namespace {
   // name rather than waited on forever (ADR-0002).
   const int LOCK_POLL_MIN_MS = 1;
   const int LOCK_POLL_MAX_MS = 20;
+
+  // The stdio buffer a sequential read stream is given. One mebibyte, chosen against what it
+  // replaces rather than as a round number: the default is the filesystem's block size, 4096
+  // bytes here, and a 256x buffer turns the measured 12,111 read syscalls of a 44.5 MB
+  // container into the low hundreds. Larger buys progressively less -- the device bytes are
+  // already exactly the file's size at any of these sizes, so all that is being bought is
+  // syscalls -- and costs a megabyte per concurrently-open container, of which a multi-model
+  // host has one per (context, model) pair being read.
+  const size_t SEQUENTIAL_STREAM_BUFFER_BYTES = 1 << 20;
 }
 
 //-------------------------------------------------------------------------------------
@@ -189,6 +200,46 @@ bool NNCacheFileHandle::flushAndSync() {
 #endif
 }
 
+size_t NNCacheFileHandle::sequentialStreamBufferBytes() {
+  return SEQUENTIAL_STREAM_BUFFER_BYTES;
+}
+
+bool NNCacheFileHandle::useSequentialStreamBuffer() {
+  if(file_ == nullptr)
+    return false;
+  buffer_.resize(SEQUENTIAL_STREAM_BUFFER_BYTES);
+  if(std::setvbuf(file_, buffer_.data(), _IOFBF, buffer_.size()) != 0) {
+    // The stream keeps whatever buffer it had, so the storage is released rather than left
+    // held for a setvbuf that did not take it.
+    buffer_.clear();
+    buffer_.shrink_to_fit();
+    return false;
+  }
+#ifndef _WIN32
+#ifdef POSIX_FADV_SEQUENTIAL
+  (void)::posix_fadvise(::fileno(file_), 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+#endif
+  return true;
+}
+
+void NNCacheFileHandle::dropCachedRange(int64_t offset, int64_t bytes) {
+  if(file_ == nullptr || offset < 0 || bytes <= 0)
+    return;
+#ifndef _WIN32
+#ifdef POSIX_FADV_DONTNEED
+  // The stdio buffer may still hold bytes the caller has not consumed; the advice is about
+  // page cache and does not touch the stream's own position or buffer, so no flush is needed
+  // and none is done.
+  (void)::posix_fadvise(::fileno(file_), (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
+#else
+  (void)offset; (void)bytes;
+#endif
+#else
+  (void)offset; (void)bytes;
+#endif
+}
+
 bool NNCacheFileHandle::closeNow() {
   if(file_ == nullptr)
     return true;
@@ -209,6 +260,94 @@ void NNCacheFileSync::directoryOf(const std::string& path) {
 #else
   (void)path;
 #endif
+}
+
+void NNCacheFileTruncate::toLength(const std::string& path, int64_t bytes) {
+  if(bytes < 0)
+    throw StringError(
+      "NNCacheFileTruncate: a length of " + Global::int64ToString(bytes) + " for " + path +
+      " has no reading."
+    );
+
+#ifdef _WIN32
+  const int fd = ::_open(path.c_str(), _O_WRONLY | _O_BINARY);
+  if(fd < 0)
+    throw StringError(
+      "NNCacheFileTruncate: could not open " + path + " to shorten it to " +
+      Global::int64ToString(bytes) + " bytes: " + std::strerror(errno) + "."
+    );
+  const __int64 currentLength = ::_filelengthi64(fd);
+  if(currentLength < 0) {
+    ::_close(fd);
+    throw StringError("NNCacheFileTruncate: could not size " + path + " before shortening it.");
+  }
+  if((int64_t)currentLength < bytes) {
+    ::_close(fd);
+    throw StringError(
+      "NNCacheFileTruncate: " + path + " is " + Global::int64ToString((int64_t)currentLength) +
+      " bytes and was asked to become " + Global::int64ToString(bytes) +
+      ". This shortens a file to the end of its last intact block; it never grows one."
+    );
+  }
+  if(::_chsize_s(fd, (__int64)bytes) != 0) {
+    ::_close(fd);
+    throw StringError(
+      "NNCacheFileTruncate: could not shorten " + path + " to " + Global::int64ToString(bytes) +
+      " bytes: " + std::strerror(errno) + "."
+    );
+  }
+  const bool synced = ::_commit(fd) == 0;
+  ::_close(fd);
+#else
+  const int fd = ::open(path.c_str(), O_WRONLY);
+  if(fd < 0)
+    throw StringError(
+      "NNCacheFileTruncate: could not open " + path + " to shorten it to " +
+      Global::int64ToString(bytes) + " bytes: " + std::strerror(errno) + "."
+    );
+  struct stat st;
+  if(::fstat(fd, &st) != 0) {
+    ::close(fd);
+    throw StringError("NNCacheFileTruncate: could not size " + path + " before shortening it.");
+  }
+  if((int64_t)st.st_size < bytes) {
+    ::close(fd);
+    throw StringError(
+      "NNCacheFileTruncate: " + path + " is " + Global::int64ToString((int64_t)st.st_size) +
+      " bytes and was asked to become " + Global::int64ToString(bytes) +
+      ". This shortens a file to the end of its last intact block; it never grows one."
+    );
+  }
+  if(::ftruncate(fd, (off_t)bytes) != 0) {
+    const int err = errno;
+    ::close(fd);
+    throw StringError(
+      "NNCacheFileTruncate: could not shorten " + path + " to " + Global::int64ToString(bytes) +
+      " bytes: " + std::strerror(err) + "."
+    );
+  }
+  // The new LENGTH is what has to be durable. Without this the tail can come back after a
+  // crash, and a block appended past it would be stranded at an offset no loader reaches --
+  // exactly the failure the repair exists to prevent.
+  const bool synced = ::fsync(fd) == 0;
+  const int syncErr = errno;
+  ::close(fd);
+  if(!synced)
+    throw StringError(
+      "NNCacheFileTruncate: shortened " + path + " to " + Global::int64ToString(bytes) +
+      " bytes but could not fsync the new length: " + std::strerror(syncErr) + "."
+    );
+#endif
+#ifdef _WIN32
+  if(!synced)
+    throw StringError(
+      "NNCacheFileTruncate: shortened " + path + " to " + Global::int64ToString(bytes) +
+      " bytes but could not commit the new length."
+    );
+#endif
+  // The length lives in the inode, not the directory entry, so no directory fsync is needed
+  // -- unlike the rename this replaces, which is a directory operation. Stated because the
+  // asymmetry with rewriteAsOneBlock's directory fsync is otherwise an apparent omission.
 }
 
 //-------------------------------------------------------------------------------------
