@@ -43,7 +43,9 @@ lock probe refused the directory, a file was missing, an engine would not start)
 
 import argparse
 import glob
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -125,14 +127,49 @@ def context_files(cache_dir, context):
   return sorted(glob.glob(os.path.join(cache_dir, context + ".*")))
 
 
-class Suite:
-  def __init__(self, w, binary, config, net, cache_dir, context):
-    self.w, self.binary, self.config, self.net = w, binary, config, net
-    self.cache_dir, self.context = cache_dir, context
+# WHAT THE CONFIG-DRIVEN LIFECYCLE SAYS ABOUT ITSELF, in the engine's own log. These two lines
+# are the only surface a leaf's operator has for "did the attach happen, and what did the
+# shutdown write", precisely because the whole point of the feature is that no client ever asked
+# for either. Reading them here rather than eyeballing them is what makes SC5 a witness.
+_ATTACH_LINE = re.compile(
+  r'nnCacheAttachContext: model "(?P<model>[^"]*)" attached context "(?P<context>[^"]*)": '
+  r'(?P<entries>\d+) entries in level 0'
+)
+_SHUTDOWN_LINE = re.compile(
+  r'nnCacheAttachContext: model "(?P<model>[^"]*)" dumped context "(?P<context>[^"]*)" '
+  r'at shutdown: (?P<result>\{.*\})$'
+)
 
-  def session(self, requests, timeout=1800):
+
+def startup_attaches(stderr, context):
+  """[{model, entries}] for every startup attach of `context` the engine logged, in order."""
+  out = []
+  for line in stderr.splitlines():
+    m = _ATTACH_LINE.search(line)
+    if m and m.group("context") == context:
+      out.append({"model": m.group("model"), "entries": int(m.group("entries"))})
+  return out
+
+
+def shutdown_dumps(stderr, context):
+  """[{model, result}] for every shutdown dump of `context`, the result being the dump's own
+  response object -- the same one a client that had sent cache_dump by hand would have read."""
+  out = []
+  for line in stderr.splitlines():
+    m = _SHUTDOWN_LINE.search(line)
+    if m and m.group("context") == context:
+      out.append({"model": m.group("model"), "result": json.loads(m.group("result"))})
+  return out
+
+
+class Suite:
+  def __init__(self, w, binary, config, net, cache_dir, context, workdir):
+    self.w, self.binary, self.config, self.net = w, binary, config, net
+    self.cache_dir, self.context, self.workdir = cache_dir, context, workdir
+
+  def session(self, requests, timeout=1800, config=None):
     """One engine process, one request at a time. Returns (responses by id, NN rows, rc)."""
-    e = Engine(self.binary, self.config, [self.net], timeout=timeout)
+    e = Engine(self.binary, config or self.config, [self.net], timeout=timeout)
     out = {}
     try:
       for req in requests:
@@ -141,6 +178,23 @@ class Suite:
     finally:
       e.kill()
     return out, nn_rows_for(err, self.net), rc
+
+  def lifecycle_config(self, name, cache_dir, extra_lines):
+    """This run's config plus the lifecycle keys, as its own file.
+
+    A separate file rather than an -override-config flag because the claim SC5 makes is about
+    what an OPERATOR puts in a leaf's config file; a witness that only ever exercised the
+    override path would leave the config-file path untested (ADR-0021 Rule 1).
+    """
+    path = os.path.join(self.workdir, name)
+    with open(self.config) as f:
+      text = f.read()
+    # The cache directory may differ from the suite's own -- the refusal leg points at one that
+    # is not there -- so it is substituted rather than inherited.
+    text = re.sub(r"(?m)^nnCacheDir = .*$", "nnCacheDir = " + cache_dir, text)
+    with open(path, "w") as f:
+      f.write(text + "\n" + "\n".join(extra_lines) + "\n")
+    return path
 
   # ---------------------------------------------------------------------------------------
   # SC1: one process writes, a LATER process is served by it.
@@ -391,6 +445,141 @@ class Suite:
     print()
 
   # ---------------------------------------------------------------------------------------
+  # SC5: the same sharing as SC1, driven ENTIRELY BY THE CONFIG FILE. No wire cache verb.
+  # ---------------------------------------------------------------------------------------
+  def sc5_config_driven_lifecycle(self):
+    """SC1's shape, with every cache_attach and cache_dump deleted from the client.
+
+    WHY THIS LEG EXISTS AND SC1 DOES NOT COVER IT. SC1 proves the STORE works across processes;
+    every one of its sessions drives the store by hand, sending cache_attach before its queries
+    and cache_dump after them. The deployment this feature is for has no such client: a proxy
+    fans queries at a pool of leaves and knows nothing about cards, contexts or dumps. So what
+    has to be witnessed here is that the LEAF does it -- from its own config file, at its own
+    startup and its own exit -- and the way to witness that is to send the engine nothing but
+    analysis queries and see the sharing happen anyway.
+
+    The requests below are therefore ORDINARY QUERIES AND NOTHING ELSE, with one exception that
+    is deliberately not part of the claim: SC5e sends wire verbs on purpose, to witness that a
+    config-attached context is an ordinary attached context and the client-driven surface still
+    composes with it.
+    """
+    print("== SC5: the SAME sharing, driven purely by the config file -- ZERO cache verbs ==")
+    ctx = self.context + "-sc5"
+    queries = positions(3)
+    # minObservations 0 is accept-all, so one session's work is enough to serve the next -- the
+    # same thing SC1 asks for with "admission": {"all": true}, here as the operator's config key.
+    cfg = self.lifecycle_config(
+      "sharedcache-sc5.cfg", self.cache_dir,
+      ["nnCacheAttachContext = " + ctx, "nnCacheShutdownDumpMinObservations = 0"],
+    )
+
+    a = Engine(self.binary, cfg, [self.net])
+    try:
+      for i, q in enumerate(queries):
+        a.ask(dict(q, id="q%d" % i))
+      a_rc, _, a_err = a.finish()
+    finally:
+      a.kill()
+    a_rows = nn_rows_for(a_err, self.net)
+    a_attaches = startup_attaches(a_err, ctx)
+    a_dumps = shutdown_dumps(a_err, ctx)
+    a_written = a_dumps[0]["result"]["evaluations"]["entriesWritten"] if a_dumps else None
+
+    self.w.check(
+      "SC5a engine A attaches its context AT STARTUP from the config, with nothing sent to it",
+      a_rc == 0 and len(a_attaches) == 1 and a_attaches[0]["entries"] == 0,
+      "rc=%d startup attaches=%s" % (a_rc, a_attaches),
+      "exactly one startup attach of this context, reporting 0 entries -- the context is new",
+    )
+    self.w.check(
+      "SC5b *** and DUMPS it at clean shutdown, on stdin closing, with nothing sent to it ***",
+      a_rc == 0 and len(a_dumps) == 1 and a_rows > 0 and a_written == a_rows,
+      "rc=%d NN rows=%d shutdown dumps=%d entriesWritten=%s bytesAppended=%s"
+      % (a_rc, a_rows, len(a_dumps), a_written,
+         a_dumps[0]["result"]["evaluations"]["bytesAppended"] if a_dumps else None),
+      "exactly one shutdown dump, and it wrote every key the neural net paid for",
+    )
+    on_disk = [os.path.basename(p) for p in context_files(self.cache_dir, ctx)]
+    self.w.check(
+      "SC5c the files landed under the configured nnCacheDir",
+      any(n.endswith(".nncounts") for n in on_disk) and any(n.endswith(".nnevals") for n in on_disk),
+      "%s holds %s" % (self.cache_dir, on_disk),
+      "a .nncounts and a .nnevals for this context",
+    )
+
+    b = Engine(self.binary, cfg, [self.net])
+    try:
+      for i, q in enumerate(queries):
+        b.ask(dict(q, id="q%d" % i))
+      b_rc, _, b_err = b.finish()
+    finally:
+      b.kill()
+    b_rows = nn_rows_for(b_err, self.net)
+    b_attaches = startup_attaches(b_err, ctx)
+
+    self.w.check(
+      "SC5d *** engine B pays ZERO neural net rows for A's queries, having sent no cache verb "
+      "and been sent none ***",
+      b_rc == 0 and b_rows == 0 and len(b_attaches) == 1 and b_attaches[0]["entries"] == a_written,
+      "rc=%d NN rows=%d (A paid %d) startup attach entries=%s (A wrote %s)"
+      % (b_rc, b_rows, a_rows, b_attaches[0]["entries"] if b_attaches else None, a_written),
+      "NN rows == 0 exactly, and B's startup attach counts exactly the keys A's shutdown wrote",
+    )
+
+    # SC5e: the wire verbs still compose. A config-attached context is an ordinary attached one.
+    c = Engine(self.binary, cfg, [self.net])
+    try:
+      c_stats = c.ask({"id": "s", "action": "cache_stats"})
+      for i, q in enumerate(positions(5)[3:]):
+        c.ask(dict(q, id="cq%d" % i))
+      c_dump = c.ask({"id": "d", "action": "cache_dump", "context": ctx, "what": "both",
+                      "admission": {"all": True}})
+      c_detach = c.ask({"id": "x", "action": "cache_detach", "context": ctx})
+      c_rc, _, c_err = c.finish()
+    finally:
+      c.kill()
+    c_contexts = [entry.get("context") for entry in c_stats.get("contexts", [])]
+    self.w.check(
+      "SC5e a config-attached context is an ORDINARY attached context: cache_stats sees it, "
+      "cache_dump writes it, cache_detach takes it",
+      c_rc == 0 and ctx in c_contexts and "error" not in c_dump and "error" not in c_detach
+      and c_dump.get("evaluations", {}).get("entriesWritten", 0) > 0
+      and c_detach.get("sourcesDetached") == 1,
+      "cache_stats contexts=%s dump entriesWritten=%s detach sourcesDetached=%s %s %s"
+      % (c_contexts, c_dump.get("evaluations", {}).get("entriesWritten"),
+         c_detach.get("sourcesDetached"), disposition(c_dump), disposition(c_detach)),
+      "the context appears in cache_stats without ever being attached by wire, the wire dump "
+      "writes the new keys, and the wire detach takes it",
+    )
+    self.w.check(
+      "SC5f and the shutdown then dumps NOTHING for a context the client detached -- the "
+      "lifecycle does not overrule the client",
+      not shutdown_dumps(c_err, ctx),
+      "shutdown dumps of %s after the wire detach: %s" % (ctx, shutdown_dumps(c_err, ctx)),
+      "no shutdown dump line for this context at all",
+    )
+
+    # SC5g: the startup refusal. A leaf pointed at a directory that is not there must NOT come
+    # up serving an empty cache while the operator believes it is attached.
+    missing = os.path.join(self.cache_dir, "definitely-not-a-directory-" + str(os.getpid()))
+    bad_cfg = self.lifecycle_config(
+      "sharedcache-sc5-baddir.cfg", missing, ["nnCacheAttachContext = " + ctx],
+    )
+    proc = subprocess.run([self.binary, "analysis", "-config", bad_cfg, "-model", self.net],
+                          input="", capture_output=True, text=True, timeout=600)
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    self.w.check(
+      "SC5g an engine whose configured cache directory is not there REFUSES TO START, and says "
+      "which key",
+      proc.returncode != 0 and "nnCacheDir" in combined and not os.path.exists(missing),
+      "rc=%d, message names nnCacheDir=%s, the directory was NOT created=%s; %r"
+      % (proc.returncode, "nnCacheDir" in combined, not os.path.exists(missing),
+         combined.strip()[-220:]),
+      "nonzero exit, the refusal names nnCacheDir, and the engine did not silently create it",
+    )
+    print()
+
+  # ---------------------------------------------------------------------------------------
   # SC3: a reader attaching WHILE a writer dumps. State-based, never timing-based.
   # ---------------------------------------------------------------------------------------
   def sc3_attach_during_dump(self):
@@ -539,7 +728,8 @@ def main():
   p.add_argument("--skip-probe", action="store_true",
                  help="Do not run lockfsprobe first. Only for a directory already probed.")
   p.add_argument("--keep", action="store_true", help="Leave this run's cache files behind.")
-  p.add_argument("--only", action="append", default=None, choices=["sc1", "sc2", "sc3", "sc4"],
+  p.add_argument("--only", action="append", default=None,
+                 choices=["sc1", "sc2", "sc3", "sc4", "sc5"],
                  help="Run only these scenarios. Repeatable.")
   args = p.parse_args()
 
@@ -595,8 +785,8 @@ def main():
   print()
 
   w = Witness()
-  suite = Suite(w, binary, config, args.model, cache_dir, context)
-  chosen = args.only or ["sc1", "sc2", "sc3", "sc4"]
+  suite = Suite(w, binary, config, args.model, cache_dir, context, workdir)
+  chosen = args.only or ["sc1", "sc2", "sc3", "sc4", "sc5"]
   try:
     if "sc1" in chosen:
       suite.sc1_sequential_reuse()
@@ -606,14 +796,17 @@ def main():
       suite.sc3_attach_during_dump()
     if "sc4" in chosen:
       suite.sc4_default_admission_bootstrap()
+    if "sc5" in chosen:
+      suite.sc5_config_driven_lifecycle()
   finally:
     if args.keep:
       print("kept: %s" % [os.path.basename(f) for f in context_files(cache_dir, context + "-sc1")
                           + context_files(cache_dir, context + "-sc2")
                           + context_files(cache_dir, context + "-sc3")
-                          + context_files(cache_dir, context + "-sc4")])
+                          + context_files(cache_dir, context + "-sc4")
+                          + context_files(cache_dir, context + "-sc5")])
     else:
-      for suffix in ("-sc1", "-sc2", "-sc3", "-sc4"):
+      for suffix in ("-sc1", "-sc2", "-sc3", "-sc4", "-sc5"):
         for f in context_files(cache_dir, context + suffix):
           try:
             os.remove(f)

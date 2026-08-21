@@ -173,12 +173,70 @@ models' caches are separate structures - and it is deliberately the strict direc
 several models and drive them from independent client threads, expect attach and detach to need a moment
 when the *whole engine* is quiet, not just the model you are attaching to.
 
-`cache_dump` is the **only** action that writes. Nothing is persisted automatically, on a timer, or at
-exit - if you do not dump, nothing you computed reaches disk.
+`cache_dump` is the **only** action that writes, and nothing is written on a timer. If you drive the
+session yourself and do not dump, nothing you computed reaches disk. The one exception is the
+config-driven lifecycle in the next section, where the engine sends itself the attach and the dump.
 
 A context's name stays registered with a model for the life of the process once you have attached it, even
 after you detach. Re-attaching the same context later is fine and reuses that registration; attaching a
 context that is *currently* attached is an error.
+
+### Letting the engine do it: attaching and dumping from the config
+
+The session shape above assumes a client that knows which card it is studying. Some deployments have no
+such client - a proxy fanning queries across several KataGo leaves on one host, all pointed at one shared
+directory, knows nothing about contexts and should not have to. For those, name the context in the leaf's
+own config file and the engine does the rest:
+
+```
+nnCacheDir = /some/existing/directory
+nnCacheAttachContext = mycard
+```
+
+With `nnCacheAttachContext` set, the engine:
+
+  * **attaches that context to every hosted model at startup**, after the models load and before it
+    accepts a single request, with the same defaults a bare `cache_attach` gets - the whole of level 0,
+    no level-1 fill;
+  * **dumps it back at shutdown**, `what: "both"`, when stdin closes - on both the ordinary exit and
+    `-quit-without-waiting`, because by then every analysis thread has already been joined on either
+    path and a session's earned evaluations should not survive or not survive depending on a flag about
+    the queue.
+
+One context name covers every hosted model; each model still gets its own `<context>.<model>.nnevals`, so
+this is the same card evaluated by each net, not a collision. There is no per-model override.
+
+What the shutdown dump lets onto disk is the same default an `admission`-less `cache_dump` gets - entries
+observed at least twice - and one key changes it:
+
+```
+nnCacheShutdownDumpMinObservations = 0     # 0 means write everything; the default is 2
+```
+
+Setting `nnCacheShutdownDumpMinObservations` without `nnCacheAttachContext` is refused at startup: it
+would be a policy for a write that never happens. So is `nnCacheAttachContext` without `nnCacheDir`,
+naming both keys, and so is an `nnCacheAttachContext` the filesystem cannot hold a context under - a
+name outside the legal alphabet, a directory that is unreadable or that cannot be locked, a store torn
+past repair. **The engine refuses to start in every one of those cases**, rather than coming up and
+serving from an empty cache while you believe it is attached.
+
+Both acts announce themselves in the engine's log, one line per model. The shutdown line carries the
+dump's own response object verbatim - the same thing a client that had sent `cache_dump` by hand would
+have read - so `entriesWritten`, `belowThreshold` and the rest are all there. A dump that FAILS at
+shutdown is reported as an error line naming the model and the cause, and the remaining models are still
+dumped; shutdown is never held up or aborted by it.
+
+A config-attached context is an **ordinary attached context**, so the wire actions still compose with it:
+`cache_stats` reports it, `cache_dump` writes it early, and `cache_detach` takes it. Once a client has
+detached it the shutdown dump has nothing to dump for that model and does not re-attach it - detaching
+is the client's decision and the lifecycle does not overrule it. Conversely, `cache_attach` on the
+name the config already attached is the ordinary already-attached error.
+
+Periodic dumping - every N minutes, or every N requests - is deliberately **not** implemented. A long-
+lived leaf that is killed rather than stopped loses its session; if that becomes the operator's real
+failure mode, the place to add it is beside the shutdown dump in `cpp/command/analysiscachelifecycle.cpp`
+(`analysisCacheShutdownDump`), driven from the request loop rather than from a timer thread, because the
+dump reads structures the request loop owns.
 
 ### Reading an error from a cache action
 

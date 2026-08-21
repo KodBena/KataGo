@@ -1103,6 +1103,7 @@ add_executable(katago
   tests/testnncachedump.cpp
   tests/testnncachefilelock.cpp
   tests/testanalysiscacheactions.cpp
+  tests/testanalysiscachelifecycle.cpp
   tests/testanalysismodels.cpp
   tests/testnncachecountlogbench.cpp
   tests/testnncountsdump.cpp
@@ -1138,6 +1139,7 @@ add_executable(katago
   command/commandline.cpp
   command/analysis.cpp
   command/analysiscacheactions.cpp
+  command/analysiscachelifecycle.cpp
   command/analysismodels.cpp
   command/benchmark.cpp
   command/benchmarknn.cpp

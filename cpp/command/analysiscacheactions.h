@@ -157,6 +157,17 @@ struct CacheDumpRequest {
 // a bare stats request.
 struct CacheStatsRequest {};
 
+// WHAT AN ABSENT cache_dump "admission" MEANS, as a number with ONE home. Two: the operator's
+// standing policy, "store only what has been seen at least twice", which under observation
+// currency is reachable across sessions -- a position observed once in one session and once in
+// the next clears it (ledger rows 1717/1722).
+//
+// It is a function on this header rather than a constant in the decoder's translation unit
+// because the decoder is no longer its only reader: an engine configured to dump at SHUTDOWN
+// with no admission key of its own gets the same default, and two homes for one policy is two
+// numbers waiting to disagree (ADR-0012 P1).
+[[nodiscard]] uint64_t cacheDumpDefaultAdmissionObservations();
+
 // The first key of `request` that `allowed` does not hold, in the object's own order, or
 // nothing when every key is allowed.
 [[nodiscard]] std::optional<std::string> firstUnexpectedKey(

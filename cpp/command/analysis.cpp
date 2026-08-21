@@ -10,6 +10,7 @@
 #include "../program/play.h"
 #include "../command/commandline.h"
 #include "../command/analysiscacheactions.h"
+#include "../command/analysiscachelifecycle.h"
 #include "../command/analysismodels.h"
 #include "../core/test.h"
 #include "../main.h"
@@ -294,6 +295,13 @@ int MainCmds::analysis(const vector<string>& args) {
 
   const bool warnUnusedFields = cfg.contains("warnUnusedFields") ? cfg.getBool("warnUnusedFields") : true;
 
+  //THE PERSISTED CACHE'S LIFECYCLE, if the operator configured one: which context every hosted
+  //model attaches at startup and dumps at shutdown. Read HERE, before the models are loaded and
+  //well before cfg.warnUnusedKeys, for two reasons -- a config whose lifecycle keys are
+  //incoherent is refused before this process pays to put a net on the device, and the keys are
+  //marked used so warnUnusedKeys does not report a setting the engine is honoring.
+  const AnalysisCacheLifecycle cacheLifecycle = AnalysisCacheLifecycle::fromCfg(cfg);
+
   auto loadParams = [&humanModelFile](ConfigParser& config, SearchParams& params, Player& perspective, Player defaultPerspective) {
     bool hasHumanModel = humanModelFile != "";
     params = Setup::loadSingleParams(config,Setup::SETUP_FOR_ANALYSIS,hasHumanModel);
@@ -490,6 +498,15 @@ int MainCmds::analysis(const vector<string>& args) {
   //What the cache actions have attached to each hosted model. Read and written ONLY on the request
   //loop below, which is a single thread, so it takes no lock; see AnalysisCacheAttachments.
   AnalysisCacheAttachments cacheAttachments(modelHosts.numSearchable());
+
+  //THE STARTUP ATTACH, and its position is the point of it: after every model is loaded and the
+  //registry exists, and BEFORE a single analysis thread is started, so no request can ever be
+  //served by a leaf whose configured context is not yet on its cache. A refusal here propagates
+  //out of this command and the engine does not start -- which is the whole intent, because a
+  //leaf silently serving from an empty cache while the operator believes it is attached is the
+  //failure this feature exists to notice.
+  for(const string& line: analysisCacheStartupAttach(modelHosts, cacheAttachments, cacheLifecycle))
+    logger.write(line);
 
   auto reportError = [&pushToWrite,&logger,&logErrorsAndWarnings](const string& s) {
     json ret;
@@ -1682,6 +1699,27 @@ int MainCmds::analysis(const vector<string>& args) {
   for(size_t i = 0; i<bots.size(); i++)
     for(AsyncBot* bot: bots[i].all())
       delete bot;
+
+  //THE SHUTDOWN DUMP, and its position is again the point of it: every analysis thread has been
+  //joined and every bot destroyed, so nothing can touch a cache table while this writes, and the
+  //evaluators are still alive to be written from -- they are deleted a few lines below.
+  //
+  //IT RUNS ON BOTH QUIT PATHS, including -quit-without-waiting. That flag's promise is that the
+  //engine will not wait for QUEUED TASKS, and by this line there are none left to wait for on
+  //either path: both branches above join every analysis thread. Making a session's earned
+  //evaluations survive or not survive depending on a flag whose documentation says nothing about
+  //the cache would be a silent data-loss trap, so the flag costs the queue and not the store.
+  {
+    const AnalysisCacheShutdownDumpReport dumped =
+      analysisCacheShutdownDump(modelHosts, cacheAttachments, cacheLifecycle);
+    for(const string& line: dumped.lines) {
+      logger.write(line);
+      //A dump that failed at shutdown is the operator's only notice that this session's work is
+      //not on disk, so it reaches stderr even when the log does not go there.
+      if(dumped.modelsFailed > 0 && !logToStderr)
+        cerr << line << endl;
+    }
+  }
 
   //Per hosted model, so a session that ran two nets can be read for how much work each one did.
   for(const SearchableModelIdx modelIdx: modelHosts.searchableIdxs()) {

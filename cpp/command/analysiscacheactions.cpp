@@ -158,13 +158,6 @@ namespace {
 
 const char* const RETIRED_LOOKUPS_KEY = "minLookups";
 
-// WHAT AN ABSENT cache_dump "admission" MEANS, as one number with one home so the decoder,
-// the refusal texts and the tests cannot state three different defaults (ADR-0012 P1). Two:
-// the operator's own standing policy, "store only what has been seen at least twice", which
-// under observation currency is reachable across sessions -- a position observed once in one
-// session and once in the next clears it (ledger rows 1717/1722).
-const uint64_t DEFAULT_ADMISSION_OBSERVATIONS = 2;
-
 string retiredLookupsKeyRefusal(const string& where) {
   return
     "\"minLookups\" is no longer accepted in " + where + "; send \"minObservations\" instead. This is a "
@@ -177,6 +170,15 @@ string retiredLookupsKeyRefusal(const string& where) {
 }
 
 }  // namespace
+
+// WHAT AN ABSENT cache_dump "admission" MEANS, as one number with one home so the decoder, the
+// refusal texts, the config-driven shutdown dump and the tests cannot state four different
+// defaults (ADR-0012 P1). Two: the operator's own standing policy, "store only what has been
+// seen at least twice", which under observation currency is reachable across sessions -- a
+// position observed once in one session and once in the next clears it (ledger rows 1717/1722).
+uint64_t cacheDumpDefaultAdmissionObservations() {
+  return 2;
+}
 
 CacheActionDecode<CacheAttachRequest> decodeCacheAttach(const json& request) {
   const std::optional<string> unexpected = firstUnexpectedKey(request, cacheAttachRequestKeys());
@@ -388,7 +390,7 @@ CacheActionDecode<CacheDumpRequest> decodeCacheDump(const json& request) {
   //
   // Both explicit forms stay exactly as they were, so a client that names its policy still
   // gets precisely what it named.
-  NNCacheDiskAdmission admission = NNCacheDiskAdmission::minObservations(DEFAULT_ADMISSION_OBSERVATIONS);
+  NNCacheDiskAdmission admission = NNCacheDiskAdmission::minObservations(cacheDumpDefaultAdmissionObservations());
   if(request.find("admission") != request.end()) {
     if(!request["admission"].is_object())
       return CacheActionDecode<CacheDumpRequest>::refused(
