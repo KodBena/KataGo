@@ -497,8 +497,14 @@ class NNEvaluator {
     const SGFMetadata* sgfMeta,
     const MiscNNInputParams& nnInputParams,
     NNCacheHitOrigin origin,
-    const std::shared_ptr<NNOutput>& served
+    const std::shared_ptr<NNOutput>& served,
+    bool viaOwnerMapFallThrough
   );
+
+  // The symmetry a verification recompute may be issued under, or -1 having COUNTED the refusal.
+  // Written once because both cache-hit arms ask the identical question and two copies of it
+  // could drift apart (ADR-0012 P1).
+  [[nodiscard]] int pinnedVerifySymmetryOrRefuse(const MiscNNInputParams& nnInputParams);
 #endif
 
  public:

@@ -103,10 +103,20 @@
 // verifiedHits, so a run that verified zero hits cannot be mistaken for a run that verified
 // many and found nothing (ADR-0002).
 //
-// WHAT IS COVERED, THEN: an evaluator with nnRandomize=false (or nnForcedSymmetry set), where
-// every unspecified evaluation takes currentDefaultSymmetry, and the recompute is issued with
-// that same symmetry named EXPLICITLY rather than left unspecified. A request that named its
-// own symmetry is covered too, because the recompute reuses the request's symmetry.
+// WHAT IS COVERED, THEN, AND ONLY THIS: an evaluator with nnRandomize=false (or nnForcedSymmetry
+// set), serving a request that did NOT name a symmetry of its own -- so the entry and the
+// recompute both take currentDefaultSymmetry, and the recompute names it EXPLICITLY rather than
+// leaving it unspecified.
+//
+// A REQUEST THAT NAMES ITS OWN SYMMETRY IS REFUSED AND COUNTED, not covered. An earlier draft of
+// this header claimed the opposite -- "the recompute reuses the request's symmetry" -- and an
+// audit was right to call it an inversion of this file's own principle. Pinning the RECOMPUTE's
+// symmetry says nothing about the SERVED ENTRY's: the cache key does not fold symmetry, so an
+// entry computed under symmetry 0 is served, by key, to a request naming symmetry 5, and
+// comparing them measures non-equivariance exactly as the randomized case does. The clause was
+// vacuous when written -- every in-tree caller that names a symmetry passes skipCache=true,
+// precisely because "there's no guarantee which symmetry is in the cache" -- and would have been
+// unsound the moment it stopped being vacuous.
 //
 // WHAT IS STILL NOT COVERED, and cannot be without a format change: that the SESSION THAT
 // WROTE the entry also ran with the same pinned symmetry. Nothing in the file says. A store
@@ -118,10 +128,37 @@
 // here.
 //
 // -----------------------------------------------------------------------------------------
+// BOTH PATHS THAT SERVE DESERIALIZED BYTES ARE VERIFIED, AND THAT IS TWO, NOT ONE
+//
+// NNEvaluator::evaluate's cache-hit branch has two arms and the first draft of this feature only
+// covered one (found by audit, 2026-08-21). They are:
+//
+//   THE EARLY RETURN -- the entry answers the request as it stands, and is handed straight back.
+//   Verified by running a fresh forward pass alongside it.
+//
+//   THE OWNERMAP FALL-THROUGH -- the entry answers everything EXCEPT the ownership map the
+//   caller asked for, so the net runs anyway, and then the cached entry's scalars and its whole
+//   policy array are copied back over the fresh result (to avoid re-deciding the policy in a
+//   different orientation). That path returns deserialized bytes just as surely as the first,
+//   AND STORES THEM into level 1, where a corrupt scalar becomes a resident entry that the
+//   default configuration will not re-check. It is verified too.
+//
+// IT IS VERIFIED WITH ITS OWN RECOMPUTE, NOT AGAINST THE FORWARD PASS THAT PATH ALREADY MAKES,
+// and the reason is worth stating because the free-looking option is the wrong one. The result
+// of that path's forward pass is NOT postprocessed -- that is the entire point of the copy: the
+// raw logits are discarded and the cached, already-postprocessed values are kept. Comparing a
+// postprocessed cached entry against raw logits would measure the postprocessing, not the
+// deserialization. So this path pays a second forward pass, which a verify build can afford and
+// a shipping build never sees.
+//
+// -----------------------------------------------------------------------------------------
 // THE INSTRUMENT STAYS OUTSIDE THE INSTRUMENT
 //
 // A mismatch NEVER alters the served result. This is an observer: it counts, it logs, and the
-// evaluation the caller receives is the one the cache served, mismatch or not. Two further
+// evaluation the caller receives is the one the cache served, mismatch or not. AND NEITHER DOES
+// A FAILURE: the recompute is wrapped, so an exception thrown inside it is counted
+// (recomputesThatThrew) and swallowed rather than replacing the caller's answer with a throw --
+// an instrument that can take down the request it is observing is not an observer. Two further
 // consequences, both enforced rather than remembered:
 //
 //   THE RECOMPUTE DOES NOT STORE. NNEvaluator::evaluate ends by setting its result into the
@@ -191,15 +228,32 @@ struct NNCacheHitVerifyTolerances {
 // WHAT A VERIFY BUILD ADDS TO cache_stats. Present only in a verify build, by construction:
 // the type that carries them does not exist otherwise.
 struct NNCacheHitVerifyStats {
-  // Hits that were actually compared against a fresh forward pass.
+  // Hits that were actually compared against a fresh forward pass, over BOTH arms.
   int64_t verifiedHits;
+  // Of those, the ones that came through the ownermap fall-through arm rather than the early
+  // return. THE TWO ARMS ARE COUNTED APART because a witness that could not tell them apart
+  // could not show the fall-through was verified at all: the first attempt at that leg passed
+  // with the fall-through's verification deleted, since an analysis query's ROOT always requests
+  // an ownership map and so never reaches that arm (search/searchnnhelpers.cpp: includeOwnerMap
+  // = isRoot || alwaysIncludeOwnerMap). A counter that only a real fall-through can move is what
+  // makes the leg falsifiable.
+  int64_t verifiedFallThroughHits;
   // Of those, how many exceeded tolerance on at least one channel.
   int64_t mismatches;
   // Level-0 hits NOT compared, because the evaluator's symmetry is not pinned. Reported
   // beside verifiedHits precisely so a zero-coverage run is legible as one.
   int64_t skippedNondeterministicSymmetry;
-  // Resident (level-1) hits not compared, because verifying them is opt-in.
+  // Resident (level-1) hits not compared, because verifying them is opt-in. Counts ONLY hits
+  // that were actually skipped: with nnCacheVerifyHitsIncludeResident on, resident hits land in
+  // verifiedHits and this stays zero.
   int64_t skippedResidentOrigin;
+  // Hits not compared because no forward pass was available to compare against -- a
+  // neural-net-less (debugSkipNeuralNet) evaluator, or a recompute that came back empty. Counted
+  // rather than returned from silently, for the same reason the two counts above are.
+  int64_t skippedNoRecompute;
+  // Recomputes that threw. The exception is swallowed -- an instrument must not take down the
+  // request it is observing -- so without this counter it would vanish entirely.
+  int64_t recomputesThatThrew;
   // The largest deviation/allowance ratio seen across every channel of every comparison. <= 1
   // means every comparison held. Reported as a RATIO rather than a raw deviation because the
   // channels are in five different units and a raw maximum over them means nothing. Borrowed
@@ -234,6 +288,13 @@ class NNCacheHitVerifier {
   // The symmetry could not be pinned, so nothing is compared. Counted, and reported.
   void countSkippedNondeterministicSymmetry();
 
+  // There was no forward pass to compare against -- a neural-net-less evaluator, or a recompute
+  // that came back empty.
+  void countSkippedNoRecompute();
+
+  // The recompute threw and the exception was swallowed. See NNCacheHitVerifyStats.
+  void countRecomputeThrew();
+
   // THE COMPARISON. `served` is what the cache handed the caller; `recomputed` is what a fresh
   // forward pass under `symmetryUsed` produced for the same position. `policySize` is
   // nnXLen*nnYLen+1 for the board actually evaluated -- the slots beyond it are a property of
@@ -242,7 +303,13 @@ class NNCacheHitVerifier {
   //
   // OWNERSHIP IS COMPARED WHEN BOTH SIDES HAVE IT, and its ABSENCE ON ONE SIDE ONLY is itself
   // a mismatch -- the ownermap-present flag is a persisted field, and a decoder that lost it
-  // is exactly the defect class this exists for.
+  // is exactly the defect class this exists for. Both call sites ask the recompute for a map
+  // exactly when the served entry carries one, so a disagreement here is the format's.
+  //
+  // NON-FINITE VALUES ARE DECIDED BEFORE ANY TOLERANCE IS APPLIED. Two of them agree only if
+  // they are the same non-finite value; anything else is forced to an infinite ratio. Naive
+  // arithmetic gets this exactly backwards -- inf/inf is NaN and NaN fails every comparison, so
+  // the grossest corruption an f32 can carry reads as "held" (found by audit, 2026-08-21).
   //
   // Returns true iff every channel held. Never modifies either output.
   bool compare(
@@ -250,7 +317,8 @@ class NNCacheHitVerifier {
     int symmetryUsed,
     const NNOutput& served,
     const NNOutput& recomputed,
-    int policySize
+    int policySize,
+    bool viaOwnerMapFallThrough
   );
 
   [[nodiscard]] NNCacheHitVerifyStats stats() const;
@@ -300,9 +368,12 @@ class NNCacheHitVerifier {
 
   mutable std::mutex mutex_;
   int64_t verifiedHits_;
+  int64_t verifiedFallThroughHits_;
   int64_t mismatches_;
   int64_t skippedNondeterministicSymmetry_;
   int64_t skippedResidentOrigin_;
+  int64_t skippedNoRecompute_;
+  int64_t recomputesThatThrew_;
   double worstDeviationRatio_;
   std::string worstChannel_;
   std::string worstKey_;

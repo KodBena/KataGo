@@ -60,11 +60,11 @@ DEFAULT_NET = "/home/bork/kg/14.gz"
 CONTEXT = "hitverify"
 
 
-def positions(count, visits):
+def positions(count, visits, ownership=True):
   """`count` distinct 7x7 positions. Distinct BY CONSTRUCTION -- a different move sequence is a
   different board and so a different cache key -- rather than by hope. Small and cheap because
   a verify build pays a SECOND forward pass for every hit, so this suite does twice the neural
-  net work of an ordinary one by design."""
+  net work of an ordinary one by design. See --visits for why one visit is load-bearing."""
   coords = ["c3", "e5", "c5", "e3", "d4", "b2", "f6", "b6", "f2", "d2", "d6", "b4"]
   out = []
   for i in range(count):
@@ -73,7 +73,7 @@ def positions(count, visits):
     out.append({
       "boardXSize": 7, "boardYSize": 7, "rules": "tromp-taylor", "komi": 7.5,
       "initialPlayer": "b", "moves": moves, "analyzeTurns": [3],
-      "maxVisits": visits, "includeOwnership": True,
+      "maxVisits": visits, "includeOwnership": ownership,
     })
   return out
 
@@ -145,8 +145,16 @@ def main():
   ap.add_argument("config_template")
   ap.add_argument("workdir")
   ap.add_argument("net", nargs="?", default=DEFAULT_NET)
-  ap.add_argument("--positions", type=int, default=4)
-  ap.add_argument("--visits", type=int, default=8)
+  ap.add_argument("--positions", type=int, default=6)
+  # ONE VISIT PER QUERY, AND THAT IS LOAD-BEARING, NOT A SPEED CHOICE. HV3 reads the CLIENT's
+  # own answer to prove the corrupt value reached it, and it can only do that if the entry the
+  # instrument corrupts is one the client can see. At eight visits a query evaluates its root
+  # plus seven interior nodes, the instrument corrupts whichever entry the dump wrote first, and
+  # that is almost always an interior node whose value never surfaces in rootInfo -- observed:
+  # 32 entries written, zero client-visible movement. At one visit the store holds exactly one
+  # entry per query, every one of them a ROOT, so the corrupted entry is necessarily one the
+  # client is shown.
+  ap.add_argument("--visits", type=int, default=1)
   ap.add_argument("--keep", action="store_true")
   args = ap.parse_args()
 
@@ -287,15 +295,131 @@ def main():
   )
 
   # ---- HV3: the observer did not become a corrector. -----------------------------------
+  #
+  # OBSERVED ON THE CLIENT'S OWN ANSWER, not on the exit code. An earlier draft of this leg
+  # checked rc==0 and no query error, which a verifier that silently substituted the RECOMPUTED
+  # value for the served one would also pass -- a symptom, not the property (ADR-0021 Rule 1).
+  # The property is that the corrupt value reached the caller unchanged, so that is what is read:
+  # the raw root evaluation of each query, before and after the corruption, from the two engines'
+  # own responses.
   print()
+  b_roots = [b_out["q%d" % i]["rootInfo"]["rawWinrate"] for i in range(len(queries))]
+  c_roots = [c_out["q%d" % i]["rootInfo"]["rawWinrate"] for i in range(len(queries))]
+  moved = [i for i in range(len(queries)) if abs(b_roots[i] - c_roots[i]) > 1e-9]
   w.check(
-    "HV3 *** the instrument stayed OUTSIDE the instrument: the engine answered every query "
-    "and exited cleanly with a mismatch outstanding ***",
+    "HV3a *** the CORRUPT value reached the client: exactly one query's raw root evaluation "
+    "moved, and nothing was silently corrected ***",
+    len(moved) == 1,
+    "queries whose rawWinrate moved between the clean and corrupted runs: %s (clean %s, "
+    "corrupted %s)" % (moved, [round(x, 6) for x in b_roots], [round(x, 6) for x in c_roots]),
+    "exactly one -- zero would mean the verifier substituted its recompute, more than one would "
+    "mean something other than the corruption moved",
+  )
+  # THE EXPECTED MOVEMENT IS DERIVED, NOT EYEBALLED. The instrument moves whiteWinProb by 0.25
+  # and leaves whiteLossProb alone; the analysis engine reports rawWinrate as
+  # 0.5 + (win - loss)/2, so a 0.25 move on one term of that difference surfaces as exactly
+  # HALF of it at the client. Asserting 0.25 here would be asserting the wrong number and would
+  # have made this leg unfalsifiable in the other direction -- it went red on the real value
+  # first, which is how the relationship was pinned down rather than assumed.
+  expected_delta = 0.25 / 2.0
+  w.check(
+    "HV3b and it moved by exactly the corruption's own magnitude, not by numerical noise",
+    len(moved) == 1 and abs(abs(b_roots[moved[0]] - c_roots[moved[0]]) - expected_delta) < 1e-6,
+    "delta=%s, expected %s (whiteWinProb moved 0.25; rawWinrate is 0.5+(win-loss)/2, so the "
+    "client sees half)"
+    % (abs(b_roots[moved[0]] - c_roots[moved[0]]) if len(moved) == 1 else None, expected_delta),
+    "|delta| == %s to within 1e-6" % expected_delta,
+  )
+  w.check(
+    "HV3c and the engine still answered every query and exited cleanly with the mismatch "
+    "outstanding",
     c_rc == 0 and all(("error" not in c_out["q%d" % i]) for i in range(len(queries))),
     "rc=%d, %d queries answered without error, mismatches=%s"
     % (c_rc, len(queries), c_verify.get("mismatches")),
-    "rc==0 and no query carried an error -- a verifier that refused or corrected would be "
+    "rc==0 and no query carried an error -- a verifier that refused or crashed would be "
     "changing what it is there to observe",
+  )
+
+  # ---- HV4: the OTHER arm that serves deserialized bytes. -------------------------------
+  #
+  # NNEvaluator::evaluate's cache-hit branch has two arms, and an audit found the first draft of
+  # this feature verified only one. The second is the OWNERMAP FALL-THROUGH: the cached entry
+  # answers everything except an ownership map the caller has now asked for, so the net runs
+  # anyway and the cached entry's scalars and whole policy array are copied back over the fresh
+  # result -- reaching the client exactly as they would through the early return, AND being
+  # stored into level 1, where a corrupt value becomes resident.
+  #
+  # REACHING THAT ARM TAKES CONSTRUCTION, AND THE FIRST TWO ATTEMPTS AT THIS LEG DID NOT REACH IT.
+  # An analysis query's ROOT always requests an ownership map -- search/searchnnhelpers.cpp:72,
+  # `includeOwnerMap = isRoot || alwaysIncludeOwnerMap` -- so a store built only from roots holds
+  # entries that already carry one whatever includeOwnership says, and the fall-through is never
+  # reached; that draft passed with the fall-through's verification deleted, which is what a leg
+  # asserting nothing looks like. Nor can an interior position simply be re-sent as a root: the
+  # root of a query carries different MiscNNInputParams (root policy temperature, playout
+  # doubling advantage), which go into the cache key, so it is a different key and a plain miss.
+  #
+  # WHAT DOES REACH IT: the SAME queries, run twice, with the ownership request flipped. Process
+  # D searches with includeOwnership off, so its INTERIOR evaluations are stored with no map
+  # (only its roots have one). Process E sends the identical queries with includeOwnership on,
+  # which sets alwaysIncludeOwnerMap and makes every interior evaluation ask for a map -- against
+  # the very entries D stored without one, under identical keys. That is the deployment shape as
+  # well: two leaves on one shared directory, configured differently.
+  #
+  # AND THE LEG COUNTS THE ARM, NOT THE TOTAL. verifiedFallThroughHits moves only when the
+  # fall-through arm compares something, so deleting that call makes this leg red and nothing
+  # else does.
+  print("\n== HV4: the ownermap fall-through arm -- stored without a map, read wanting one ==")
+  ctx2 = CONTEXT + "-fallthrough"
+  d_queries = positions(args.positions, visits=8, ownership=False)
+  e_queries = positions(args.positions, visits=8, ownership=True)
+  d_out, d_rows, d_rc, _ = suite.analyze_session(ctx2, d_queries, dump=True)
+  d_written = d_out["d"].get("evaluations", {}).get("entriesWritten")
+  w.check(
+    "HV4a process D stores a search tree, whose INTERIOR entries carry no ownership map",
+    d_rc == 0 and d_written and d_written > args.positions,
+    "rc=%d NN rows=%d entriesWritten=%s (more than the %d roots, so interior nodes are in there)"
+    % (d_rc, d_rows, d_written, args.positions),
+    "entriesWritten > one per query",
+  )
+
+  containers2 = sorted(glob.glob(os.path.join(cache_dir, ctx2 + ".*.nnevals")))
+  if len(containers2) != 1:
+    w.check("HV4 could be run at all", False,
+            "containers=%s" % [os.path.basename(x) for x in containers2],
+            "exactly one container")
+    return 1
+
+  e_out, e_rows, e_rc, _ = suite.analyze_session(ctx2, e_queries, dump=False)
+  e_verify = e_out["s"].get("hitVerification") or {}
+  w.check(
+    "HV4c *** the fall-through arm IS verified: verifiedFallThroughHits > 0 with no mismatch ***",
+    e_verify.get("verifiedFallThroughHits", 0) > 0 and e_verify.get("mismatches") == 0,
+    "verifiedFallThroughHits=%s of verifiedHits=%s, mismatches=%s, NN rows=%d"
+    % (e_verify.get("verifiedFallThroughHits"), e_verify.get("verifiedHits"),
+       e_verify.get("mismatches"), e_rows),
+    "verifiedFallThroughHits > 0 and mismatches == 0 -- this counter is zero if the "
+    "fall-through's verification is removed, which is the whole point of counting the arms apart",
+  )
+
+  print(corrupt(args.katago, containers2[0]).rstrip())
+  f_out, f_rows, f_rc, f_err = suite.analyze_session(ctx2, e_queries, dump=False)
+  f_verify = f_out["s"].get("hitVerification") or {}
+  w.check(
+    "HV4d *** and a corruption served through THIS arm is caught, on the right key and channel ***",
+    f_verify.get("mismatches", 0) > 0 and f_verify.get("worstChannel") == "whiteWinProb"
+    and f_verify.get("verifiedFallThroughHits", 0) > 0,
+    "mismatches=%s worstChannel=%r worstKey=%r verifiedFallThroughHits=%s"
+    % (f_verify.get("mismatches"), f_verify.get("worstChannel"), f_verify.get("worstKey"),
+       f_verify.get("verifiedFallThroughHits")),
+    "mismatches > 0 on whiteWinProb, with the fall-through arm having done comparisons",
+  )
+  w.check(
+    "HV4e and the engine survives a corrupted store on this arm too, reporting rather than "
+    "refusing",
+    f_rc == 0 and all(("error" not in f_out["q%d" % i]) for i in range(len(e_queries))),
+    "rc=%d, %d queries answered without error, mismatches=%s verifiedFallThroughHits=%s"
+    % (f_rc, len(e_queries), f_verify.get("mismatches"), f_verify.get("verifiedFallThroughHits")),
+    "rc==0 and no query carried an error",
   )
 
   print()

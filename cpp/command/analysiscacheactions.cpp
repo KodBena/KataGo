@@ -1062,9 +1062,12 @@ json cacheStatsExecute(
   if(verify.has_value()) {
     json v;
     v["verifiedHits"] = verify.value().verifiedHits;
+    v["verifiedFallThroughHits"] = verify.value().verifiedFallThroughHits;
     v["mismatches"] = verify.value().mismatches;
     v["skippedNondeterministicSymmetry"] = verify.value().skippedNondeterministicSymmetry;
     v["skippedResidentOrigin"] = verify.value().skippedResidentOrigin;
+    v["skippedNoRecompute"] = verify.value().skippedNoRecompute;
+    v["recomputesThatThrew"] = verify.value().recomputesThatThrew;
     // A RATIO AGAINST THE ALLOWANCE, not a raw deviation: the channels are in five different
     // units and a maximum over them in raw units means nothing. <= 1.0 is a held comparison.
     v["worstDeviationRatio"] = verify.value().worstDeviationRatio;

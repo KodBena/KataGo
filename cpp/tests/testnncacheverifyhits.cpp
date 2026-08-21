@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <iostream>
 
 #include "../core/global.h"
@@ -84,7 +85,7 @@ void testIdenticalOutputsHoldWithNoDeviation() {
   NNOutput a, b;
   fillOutput(a, EDGE, EDGE, true, 0.0);
   fillOutput(b, EDGE, EDGE, true, 0.0);
-  testAssert(verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE));
+  testAssert(verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
   const NNCacheHitVerifyStats stats = verifier.stats();
   testAssert(stats.verifiedHits == 1);
   testAssert(stats.mismatches == 0);
@@ -104,7 +105,7 @@ void testAPerturbationInsideTheAllowanceHolds() {
   // Half the fp32 allowance on a probability channel, whose magnitude is under the floor so
   // the allowance is exactly relative*floor = 1e-4.
   b.whiteWinProb = a.whiteWinProb + 5e-5f;
-  testAssert(verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE));
+  testAssert(verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
   const NNCacheHitVerifyStats stats = verifier.stats();
   testAssert(stats.mismatches == 0);
   testAssert(stats.worstDeviationRatio > 0.0 && stats.worstDeviationRatio < 1.0);
@@ -121,7 +122,7 @@ void testAValueChannelOutsideTheAllowanceIsReportedByName() {
   fillOutput(a, EDGE, EDGE, true, 0.0);
   fillOutput(b, EDGE, EDGE, true, 0.0);
   b.whiteLead = a.whiteLead + 0.25f;
-  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE));
+  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
   const NNCacheHitVerifyStats stats = verifier.stats();
   testAssert(stats.verifiedHits == 1);
   testAssert(stats.mismatches == 1);
@@ -139,7 +140,7 @@ void testAPolicySlotOutsideTheAllowanceNamesItsIndex() {
   fillOutput(a, EDGE, EDGE, true, 0.0);
   fillOutput(b, EDGE, EDGE, true, 0.0);
   b.policyProbs[17] = a.policyProbs[17] + 0.01f;
-  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE));
+  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
   testAssert(verifier.stats().worstChannel == "policyProbs[17]");
   cout << "hit verify: a policy slot is caught by index, worstChannel="
        << verifier.stats().worstChannel << endl;
@@ -152,7 +153,7 @@ void testAnOwnershipSlotOutsideTheAllowanceIsCaught() {
   fillOutput(a, EDGE, EDGE, true, 0.0);
   fillOutput(b, EDGE, EDGE, true, 0.0);
   b.whiteOwnerMap[200] = a.whiteOwnerMap[200] + 0.5f;
-  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE));
+  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
   testAssert(verifier.stats().worstChannel == "whiteOwnerMap[200]");
   cout << "hit verify: an ownership slot is caught by index, worstChannel="
        << verifier.stats().worstChannel << endl;
@@ -166,10 +167,61 @@ void testALostOwnershipMapIsAMismatchAndNotASkippedChannel() {
   NNOutput a, b;
   fillOutput(a, EDGE, EDGE, true, 0.0);
   fillOutput(b, EDGE, EDGE, false, 0.0);
-  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE));
+  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
   testAssert(verifier.stats().worstChannel == "whiteOwnerMap presence");
   cout << "hit verify: an ownership map present on one side only is a mismatch: "
        << verifier.stats().worstChannel << endl;
+}
+
+// AN INFINITY ON ONE SIDE ONLY IS A MISMATCH, AND THIS IS THE LEG THE FIRST DRAFT DID NOT HAVE.
+//
+// It is the exact inverse of the NaN case above and it fooled the arithmetic in the opposite
+// direction: with served = +inf the allowance is also inf, the deviation is inf, and the ratio is
+// inf/inf = NaN -- which is FALSE against every comparison, so the fold skipped it and the
+// comparison concluded HELD. The grossest corruption an f32 can carry was the one value the
+// instrument could not see (found and reproduced by audit, 2026-08-21).
+void testAnInfinityOnOneSideOnlyIsAMismatch() {
+  const float posInf = std::numeric_limits<float>::infinity();
+  struct Case { float served; float recomputed; const char* what; };
+  const Case cases[] = {
+    { posInf, 0.51f, "+inf served against a finite recompute" },
+    { -posInf, 0.51f, "-inf served against a finite recompute" },
+    { 0.51f, posInf, "a finite served value against a +inf recompute" },
+    { posInf, -posInf, "+inf against -inf" },
+  };
+  for(const Case& c: cases) {
+    NNCacheHitVerifier verifier(fp32Tolerances(), false, NULL);
+    NNOutput a, b;
+    fillOutput(a, EDGE, EDGE, true, 0.0);
+    fillOutput(b, EDGE, EDGE, true, 0.0);
+    a.whiteWinProb = c.served;
+    b.whiteWinProb = c.recomputed;
+    testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
+    testAssert(verifier.stats().mismatches == 1);
+    testAssert(verifier.stats().worstChannel == "whiteWinProb");
+    cout << "hit verify: " << c.what << " is a mismatch" << endl;
+  }
+}
+
+// AND TWO EQUAL NON-FINITE VALUES HOLD, because that is the format faithfully round-tripping
+// what was written -- which is exactly what putF32/getF32 exist to do. Without this leg the fix
+// above could have been "any non-finite value is a mismatch", which would report a correctly
+// persisted infinity as corruption.
+void testTwoEqualNonFiniteValuesHold() {
+  const float posInf = std::numeric_limits<float>::infinity();
+  const float values[] = { posInf, -posInf, std::nanf("") };
+  for(const float v: values) {
+    NNCacheHitVerifier verifier(fp32Tolerances(), false, NULL);
+    NNOutput a, b;
+    fillOutput(a, EDGE, EDGE, true, 0.0);
+    fillOutput(b, EDGE, EDGE, true, 0.0);
+    a.whiteScoreMean = v;
+    b.whiteScoreMean = v;
+    testAssert(verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
+    testAssert(verifier.stats().mismatches == 0);
+  }
+  cout << "hit verify: an infinity or a NaN present IDENTICALLY on both sides holds -- the format "
+          "round-tripped it, which is not a defect" << endl;
 }
 
 // A NaN ON ONE SIDE ONLY IS A MISMATCH. It has to be forced rather than computed: a NaN
@@ -180,7 +232,7 @@ void testANaNOnOneSideOnlyIsAMismatch() {
   fillOutput(a, EDGE, EDGE, true, 0.0);
   fillOutput(b, EDGE, EDGE, true, 0.0);
   b.whiteScoreMean = std::nanf("");
-  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE));
+  testAssert(!verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
   testAssert(verifier.stats().worstChannel == "whiteScoreMean");
   cout << "hit verify: a NaN on one side only is caught rather than passing as held" << endl;
 }
@@ -196,14 +248,14 @@ void testTheAllowanceScalesWithTheChannelsOwnMagnitude() {
   // 2e-3 absolute: ten times the fp32 allowance of a probability channel, but under the
   // 1e-4 * 410.5 = 4.1e-2 that this channel's own magnitude earns it.
   b.whiteScoreMeanSq = a.whiteScoreMeanSq + 2e-3f;
-  testAssert(verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE));
+  testAssert(verifier.compare(a.nnHash, 0, a, b, POLICY_SIZE, false));
   // The same absolute move on a small channel does NOT hold.
   NNCacheHitVerifier verifier2(fp32Tolerances(), false, NULL);
   NNOutput c, d;
   fillOutput(c, EDGE, EDGE, true, 0.0);
   fillOutput(d, EDGE, EDGE, true, 0.0);
   d.whiteWinProb = c.whiteWinProb + 2e-3f;
-  testAssert(!verifier2.compare(c.nnHash, 0, c, d, POLICY_SIZE));
+  testAssert(!verifier2.compare(c.nnHash, 0, c, d, POLICY_SIZE, false));
   cout << "hit verify: 2e-3 holds on whiteScoreMeanSq (|v|~410) and fails on whiteWinProb "
           "(|v|<1) -- the allowance follows the channel's own magnitude" << endl;
 }
@@ -226,11 +278,15 @@ void testTheSkipCountsAreSeparateFromTheVerifiedCount() {
           "skippedNondeterministicSymmetry=" << stats.skippedNondeterministicSymmetry
        << " skippedResidentOrigin=" << stats.skippedResidentOrigin << endl;
 
-  // AND THE OPT-IN IS REAL: with it on, a resident hit is verified and still counted as the
-  // opt-in it was, so a reader can tell an all-resident run from an all-persisted one.
+  // AND THE OPT-IN IS REAL, AND DOES NOT DOUBLE-COUNT. With it on a resident hit is verified,
+  // and therefore NOT skipped -- so the counter whose name and published JSON key both say "not
+  // compared" stays at zero. The first draft incremented above the opt-in test and a leg here
+  // asserted that, locking in a field that counted hits it had not skipped (audit finding).
   NNCacheHitVerifier withResident(fp32Tolerances(), true, NULL);
   testAssert(withResident.shouldVerify(NNCacheHitOrigin::LevelOneResident));
-  testAssert(withResident.stats().skippedResidentOrigin == 1);
+  testAssert(withResident.shouldVerify(NNCacheHitOrigin::LevelZeroPersisted));
+  testAssert(withResident.stats().skippedResidentOrigin == 0);
+  cout << "hit verify: with the resident opt-in on, a resident hit is verified and skippedResidentOrigin stays 0" << endl;
 }
 
 // THE RECOMPUTE SCOPE NESTS AND UNWINDS. It is what keeps a verification recompute from
@@ -321,6 +377,8 @@ void Tests::runNNCacheVerifyHitsTests() {
   testAnOwnershipSlotOutsideTheAllowanceIsCaught();
   testALostOwnershipMapIsAMismatchAndNotASkippedChannel();
   testANaNOnOneSideOnlyIsAMismatch();
+  testAnInfinityOnOneSideOnlyIsAMismatch();
+  testTwoEqualNonFiniteValuesHold();
   testTheAllowanceScalesWithTheChannelsOwnMagnitude();
   testTheSkipCountsAreSeparateFromTheVerifiedCount();
   testTheRecomputeScopeNestsAndUnwinds();

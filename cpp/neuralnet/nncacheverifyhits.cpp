@@ -84,12 +84,17 @@ NNCacheHitVerifier::NNCacheHitVerifier(
     logger_(logger),
     mutex_(),
     verifiedHits_(0),
+    verifiedFallThroughHits_(0),
     mismatches_(0),
     skippedNondeterministicSymmetry_(0),
     skippedResidentOrigin_(0),
+    skippedNoRecompute_(0),
+    recomputesThatThrew_(0),
     worstDeviationRatio_(0.0),
-    worstChannel_(),
-    worstKey_()
+    // "none" AND NOT THE EMPTY STRING. This is the field a reader checks first, and an empty
+    // string reads as "missing" rather than as "nothing deviated" (audit note, 2026-08-21).
+    worstChannel_("none"),
+    worstKey_("none")
 {
   // SAYS SO ON ARMING. A build that silently carries this would be indistinguishable from the
   // default build in its own log, which is exactly the confusion the compile-time gate exists
@@ -108,16 +113,30 @@ NNCacheHitVerifier::~NNCacheHitVerifier() {
 }
 
 bool NNCacheHitVerifier::shouldVerify(NNCacheHitOrigin origin) {
-  if(origin == NNCacheHitOrigin::LevelZeroPersisted)
+  if(origin == NNCacheHitOrigin::LevelZeroPersisted || verifyResidentOrigin_)
     return true;
+  // COUNTED ONLY WHERE IT IS ACTUALLY SKIPPED. The increment used to sit above the opt-in test,
+  // so with nnCacheVerifyHitsIncludeResident=true a resident hit was both verified and reported
+  // as skipped -- a field whose own name and published JSON key say "not compared" carrying
+  // hits that were (audit finding, 2026-08-21).
   lock_guard<std::mutex> lock(mutex_);
   skippedResidentOrigin_ += 1;
-  return verifyResidentOrigin_;
+  return false;
 }
 
 void NNCacheHitVerifier::countSkippedNondeterministicSymmetry() {
   lock_guard<std::mutex> lock(mutex_);
   skippedNondeterministicSymmetry_ += 1;
+}
+
+void NNCacheHitVerifier::countSkippedNoRecompute() {
+  lock_guard<std::mutex> lock(mutex_);
+  skippedNoRecompute_ += 1;
+}
+
+void NNCacheHitVerifier::countRecomputeThrew() {
+  lock_guard<std::mutex> lock(mutex_);
+  recomputesThatThrew_ += 1;
 }
 
 void NNCacheHitVerifier::checkChannel(
@@ -127,18 +146,40 @@ void NNCacheHitVerifier::checkChannel(
   double recomputedValue,
   WorstChannel& worst
 ) const {
+  // NON-FINITE VALUES ARE DECIDED FIRST, AND NOT BY ARITHMETIC. This is the hole an audit found
+  // and reproduced (2026-08-21): with served = +inf the allowance is also inf, the deviation is
+  // inf, and the ratio is inf/inf = NaN -- which is FALSE against every comparison, so the fold
+  // below skips it and `held` concludes true. The grossest corruption an f32 can carry was the
+  // one value this instrument could not see. It is not exotic either: a mis-offset read hands
+  // getF32 an arbitrary 32-bit pattern, and about one in 256 of those has exponent 0xFF.
+  //
+  // THE RULE: two non-finite values agree only if they are THE SAME non-finite value -- both
+  // NaN, both +inf, both -inf. That much is the format faithfully round-tripping what was
+  // written, which putF32/getF32 exist to do. Anything else is a mismatch, forced to infinity so
+  // it cannot be argued down by a tolerance.
+  const bool servedFinite = std::isfinite(servedValue);
+  const bool recomputedFinite = std::isfinite(recomputedValue);
+  if(!servedFinite || !recomputedFinite) {
+    const bool sameNonFinite =
+      (std::isnan(servedValue) && std::isnan(recomputedValue)) ||
+      (servedValue == recomputedValue);  // catches +inf/+inf and -inf/-inf
+    if(!sameNonFinite && std::numeric_limits<double>::infinity() > worst.ratio) {
+      worst.ratio = std::numeric_limits<double>::infinity();
+      worst.name = slot < 0 ? string(channelName) : (string(channelName) + "[" + Global::intToString(slot) + "]");
+      worst.served = servedValue;
+      worst.recomputed = recomputedValue;
+      worst.allowance = 0.0;
+    }
+    return;
+  }
+
   const double magnitude = std::max(std::fabs(servedValue), std::fabs(recomputedValue));
   // Positive by construction: fromConfig bounds relative strictly above zero, and a zero floor
   // still leaves the magnitude term -- but a channel that is exactly zero on both sides with a
   // zero floor would divide by zero, so the guard is not decorative.
   const double allowance = std::max(tolerances_.relative * std::max(magnitude, tolerances_.floor), 1e-300);
   const double deviation = std::fabs(servedValue - recomputedValue);
-  // A NaN on ONE side only is a mismatch, and it must be forced rather than computed: a NaN
-  // deviation compares false against the allowance and would otherwise pass as "held". A NaN
-  // on BOTH sides is the format faithfully round-tripping a NaN, which putF32/getF32 exist to
-  // do, and is not a defect.
-  const bool nanDisagreement = std::isnan(servedValue) != std::isnan(recomputedValue);
-  const double ratio = nanDisagreement ? std::numeric_limits<double>::infinity() : deviation / allowance;
+  const double ratio = deviation / allowance;
   if(ratio > worst.ratio) {
     worst.ratio = ratio;
     worst.name = slot < 0 ? string(channelName) : (string(channelName) + "[" + Global::intToString(slot) + "]");
@@ -153,7 +194,8 @@ bool NNCacheHitVerifier::compare(
   int symmetryUsed,
   const NNOutput& served,
   const NNOutput& recomputed,
-  int policySize
+  int policySize,
+  bool viaOwnerMapFallThrough
 ) {
   WorstChannel worst;
   worst.name = "none";
@@ -187,7 +229,8 @@ bool NNCacheHitVerifier::compare(
 
     // THE OWNERMAP-PRESENT FLAG IS PERSISTED TOO. A disagreement about whether there IS an
     // ownership map is the same defect class as a wrong value in one, so it is a mismatch and
-    // not a reason to skip the channel.
+    // not a reason to skip the channel. The recompute always asks for a map exactly when the
+    // served entry has one, so a disagreement here is the format's and nobody else's.
     const bool servedHasOwnership = served.whiteOwnerMap != NULL;
     const bool recomputedHasOwnership = recomputed.whiteOwnerMap != NULL;
     if(servedHasOwnership != recomputedHasOwnership) {
@@ -211,6 +254,8 @@ bool NNCacheHitVerifier::compare(
   {
     lock_guard<std::mutex> lock(mutex_);
     verifiedHits_ += 1;
+    if(viaOwnerMapFallThrough)
+      verifiedFallThroughHits_ += 1;
     if(!held)
       mismatches_ += 1;
     if(worst.ratio > worstDeviationRatio_) {
@@ -251,9 +296,12 @@ NNCacheHitVerifyStats NNCacheHitVerifier::stats() const {
   lock_guard<std::mutex> lock(mutex_);
   NNCacheHitVerifyStats out;
   out.verifiedHits = verifiedHits_;
+  out.verifiedFallThroughHits = verifiedFallThroughHits_;
   out.mismatches = mismatches_;
   out.skippedNondeterministicSymmetry = skippedNondeterministicSymmetry_;
   out.skippedResidentOrigin = skippedResidentOrigin_;
+  out.skippedNoRecompute = skippedNoRecompute_;
+  out.recomputesThatThrew = recomputesThatThrew_;
   out.worstDeviationRatio = worstDeviationRatio_;
   out.worstChannel = worstChannel_;
   out.worstKey = worstKey_;

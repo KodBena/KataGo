@@ -1332,10 +1332,12 @@ void NNEvaluator::evaluate(
     {
       m_numCacheHits.fetch_add(1, std::memory_order_relaxed);
 #ifdef KATAGO_NNCACHE_VERIFY_HITS
-      // AFTER the hit is counted and BEFORE the return, so every served hit is offered to the
-      // verifier and none is offered twice. It cannot change buf.result: see the header.
+      // AFTER the hit is counted and BEFORE the return. This is ONE OF TWO arms that serve
+      // deserialized bytes; the other is the ownermap fall-through immediately below, verified
+      // further down where its forward pass lands. It cannot change buf.result: see the header.
       verifyCacheHitAgainstForwardPass(
-        board, history, nextPlayer, sgfMeta, nnInputParams, hitOrigin, buf.result
+        board, history, nextPlayer, sgfMeta, nnInputParams, hitOrigin, buf.result,
+        /*viaOwnerMapFallThrough*/ false
       );
 #endif
       buf.hasResult = true;
@@ -1345,6 +1347,21 @@ void NNEvaluator::evaluate(
       hadResultWithoutOwnerMap = true;
       resultWithoutOwnerMap = std::move(buf.result);
       buf.result = nullptr;
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+      // THE SECOND ARM THAT SERVES DESERIALIZED BYTES, AND IT IS VERIFIED TOO. This entry does
+      // not answer the request as it stands -- it lacks the ownership map -- but its scalars and
+      // its whole policy array are copied back over the fresh result below and handed to the
+      // caller, and then STORED into level 1. So a corrupt on-disk value reaches the client here
+      // exactly as it would through the early return, and is additionally promoted into resident
+      // memory. Verified against its own recompute rather than against the forward pass this
+      // call is about to make: that one is deliberately NOT postprocessed on this path (see the
+      // copy below), so it is raw logits and comparing it to a postprocessed cached entry would
+      // measure the postprocessing, not the deserialization.
+      verifyCacheHitAgainstForwardPass(
+        board, history, nextPlayer, sgfMeta, nnInputParams, hitOrigin, resultWithoutOwnerMap,
+        /*viaOwnerMapFallThrough*/ true
+      );
+#endif
     }
   }
   buf.includeOwnerMap = includeOwnerMap;
@@ -1725,7 +1742,8 @@ void NNEvaluator::verifyCacheHitAgainstForwardPass(
   const SGFMetadata* sgfMeta,
   const MiscNNInputParams& nnInputParams,
   NNCacheHitOrigin origin,
-  const shared_ptr<NNOutput>& served
+  const shared_ptr<NNOutput>& served,
+  bool viaOwnerMapFallThrough
 ) {
   if(nnCacheHitVerifier == nullptr)
     return;
@@ -1736,28 +1754,18 @@ void NNEvaluator::verifyCacheHitAgainstForwardPass(
     return;
   // A NEURAL-NET-LESS EVALUATOR HAS NO FORWARD PASS TO COMPARE AGAINST. Recomputing here would
   // compare a cached entry against the fixed dummy output and report every hit as a mismatch.
-  if(debugSkipNeuralNet)
+  // Counted rather than returned from silently: a build configured this way verifies nothing,
+  // and that must be readable off cache_stats rather than inferred.
+  if(debugSkipNeuralNet) {
+    nnCacheHitVerifier->countSkippedNoRecompute();
     return;
+  }
   if(!nnCacheHitVerifier->shouldVerify(origin))
     return;
 
-  // PINNING THE SYMMETRY, OR REFUSING. See nncacheverifyhits.h: a cached evaluation does not
-  // record the symmetry it was computed under, so the only configuration in which a recompute
-  // is comparable to it at all is one where every unspecified evaluation takes the SAME
-  // symmetry. A request that named its own symmetry is already pinned and is reused as-is.
-  int symmetryToUse = nnInputParams.symmetry;
-  if(symmetryToUse == NNInputs::SYMMETRY_NOTSPECIFIED) {
-    if(currentDoRandomize.load(std::memory_order_acquire)) {
-      nnCacheHitVerifier->countSkippedNondeterministicSymmetry();
-      return;
-    }
-    symmetryToUse = currentDefaultSymmetry.load(std::memory_order_acquire);
-  }
-  // SYMMETRY_ALL is not a symmetry a single forward pass can be run under.
-  if(symmetryToUse < 0 || symmetryToUse >= SymmetryHelpers::NUM_SYMMETRIES) {
-    nnCacheHitVerifier->countSkippedNondeterministicSymmetry();
+  const int symmetryToUse = pinnedVerifySymmetryOrRefuse(nnInputParams);
+  if(symmetryToUse < 0)
     return;
-  }
 
   MiscNNInputParams recomputeParams = nnInputParams;
   recomputeParams.symmetry = symmetryToUse;
@@ -1772,7 +1780,7 @@ void NNEvaluator::verifyCacheHitAgainstForwardPass(
   // Unattributed on purpose: this evaluation earns no card anything, and it will not be stored.
   verifyBuf.cacheAttribution = NNCacheAttribution::noAttributableContext();
 
-  {
+  try {
     // THE SCOPE IS WHAT KEEPS THE INSTRUMENT OUTSIDE THE INSTRUMENT -- it suppresses the
     // terminal store at the end of the nested evaluate(). It must cover the whole call.
     NNCacheHitVerifier::RecomputeScope scope;
@@ -1784,10 +1792,49 @@ void NNEvaluator::verifyCacheHitAgainstForwardPass(
       /*skipCache*/ true, /*includeOwnerMap*/ served->whiteOwnerMap != NULL
     );
   }
-
-  if(verifyBuf.result == nullptr)
+  catch(const std::exception&) {
+    // COUNTED AND SWALLOWED. The caller of the outer evaluate() is about to be handed the
+    // evaluation the cache served; letting this throw past that would replace their answer with
+    // an exception, which is the instrument taking down the request it exists to observe. The
+    // count is what keeps it from vanishing instead (audit finding, 2026-08-21).
+    nnCacheHitVerifier->countRecomputeThrew();
     return;
-  nnCacheHitVerifier->compare(served->nnHash, symmetryToUse, *served, *verifyBuf.result, policySize);
+  }
+
+  if(verifyBuf.result == nullptr) {
+    nnCacheHitVerifier->countSkippedNoRecompute();
+    return;
+  }
+  nnCacheHitVerifier->compare(
+    served->nnHash, symmetryToUse, *served, *verifyBuf.result, policySize, viaOwnerMapFallThrough
+  );
+}
+
+// PINNING THE SYMMETRY, OR REFUSING -- written once because both verify paths ask exactly the
+// same question and two copies of it could disagree (ADR-0012 P1). Returns the symmetry to
+// recompute under, or -1 having COUNTED the refusal.
+//
+// See nncacheverifyhits.h for the whole account. In short: a cached evaluation does not record
+// the symmetry it was computed under and the cache key does not fold symmetry, so the only
+// configuration in which a recompute is comparable to a served entry is one where every
+// unspecified evaluation takes the same currentDefaultSymmetry. A request that NAMES a symmetry
+// is refused, not honoured: pinning the recompute to the request's symmetry says nothing about
+// the entry's, and comparing across two symmetries measures the net's non-equivariance.
+int NNEvaluator::pinnedVerifySymmetryOrRefuse(const MiscNNInputParams& nnInputParams) {
+  if(nnInputParams.symmetry != NNInputs::SYMMETRY_NOTSPECIFIED) {
+    nnCacheHitVerifier->countSkippedNondeterministicSymmetry();
+    return -1;
+  }
+  if(currentDoRandomize.load(std::memory_order_acquire)) {
+    nnCacheHitVerifier->countSkippedNondeterministicSymmetry();
+    return -1;
+  }
+  const int defaultSymmetry = currentDefaultSymmetry.load(std::memory_order_acquire);
+  if(defaultSymmetry < 0 || defaultSymmetry >= SymmetryHelpers::NUM_SYMMETRIES) {
+    nnCacheHitVerifier->countSkippedNondeterministicSymmetry();
+    return -1;
+  }
+  return defaultSymmetry;
 }
 
 #endif  // KATAGO_NNCACHE_VERIFY_HITS
