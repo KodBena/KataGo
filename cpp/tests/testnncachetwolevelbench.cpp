@@ -296,4 +296,172 @@ void Tests::runNNCacheTwoLevelBench() {
       }
     }
   }
+
+  // ARM D: WHAT OBSERVATION COUNTING COSTS ON THE PATH MCTS HAMMERS.
+  //
+  // NNEvaluator::evaluate calls NNCacheTable::observe once per request, before any level is
+  // consulted, so the added cost sits on the same loop the arms above measure. Three states,
+  // because they are three different costs and a single figure would hide the one that
+  // matters most:
+  //
+  //   D0 NO CONTEXT EVER ATTACHED. The overwhelmingly common configuration -- plain katago
+  //   play, no cache directory -- and the one the design is REQUIRED to leave
+  //   indistinguishable from baseline. observe() is inlined and the ledger pointer is null for
+  //   the life of the process, so what is being measured is one always-not-taken branch.
+  //
+  //   D1 A CONTEXT ATTACHED, THE REQUEST NAMING NONE. One more test and no work: an
+  //   observation belongs to a card or to no file at all.
+  //
+  //   D2 A CONTEXT ATTACHED AND NAMED. The real cost: one pooled mutex, one bounded probe over
+  //   32-byte rows, one increment. This is what a study session actually pays.
+  //
+  // MEASURED AS A DIFFERENCE IN ONE PROCESS, INTERLEAVED REP BY REP against the same loop
+  // WITHOUT the observe call, over the same key stream, against the same table. That is a
+  // stronger protocol than an A/B across two builds for this particular quantity, and
+  // deliberately so: a cross-build A/B of a few nanoseconds is exactly the shape a compiler
+  // flag mismatch fakes, and this project has already been handed one fake 2x regression that
+  // way. Here both arms are the same binary, the same optimisation, the same instruction cache
+  // -- the only difference between them is the call under test.
+  //
+  // The baseline arm is measured FIRST in each rep and the observing arm SECOND, and then the
+  // order is reversed on odd reps, so a warm-up asymmetry cannot be read as the effect.
+  {
+    cout << "arm D: what NNCacheTable::observe costs per evaluation request, as a difference "
+         << "measured in one process against the same loop without it." << endl;
+
+    // A plain single-level table: level 0 is irrelevant to this arm, and using one would put
+    // the resolution list's own cost inside both arms for nothing.
+    unique_ptr<NNCacheTable> plain = NNCacheTable::create(NNCacheConfig::statusQuo(16, 2));
+    const NNCacheAttribution unattributed = NNCacheAttribution::noAttributableContext();
+
+    // D0 first, and it must run BEFORE any context is attached: attaching one allocates the
+    // ledger for the life of the table, and there is no way back.
+    vector<double> baseNs0;
+    vector<double> obsNs0;
+    for(int rep = 0; rep < REPS; rep++) {
+      shared_ptr<NNOutput> got;
+      int64_t found = 0;
+      const bool baseFirst = (rep % 2) == 0;
+      double base = 0.0;
+      double obs = 0.0;
+      for(int which = 0; which < 2; which++) {
+        const bool doBase = (which == 0) == baseFirst;
+        ClockTimer timer;
+        if(doBase) {
+          for(int64_t i = 0; i < LOOKUPS_PER_REP; i++)
+            if(plain->get(missQueries[(size_t)i], got)) found++;
+          base = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
+        }
+        else {
+          for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
+            plain->observe(missQueries[(size_t)i], unattributed);
+            if(plain->get(missQueries[(size_t)i], got)) found++;
+          }
+          obs = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
+        }
+      }
+      if(found != 0) throw StringError("bench: the miss stream hit something");
+      baseNs0.push_back(base);
+      obsNs0.push_back(obs);
+    }
+    report("arm D0 no context, get only          ", baseNs0);
+    report("arm D0 no context, observe + get     ", obsNs0);
+    cout << "  arm D0 added cost (minima): "
+         << (*std::min_element(obsNs0.begin(), obsNs0.end()) - *std::min_element(baseNs0.begin(), baseNs0.end()))
+         << " ns/request" << endl;
+
+    // Now a context exists, so the ledger is allocated and D1/D2 measure the real structure.
+    const NNCacheContextId card = plain->attachCacheContext("bench-card");
+    const NNCacheAttribution attributed = NNCacheAttribution::toContext(card);
+    const NNCacheAttribution* const arms[2] = {&unattributed, &attributed};
+    const char* const armNames[2] = {"arm D1 context attached, unattributed", "arm D2 context attached, named       "};
+    for(int arm = 0; arm < 2; arm++) {
+      vector<double> baseNs;
+      vector<double> obsNs;
+      for(int rep = 0; rep < REPS; rep++) {
+        shared_ptr<NNOutput> got;
+        int64_t found = 0;
+        const bool baseFirst = (rep % 2) == 0;
+        double base = 0.0;
+        double obs = 0.0;
+        for(int which = 0; which < 2; which++) {
+          const bool doBase = (which == 0) == baseFirst;
+          ClockTimer timer;
+          if(doBase) {
+            for(int64_t i = 0; i < LOOKUPS_PER_REP; i++)
+              if(plain->get(missQueries[(size_t)i], got)) found++;
+            base = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
+          }
+          else {
+            for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
+              plain->observe(missQueries[(size_t)i], *arms[arm]);
+              if(plain->get(missQueries[(size_t)i], got)) found++;
+            }
+            obs = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
+          }
+        }
+        if(found != 0) throw StringError("bench: the miss stream hit something");
+        baseNs.push_back(base);
+        obsNs.push_back(obs);
+      }
+      report(string(armNames[arm]) + " get only     ", baseNs);
+      report(string(armNames[arm]) + " observe + get", obsNs);
+      cout << "  " << armNames[arm] << " added cost (minima): "
+           << (*std::min_element(obsNs.begin(), obsNs.end()) - *std::min_element(baseNs.begin(), baseNs.end()))
+           << " ns/request" << endl;
+    }
+    // What D2 actually recorded, so the arm is not silently measuring an early-return: the
+    // stream is 1e6 lookups over ENTRIES_PER_SOURCE distinct keys, and the ledger's overflow
+    // counter says whether every one of them found a row.
+    const NNCacheObservationLedger observed = plain->harvestObservationCountsFor(card);
+    cout << "  arm D2 recorded " << observed.entries().size() << " distinct keys, "
+         << observed.unrecordedObservations() << " observations with no row available" << endl;
+
+    // ARM D3: WHERE ARM D2'S COST ACTUALLY GOES, because a bare "55 ns" with no attribution is
+    // a number nobody can act on (ADR-0009: measure the mechanism before restructuring for it).
+    //
+    // Two candidates -- the pooled mutex, and a random access into a table far larger than any
+    // cache -- separated by varying ONLY the second. Both arms run the recorder alone, take the
+    // same lock, and execute the same probe; they differ in whether the rows they touch are
+    // resident. The DIFFERENCE is the memory. What is LEFT at the small size is the lock, the
+    // hash mix and the compare.
+    //
+    // THE SMALL ARM'S KEY STREAM IS BOUNDED TO KEEP IT A CONTROL. A 2^12-row table fed the full
+    // 45,664-key stream overflows its probe window on almost every call and walks all 16 slots,
+    // which is MORE instruction work rather than less -- the first version of this arm did
+    // exactly that and its number could not be read as "the same work without the memory". The
+    // stream here is cut to a distinct-key count that leaves the small table at the same load
+    // factor the production one sits at, so the probe lengths match and the arms are comparable.
+    {
+      const int smallPow = 12;
+      const int64_t smallDistinctKeys =
+        (((int64_t)1) << smallPow) * NNCacheObservationRecorder::maxLoadFactorPercent() / 100;
+      for(int arm = 0; arm < 2; arm++) {
+        const bool production = arm == 0;
+        const int pow2 = production ? NNCacheObservationRecorder::defaultPowerOfTwo() : smallPow;
+        const int mutexPow = pow2 < 10 ? pow2 : 10;
+        NNCacheObservationRecorder recorder(pow2, mutexPow);
+        // The production arm sees the whole stream; the control sees a bounded slice of the same
+        // keys, so the two differ in table size and in nothing about the keys themselves.
+        vector<Hash128> stream((size_t)LOOKUPS_PER_REP);
+        for(int64_t i = 0; i < LOOKUPS_PER_REP; i++)
+          stream[(size_t)i] = production
+            ? missQueries[(size_t)i]
+            : missQueries[(size_t)(splitmix((uint64_t)i) % (uint64_t)smallDistinctKeys)];
+        vector<double> ns;
+        for(int rep = 0; rep < REPS; rep++) {
+          ClockTimer timer;
+          for(int64_t i = 0; i < LOOKUPS_PER_REP; i++)
+            recorder.observe(stream[(size_t)i], 0);
+          ns.push_back(timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP);
+        }
+        report(
+          string("arm D3 recorder alone, 2^") + Global::intToString(pow2) + " rows (" +
+          Global::int64ToString((int64_t)observationRecorderBytes(pow2) / 1024) + " KiB), " +
+          Global::int64ToString(recorder.unrecordedObservations()) + " with no row",
+          ns
+        );
+      }
+    }
+  }
 }

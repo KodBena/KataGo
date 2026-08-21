@@ -70,7 +70,7 @@ THE GROUPS
                        and returns the identical answer.
                     P3 the persisted mark, then attach -> dump -> detach -> re-attach -> dump
                        with NO query in the process at all: the container byte-identical, the
-                       count log's content unmoved, no key's recorded lookups moved. P3e
+                       count log's content unmoved, no key's recorded observations moved. P3e
                        records the one place the file is NOT byte-identical, and why that is
                        FILED rather than fixed in this increment.
   K  the keying     K0 seed, K1 the own container re-attached (zero rows), K2 the other model

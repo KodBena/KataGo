@@ -5,7 +5,7 @@ and this is the machinery under them, so they are separate files with one concer
 rather than one file a reader has to page through to find either (ADR-0012 P3).
 
 NOTHING HERE ASSERTS ANYTHING ABOUT THE ENGINE. `Witness` only records and prints what a leg
-decided; `fingerprint`, `search_shape`, `digest_dir` and `lookup_profile` only say HOW an
+decided; `fingerprint`, `search_shape`, `digest_dir` and `observation_profile` only say HOW an
 observation is taken. The legs live in persistence_legs.py and keying_legs.py, and are the
 only place a property is claimed.
 """
@@ -177,21 +177,21 @@ def context_of(stats, context):
   return {}
 
 
-def lookup_profile(h, config, net, context, thresholds=(0, 1, 2, 3, 4)):
-  """{minLookups t: keys a level-0 attach admits at t}, each measured in its own process.
+def observation_profile(h, config, net, context, thresholds=(0, 1, 2, 3, 4)):
+  """{minObservations t: keys a level-0 attach admits at t}, each measured in its own process.
 
   This is the count log's per-key CONTENT, read through the engine's own count-log reader and
   its own level-0 selector -- not through a second hand-written decoder of the file, which
   would be a second author of the format (ADR-0012 P7). Two profiles taken around an act are
-  equal exactly when that act moved no key's recorded lookups.
+  equal exactly when that act moved no key's recorded observations.
   """
   profile = {}
   for t in thresholds:
     out, _ = h.session(config, [net], [
-      {"id": "a", "action": "cache_attach", "context": context, "level0": {"minLookups": t}}
+      {"id": "a", "action": "cache_attach", "context": context, "level0": {"minObservations": t}}
     ])
     r = out["a"]
     if "error" in r:
-      raise RuntimeError("lookup profile attach at minLookups=%d refused: %s" % (t, r["error"]))
+      raise RuntimeError("observation profile attach at minObservations=%d refused: %s" % (t, r["error"]))
     profile[t] = r.get("entriesInLevelZero")
   return profile

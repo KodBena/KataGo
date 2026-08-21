@@ -280,6 +280,117 @@ class Suite:
     print()
 
   # ---------------------------------------------------------------------------------------
+  # SC4: the DEFAULT admission, and the cross-session bootstrap it exists for.
+  # ---------------------------------------------------------------------------------------
+  def sc4_default_admission_bootstrap(self):
+    """cache_dump with NO "admission" field, across two processes over one directory.
+
+    THIS IS THE LEG THE WHOLE CURRENCY CHANGE IS FOR, and it is here rather than in the C++
+    suite because the claim is about two ENGINE PROCESSES and a real directory: an in-process
+    test can witness the arithmetic but not that a second engine's admission decision reads
+    what the first engine's dump wrote (ADR-0021 Rule 1).
+
+    The default is minObservations(2): store only positions that have come up more than once.
+    So the shape under test is three-legged and each leg is a different assertion:
+
+      A first session evaluates each position once. MOST of its cache keys are therefore below
+      the default threshold and their evaluations are refused -- and the COUNTS dump writes a
+      row for every one of them anyway, carrying 1. Writing those rows is the entire mechanism;
+      a dump that filtered once-seen keys out of the count log would make the threshold
+      permanently unreachable, and on the evaluations side alone that failure would look
+      identical to this leg passing.
+
+      NOT ALL of them: three 7x7 searches share sub-positions, so a handful of keys really are
+      presented twice inside the first session and really do clear the default there. That is
+      the currency working, not the fixture leaking, and the leg asserts the discrimination
+      (most refused, some admitted) rather than a clean zero that would be a fact about the
+      query set rather than about admission.
+
+      A second session asks for the SAME positions. The keys that were at 1 are now at 2, clear
+      the default, and are written.
+
+      A third session is served by the UNION of both dumps, having paid no neural net work.
+    """
+    print("== SC4: the default admission (seen twice) bootstraps across two processes ==")
+    ctx = self.context + "-sc4"
+    queries = positions(3)
+
+    # SESSION ONE: every position evaluated exactly once. No "admission" field at all.
+    one_reqs = [{"id": "a", "action": "cache_attach", "context": ctx}]
+    one_reqs += [dict(q, id="q%d" % i) for i, q in enumerate(queries)]
+    one_reqs += [{"id": "d", "action": "cache_dump", "context": ctx, "what": "both"},
+                 {"id": "s", "action": "cache_stats"},
+                 {"id": "x", "action": "cache_detach", "context": ctx}]
+    one_out, one_rows, one_rc = self.session(one_reqs)
+    one_dump = one_out["d"]
+    one_evals = one_dump.get("evaluations", {})
+    one_counts = one_dump.get("counts", {})
+
+    self.w.check(
+      "SC4a a dump with NO \"admission\" field is accepted, and defaults to seen-at-least-twice",
+      one_rc == 0 and "error" not in one_dump and "2" in str(one_evals.get("admission", "")),
+      "rc=%d admission=%s %s" % (one_rc, one_evals.get("admission"), disposition(one_dump)),
+      "the request is accepted with the field absent, and the admission it reports names 2",
+    )
+    one_written = one_evals.get("entriesWritten")
+    self.w.check(
+      "SC4b the default DISCRIMINATES: most of a first session's keys are refused as once-seen",
+      one_rc == 0 and one_rows > 0 and one_evals.get("belowThreshold", 0) > 0
+      and one_written is not None and one_written < one_rows
+      and one_evals.get("belowThreshold", 0) + one_written == one_rows,
+      "NN rows=%d entriesWritten=%s belowThreshold=%s"
+      % (one_rows, one_written, one_evals.get("belowThreshold")),
+      "real neural net work was done; the refused and the written partition it exactly, and "
+      "the refused are the majority -- the handful written are keys these three searches "
+      "genuinely presented twice",
+    )
+    self.w.check(
+      "SC4c the COUNT log still gets a row for every once-seen position -- the bootstrap itself",
+      one_rc == 0 and one_counts.get("bytesAppended", 0) > 0 and one_counts.get("rowsInLog", 0) > 0,
+      "counts bytesAppended=%s rowsInLog=%s (observationsThisSession=%s)"
+      % (one_counts.get("bytesAppended"), one_counts.get("rowsInLog"),
+         one_out["s"].get("observationsThisSession")),
+      "rows were written for keys whose evaluations were NOT written; without them no second "
+      "session could ever raise one to 2",
+    )
+
+    # SESSION TWO: the same positions again, in a new process. Each reaches 2.
+    two_reqs = [{"id": "a", "action": "cache_attach", "context": ctx}]
+    two_reqs += [dict(q, id="q%d" % i) for i, q in enumerate(queries)]
+    two_reqs += [{"id": "d", "action": "cache_dump", "context": ctx, "what": "both"},
+                 {"id": "x", "action": "cache_detach", "context": ctx}]
+    two_out, two_rows, two_rc = self.session(two_reqs)
+    two_evals = two_out["d"].get("evaluations", {})
+
+    self.w.check(
+      "SC4d the SECOND session's dump writes them: the counts accumulated across processes",
+      two_rc == 0 and two_evals.get("entriesWritten", 0) > 0,
+      "attach entriesInLevelZero=%s NN rows=%d entriesWritten=%s belowThreshold=%s %s"
+      % (two_out["a"].get("entriesInLevelZero"), two_rows, two_evals.get("entriesWritten"),
+         two_evals.get("belowThreshold"), disposition(two_out["d"])),
+      "the same default that admitted nothing in session one admits in session two, because "
+      "the count each key carries is now 2 -- one from each process",
+    )
+
+    # SESSION THREE: served by what session two wrote, paying no neural net work.
+    three_reqs = [{"id": "a", "action": "cache_attach", "context": ctx}]
+    three_reqs += [dict(q, id="q%d" % i) for i, q in enumerate(queries)]
+    three_reqs += [{"id": "x", "action": "cache_detach", "context": ctx, "discardUndumped": True}]
+    three_out, three_rows, three_rc = self.session(three_reqs)
+
+    self.w.check(
+      "SC4e a third process is served entirely by what the bootstrap admitted",
+      three_rc == 0 and three_rows == 0
+      and three_out["a"].get("entriesInLevelZero") == one_written + two_evals.get("entriesWritten", 0),
+      "entriesInLevelZero=%s (session one wrote %s, session two %s) NN rows=%d"
+      % (three_out["a"].get("entriesInLevelZero"), one_written,
+         two_evals.get("entriesWritten"), three_rows),
+      "zero neural net rows, and the attach counts the UNION of both dumps -- the container is "
+      "cumulative, so the figure to match is the sum and not session two's own number",
+    )
+    print()
+
+  # ---------------------------------------------------------------------------------------
   # SC3: a reader attaching WHILE a writer dumps. State-based, never timing-based.
   # ---------------------------------------------------------------------------------------
   def sc3_attach_during_dump(self):
@@ -428,7 +539,7 @@ def main():
   p.add_argument("--skip-probe", action="store_true",
                  help="Do not run lockfsprobe first. Only for a directory already probed.")
   p.add_argument("--keep", action="store_true", help="Leave this run's cache files behind.")
-  p.add_argument("--only", action="append", default=None, choices=["sc1", "sc2", "sc3"],
+  p.add_argument("--only", action="append", default=None, choices=["sc1", "sc2", "sc3", "sc4"],
                  help="Run only these scenarios. Repeatable.")
   args = p.parse_args()
 
@@ -485,7 +596,7 @@ def main():
 
   w = Witness()
   suite = Suite(w, binary, config, args.model, cache_dir, context)
-  chosen = args.only or ["sc1", "sc2", "sc3"]
+  chosen = args.only or ["sc1", "sc2", "sc3", "sc4"]
   try:
     if "sc1" in chosen:
       suite.sc1_sequential_reuse()
@@ -493,13 +604,16 @@ def main():
       suite.sc2_two_live_engines()
     if "sc3" in chosen:
       suite.sc3_attach_during_dump()
+    if "sc4" in chosen:
+      suite.sc4_default_admission_bootstrap()
   finally:
     if args.keep:
       print("kept: %s" % [os.path.basename(f) for f in context_files(cache_dir, context + "-sc1")
                           + context_files(cache_dir, context + "-sc2")
-                          + context_files(cache_dir, context + "-sc3")])
+                          + context_files(cache_dir, context + "-sc3")
+                          + context_files(cache_dir, context + "-sc4")])
     else:
-      for suffix in ("-sc1", "-sc2", "-sc3"):
+      for suffix in ("-sc1", "-sc2", "-sc3", "-sc4"):
         for f in context_files(cache_dir, context + suffix):
           try:
             os.remove(f)

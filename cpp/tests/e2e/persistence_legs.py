@@ -10,7 +10,7 @@ import os
 
 from e2e_harness import (
   COUNT_LOG_BLOCK_HEADER_BYTES, POSITION, context_of, digest_dir, disposition, fingerprint,
-  lookup_profile, search_shape,
+  observation_profile, search_shape,
 )
 
 
@@ -157,7 +157,7 @@ def run_persistence(w, h, name_a):
     "other reason -- 'already on disk' is why, not 'below threshold' or 'gone'" % seeded,
   )
   state1 = digest_dir(q_dir)
-  profile1 = lookup_profile(h, q_cfg, net_a, "card-5455")
+  profile1 = observation_profile(h, q_cfg, net_a, "card-5455")
 
   out3, rows3 = h.session(q_cfg, [net_a], [
     {"id": "a1", "action": "cache_attach", "context": "card-5455"},
@@ -169,7 +169,7 @@ def run_persistence(w, h, name_a):
     {"id": "s2", "action": "cache_stats"},
   ])
   state2 = digest_dir(q_dir)
-  profile2 = lookup_profile(h, q_cfg, net_a, "card-5455")
+  profile2 = observation_profile(h, q_cfg, net_a, "card-5455")
   steps = [out3[k] for k in ("a1", "d1", "x1", "a2", "d2")]
   ok_seq = all("error" not in r for r in steps)
   w.check(
@@ -216,10 +216,10 @@ def run_persistence(w, h, name_a):
     "the same row count -- the deltas the two dumps took were empty",
   )
   w.check(
-    "P3d NO key's recorded lookups moved: every minLookups threshold admits the same keys",
+    "P3d NO key's recorded observations moved: every minObservations threshold admits the same keys",
     ok_seq and profile1 == profile2 and profile1.get(0) == seeded,
     "before=%s after=%s (the container holds %s keys)" % (profile1, profile2, seeded),
-    "the two profiles are equal, and minLookups=0 admits all %s. Had a dump re-appended "
+    "the two profiles are equal, and minObservations=0 admits all %s. Had a dump re-appended "
     "counts it already wrote, every key's total would have risen and the profile would have "
     "shifted right" % seeded,
   )
