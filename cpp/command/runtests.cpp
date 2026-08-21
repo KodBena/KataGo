@@ -138,6 +138,36 @@ int MainCmds::runnncachecountlogbench(const vector<string>& args) {
   return 0;
 }
 
+// The evaluation container's load/append I/O measurement: what a cold load of a multi-GiB
+// container costs in wall time, in bytes fetched from the device, and in page-cache
+// residency left behind, and what a torn-tail repair costs the device. Not part of runtests
+// for the same two reasons as the count log's bench, and the size arguments are explicit
+// because the file it synthesises is GiB-scale and no default is a safe one to scatter.
+int MainCmds::runnnevalcontainerbench(const vector<string>& args) {
+  // args[0] is the subcommand name itself, per handleSubcommand's own slicing in main.cpp.
+  if(args.size() < 2 || args.size() > 5)
+    throw StringError(
+      "runnnevalcontainerbench: expected DIRECTORY [TARGET_MIB] [ENTRIES_PER_DUMP] [full], "
+      "where 'full' additionally performs the payload-decoding load."
+    );
+  const int64_t targetMiB = args.size() >= 3 ? (int64_t)Global::stringToInt64(args[2]) : 1024;
+  const int64_t entriesPerDump = args.size() >= 4 ? (int64_t)Global::stringToInt64(args[3]) : 20000;
+  bool doFullLoad = false;
+  if(args.size() >= 5) {
+    if(args[4] == "full")
+      doFullLoad = true;
+    else if(args[4] != "index")
+      throw StringError(
+        "runnnevalcontainerbench: the fourth argument is 'full' or 'index', not '" + args[4] + "'."
+      );
+  }
+  Board::initHash();
+  ScoreValue::initTables();
+  Tests::runNNEvalContainerLoadIOBench(args[1], targetMiB, entriesPerDump, doFullLoad);
+  ScoreValue::freeTables();
+  return 0;
+}
+
 int MainCmds::runoutputtests(const vector<string>& args) {
   (void)args;
   Board::initHash();

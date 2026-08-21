@@ -26,6 +26,7 @@ namespace MainCmds {
   int runnncachefrozenbench(const std::vector<std::string>& args);
   int runnncachetwolevelbench(const std::vector<std::string>& args);
   int runnncachecountlogbench(const std::vector<std::string>& args);
+  int runnnevalcontainerbench(const std::vector<std::string>& args);
   int runnnlayertests(const std::vector<std::string>& args);
   int runnnontinyboardtest(const std::vector<std::string>& args);
   int runnnsymmetriestest(const std::vector<std::string>& args);

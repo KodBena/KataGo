@@ -194,6 +194,16 @@ namespace Tests {
   // Reached by the runnncachecountlogbench subcommand, which names the directory.
   void runNNCacheCountLogBench(const std::string& directory);
 
+  //testnnevalcontainerbench.cpp
+  // Not part of runtests, for the two reasons the count log's bench is not: it is a
+  // measurement rather than an assertion, and it writes real files -- of GiB scale here --
+  // so the directory is named on the command line rather than defaulted. `targetMiB` is the
+  // container size to synthesise, `entriesPerDump` the block size to synthesise it in, and
+  // `doFullLoad` asks for the payload-decoding load, which holds the whole live set in
+  // memory and is therefore refusable on a machine smaller than the container.
+  void runNNEvalContainerLoadIOBench(
+    const std::string& directory, int64_t targetMiB, int64_t entriesPerDump, bool doFullLoad);
+
   // Not part of runtests: it is a measurement, not an assertion. Reached by the
   // runnncachefrozenbench subcommand.
   void runNNCacheFrozenBench();

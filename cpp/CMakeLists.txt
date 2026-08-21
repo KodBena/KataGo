@@ -1106,6 +1106,7 @@ add_executable(katago
   tests/testanalysiscachelifecycle.cpp
   tests/testanalysismodels.cpp
   tests/testnncachecountlogbench.cpp
+  tests/testnnevalcontainerbench.cpp
   tests/testnncountsdump.cpp
   tests/testnncachebench.cpp
   tests/testnnevalcanary.cpp

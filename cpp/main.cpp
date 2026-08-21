@@ -73,6 +73,7 @@ nncountsdump : Renders a .nncounts (NN cache count log) file's contents human-re
 runtests : Test important board algorithms and datastructures
 runnncachebench : Measure what the nn cache's inline hash tag costs and buys
 benchnncachepolicy : Sweep the nn cache policy matrix over a recorded operation trace
+runnnevalcontainerbench : Measure a multi-GiB eval container's cold load and torn-tail repair I/O
 runnnlayertests : Test a few subcomponents of the current neural net backend
 runonnxmodelfiletests : (TensorRT/ONNX only) Test the .onnx model file reader
 
@@ -147,6 +148,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
   // same reason as the two above: an instrument, not an operator verb.
   else if(subcommand == "runnncachecountlogbench")
     return MainCmds::runnncachecountlogbench(subArgs);
+  else if(subcommand == "runnnevalcontainerbench")
+    return MainCmds::runnnevalcontainerbench(subArgs);
   else if(subcommand == "runnnlayertests")
     return MainCmds::runnnlayertests(subArgs);
   else if(subcommand == "runnnontinyboardtest")
