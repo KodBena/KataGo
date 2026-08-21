@@ -1,15 +1,11 @@
 #include "../tests/tests.h"
 
 #include <sstream>
-#include <thread>
-#include <chrono>
 #include <type_traits>
 
 #include "../command/analysiscacheactions.h"
 #include "../core/config_parser.h"
-#include "../core/fileutils.h"
 #include "../neuralnet/nncachecountlog.h"
-#include "../neuralnet/nnevalcontainer.h"
 #include "../tests/tinymodel.h"
 
 // THE ANALYSIS ENGINE'S PERSISTED-CACHE ACTIONS: cache_attach, cache_detach, cache_dump and
@@ -78,6 +74,8 @@ json dumpRequest() {
   request["action"] = "cache_dump";
   request["context"] = CONTEXT;
   request["what"] = "both";
+  request["admission"] = json::object();
+  request["admission"]["all"] = true;
   return request;
 }
 
@@ -224,6 +222,54 @@ void testTheDumpTargetIsRequiredAndClosed() {
     testAssert(decodeCacheDump(request).value().value().what == CacheDumpWhat::Evaluations);
   }
   cout << "  cache_dump's \"what\" is required and closed to three values" << endl;
+}
+
+// admission is REQUIRED and has no default (ledger row 1652: the operator rejected a silent
+// all() default -- a dump writes to disk, and SSD wear is not something to infer from an
+// absent field). Both explicit forms -- "all":true and minLookups -- are exercised, along with
+// every way of getting it wrong: absent, neither key, both keys, and all:false.
+void testTheDumpAdmissionIsRequiredAndClosed() {
+  {
+    json request = dumpRequest();
+    request.erase("admission");
+    const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
+    testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "admission");
+    testAssert(decoded.refusal().value().message.find("minLookups") != string::npos);
+    testAssert(decoded.refusal().value().message.find("\"all\"") != string::npos);
+  }
+  {
+    // Neither key inside the object: still refused, not read as all().
+    json request = dumpRequest();
+    request["admission"] = json::object();
+    const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
+    testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "admission");
+  }
+  {
+    // Both keys: exactly one is required, not "at most one".
+    json request = dumpRequest();
+    request["admission"]["minLookups"] = 2;
+    const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
+    testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "admission");
+  }
+  {
+    // all:false has no meaning -- there is no false form of "everything".
+    json request = dumpRequest();
+    request["admission"] = json::object();
+    request["admission"]["all"] = false;
+    const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
+    testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "admission");
+  }
+  // Both explicit forms decode.
+  testAssert(decodeCacheDump(dumpRequest()).value().has_value());  // "all":true, from dumpRequest()
+  {
+    json request = dumpRequest();
+    request["admission"] = json::object();
+    request["admission"]["minLookups"] = 2;
+    const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
+    testAssert(decoded.value().has_value());
+    testAssert(decoded.value().value().admission.describe().find("2") != string::npos);
+  }
+  cout << "  cache_dump's \"admission\" is required and closed to \"all\" or \"minLookups\"" << endl;
 }
 
 void testAContextIsRequiredOnTheThreeActionsThatActOnOne() {
@@ -984,6 +1030,7 @@ void Tests::runAnalysisCacheActionTests() {
   testTheLevelZeroBoundIsExactlyOneOfThree();
   testTheLevelOneFillIsBoundedInBytesOrNotRequested();
   testTheDumpTargetIsRequiredAndClosed();
+  testTheDumpAdmissionIsRequiredAndClosed();
   testAContextIsRequiredOnTheThreeActionsThatActOnOne();
   testAContextNameOutsideTheAlphabetIsRefusedUnderItsOwnField();
   testForeignModelSourcesAreAnOrderedListWithoutRepeats();

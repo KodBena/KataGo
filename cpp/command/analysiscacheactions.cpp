@@ -324,25 +324,43 @@ CacheActionDecode<CacheDumpRequest> decodeCacheDump(const json& request) {
       "what", "Must be one of \"counts\", \"evaluations\" or \"both\", got \"" + whatStr + "\"."
     );
 
+  // "admission" is REQUIRED, and has no default. Writing every earned entry to disk regardless
+  // of how many times it was retrieved is a real, sanctioned choice -- but it is a choice about
+  // SSD wear on hardware the client is not the only user of, and an absent field is not where
+  // that choice belongs. The counting currency admission ought to gate on (retrievals, raw
+  // presentations, or deduplicated-per-search presentations) is an open empirical question this
+  // decoder deliberately does not prejudge by picking a currency as "the default" -- it only
+  // ever reads the currency the request names, today "minLookups" (retrievals).
+  if(request.find("admission") == request.end() || !request["admission"].is_object())
+    return CacheActionDecode<CacheDumpRequest>::refused(
+      "admission",
+      "Required, and must be an object holding exactly one of \"minLookups\" (an integer: the "
+      "recorded retrievals an entry needs to reach disk) or \"all\" (must be true: write every "
+      "entry this context earned and does not already have on disk). There is no default: a dump "
+      "writes to disk, and which entries it admits is not something to infer from an absent field."
+    );
+  const json& admissionJson = request["admission"];
+  const std::set<std::string> admissionKeys = {"minLookups", "all"};
+  const std::optional<string> unexpectedInner = firstUnexpectedKey(admissionJson, admissionKeys);
+  if(unexpectedInner.has_value())
+    return CacheActionDecode<CacheDumpRequest>::refused(
+      "admission", unexpectedKeyMessage(unexpectedInner.value(), "cache_dump \"admission\"", admissionKeys)
+    );
+  const bool hasMinLookups = admissionJson.find("minLookups") != admissionJson.end();
+  const bool hasAll = admissionJson.find("all") != admissionJson.end();
+  if(hasMinLookups == hasAll)  // both absent, or both present
+    return CacheActionDecode<CacheDumpRequest>::refused(
+      "admission",
+      "Must hold exactly one of \"minLookups\" or \"all\", naming which entries this dump admits."
+    );
   NNCacheDiskAdmission admission = NNCacheDiskAdmission::all();
-  if(request.find("admission") != request.end()) {
-    const json& admissionJson = request["admission"];
-    if(!admissionJson.is_object())
+  if(hasAll) {
+    if(!admissionJson["all"].is_boolean() || !admissionJson["all"].get<bool>())
       return CacheActionDecode<CacheDumpRequest>::refused(
-        "admission",
-        "Must be an object holding \"minLookups\", or be omitted to write every entry this context "
-        "earned and does not already have on disk."
+        "admission", "\"all\" must be true. There is no false form; omit it and send \"minLookups\" instead."
       );
-    const std::set<std::string> admissionKeys = {"minLookups"};
-    const std::optional<string> unexpectedInner = firstUnexpectedKey(admissionJson, admissionKeys);
-    if(unexpectedInner.has_value())
-      return CacheActionDecode<CacheDumpRequest>::refused(
-        "admission", unexpectedKeyMessage(unexpectedInner.value(), "cache_dump \"admission\"", admissionKeys)
-      );
-    if(admissionJson.find("minLookups") == admissionJson.end())
-      return CacheActionDecode<CacheDumpRequest>::refused(
-        "admission", "Must hold \"minLookups\", the recorded retrievals an entry needs to reach disk."
-      );
+    admission = NNCacheDiskAdmission::all();
+  } else {
     int64_t minLookups = 0;
     if(!decodeInt64(admissionJson, "minLookups", 0, (int64_t)1 << 40, minLookups, refusalMessage))
       return CacheActionDecode<CacheDumpRequest>::refused("admission", refusalMessage);

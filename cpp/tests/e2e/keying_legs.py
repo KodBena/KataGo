@@ -35,7 +35,7 @@ def _keying_pass(w, h, tag, name_a, name_b, fp_a, fp_b, eval_cache, positive_and
   seed, _ = h.session(k_cfg, [net_a], [
     {"id": "a", "action": "cache_attach", "context": "card-key"},
     dict(POSITION, id="q", model=name_a),
-    {"id": "d", "action": "cache_dump", "context": "card-key", "what": "both"},
+    {"id": "d", "action": "cache_dump", "context": "card-key", "what": "both", "admission": {"all": True}},
   ])
   seeded = seed["d"].get("evaluations", {}).get("entriesWritten")
   if positive_and_capability:

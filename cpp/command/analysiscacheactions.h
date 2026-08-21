@@ -145,7 +145,10 @@ enum class CacheDumpWhat {
 struct CacheDumpRequest {
   std::string context;
   CacheDumpWhat what;
-  // Which earned entries are let onto disk, in recorded lookups. Defaults to all of them.
+  // Which earned entries are let onto disk. Required at decode with no default (ledger row
+  // 1652): a dump writes to disk, so which entries it admits is not something to infer from a
+  // field the client did not send. "Every entry" is still reachable via NNCacheDiskAdmission::
+  // all(), just never silently.
   NNCacheDiskAdmission admission;
 };
 

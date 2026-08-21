@@ -152,7 +152,7 @@ class Suite:
 
     a_reqs = [{"id": "a", "action": "cache_attach", "context": ctx}]
     a_reqs += [dict(q, id="q%d" % i) for i, q in enumerate(queries)]
-    a_reqs += [{"id": "d", "action": "cache_dump", "context": ctx, "what": "both"},
+    a_reqs += [{"id": "d", "action": "cache_dump", "context": ctx, "what": "both", "admission": {"all": True}},
                {"id": "x", "action": "cache_detach", "context": ctx}]
     a_out, a_rows, a_rc = self.session(a_reqs)
     written = a_out["d"].get("evaluations", {}).get("entriesWritten")
@@ -175,7 +175,7 @@ class Suite:
 
     b_reqs = [{"id": "a", "action": "cache_attach", "context": ctx}]
     b_reqs += [dict(q, id="q%d" % i) for i, q in enumerate(queries)]
-    b_reqs += [{"id": "d", "action": "cache_dump", "context": ctx, "what": "both"},
+    b_reqs += [{"id": "d", "action": "cache_dump", "context": ctx, "what": "both", "admission": {"all": True}},
                {"id": "s", "action": "cache_stats"},
                {"id": "x", "action": "cache_detach", "context": ctx}]
     b_out, b_rows, b_rc = self.session(b_reqs)
@@ -243,7 +243,7 @@ class Suite:
       a.ask({"id": "a", "action": "cache_attach", "context": ctx})
       for i, q in enumerate(queries):
         a.ask(dict(q, id="aq%d" % i))
-      a_dump = a.ask({"id": "ad", "action": "cache_dump", "context": ctx, "what": "both"})
+      a_dump = a.ask({"id": "ad", "action": "cache_dump", "context": ctx, "what": "both", "admission": {"all": True}})
       written = a_dump.get("evaluations", {}).get("entriesWritten")
 
       # A stays UP and attached. B now re-attaches, with a live sibling holding the context.
@@ -290,7 +290,7 @@ class Suite:
     # the dump SC3 overlaps is an append to an existing file rather than a first write.
     pre_reqs = [{"id": "a", "action": "cache_attach", "context": ctx}]
     pre_reqs += [dict(q, id="q%d" % i) for i, q in enumerate(positions(4))]
-    pre_reqs += [{"id": "d", "action": "cache_dump", "context": ctx, "what": "both"},
+    pre_reqs += [{"id": "d", "action": "cache_dump", "context": ctx, "what": "both", "admission": {"all": True}},
                  {"id": "x", "action": "cache_detach", "context": ctx}]
     pre_out, _, pre_rc = self.session(pre_reqs)
     pre_written = pre_out["d"].get("evaluations", {}).get("entriesWritten")
@@ -347,7 +347,7 @@ class Suite:
       for i, q in enumerate(positions(10)[4:]):
         a.ask(dict(q, id="q%d" % i))
       dump_started = time.time()
-      a_dump = a.ask({"id": "d", "action": "cache_dump", "context": ctx, "what": "both"})
+      a_dump = a.ask({"id": "d", "action": "cache_dump", "context": ctx, "what": "both", "admission": {"all": True}})
       dump_finished = time.time()
       a.ask({"id": "x", "action": "cache_detach", "context": ctx})
       a_rc, _, _ = a.finish()

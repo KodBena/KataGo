@@ -60,7 +60,7 @@ def run_persistence(w, h, name_a):
   out, rows = h.session(p_cfg, [net_a], [
     {"id": "a", "action": "cache_attach", "context": "card-5455"},
     dict(POSITION, id="q"),
-    {"id": "d", "action": "cache_dump", "context": "card-5455", "what": "both"},
+    {"id": "d", "action": "cache_dump", "context": "card-5455", "what": "both", "admission": {"all": True}},
     {"id": "x", "action": "cache_detach", "context": "card-5455"},
   ])
   attach, cold, dump, detach = out["a"], out["q"], out["d"], out["x"]
@@ -137,8 +137,8 @@ def run_persistence(w, h, name_a):
   seed, _ = h.session(q_cfg, [net_a], [
     {"id": "a", "action": "cache_attach", "context": "card-5455"},
     dict(POSITION, id="q"),
-    {"id": "d", "action": "cache_dump", "context": "card-5455", "what": "both"},
-    {"id": "d0", "action": "cache_dump", "context": "card-5455", "what": "both"},
+    {"id": "d", "action": "cache_dump", "context": "card-5455", "what": "both", "admission": {"all": True}},
+    {"id": "d0", "action": "cache_dump", "context": "card-5455", "what": "both", "admission": {"all": True}},
     {"id": "x", "action": "cache_detach", "context": "card-5455"},
   ])
   seeded = seed["d"].get("evaluations", {}).get("entriesWritten")
@@ -162,10 +162,10 @@ def run_persistence(w, h, name_a):
   out3, rows3 = h.session(q_cfg, [net_a], [
     {"id": "a1", "action": "cache_attach", "context": "card-5455"},
     {"id": "s1", "action": "cache_stats"},
-    {"id": "d1", "action": "cache_dump", "context": "card-5455", "what": "both"},
+    {"id": "d1", "action": "cache_dump", "context": "card-5455", "what": "both", "admission": {"all": True}},
     {"id": "x1", "action": "cache_detach", "context": "card-5455"},
     {"id": "a2", "action": "cache_attach", "context": "card-5455"},
-    {"id": "d2", "action": "cache_dump", "context": "card-5455", "what": "both"},
+    {"id": "d2", "action": "cache_dump", "context": "card-5455", "what": "both", "admission": {"all": True}},
     {"id": "s2", "action": "cache_stats"},
   ])
   state2 = digest_dir(q_dir)

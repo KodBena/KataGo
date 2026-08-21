@@ -651,9 +651,14 @@ automatically. Fields:
    * `model (string)`: Optional. Defaults to the model started with `-model`.
    * `what (string)`: **Required**, one of `"counts"`, `"evaluations"` or `"both"`. There is no default:
      which of the two files a write touched is not something to infer from a field you did not send.
-   * `admission (object)`: Optional. `{"minLookups":N}` writes only positions the count log records at
-     least `N` retrievals for; omitted writes everything this context earned. `{"minLookups":2}` is the
-     usual "only keep what I have seen more than once" policy.
+   * `admission (object)`: **Required**, exactly one of `{"minLookups":N}` or `{"all":true}`. There is
+     no default: a dump writes to disk, and which entries it admits is not something to infer from an
+     absent field (SSD wear is a real cost, and picking a currency to gate admission on -- retrievals
+     vs. raw presentations vs. deduplicated-per-search presentations -- is deliberately left for the
+     operator to decide per dump, not baked in here). `{"minLookups":N}` writes only positions the count
+     log records at least `N` retrievals for; `{"minLookups":2}` is the usual "only keep what I have
+     seen more than once" policy. `{"all":true}` writes everything this context earned and does not
+     already have on disk -- the old default, still reachable, only explicitly.
 
 Example:
 ```
