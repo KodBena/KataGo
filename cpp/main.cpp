@@ -61,6 +61,11 @@ testgpuerror : Print the average error of the neural net between current config 
 testbackendreference : Test backend absolute outputs against compiled-in blended reference data.
 dumponnx : (TensorRT/ONNX only) Write out the ONNX graph KataGo builds for a model.
 
+lockfsprobe : Does file locking actually EXCLUDE on a given directory's filesystem? Contends for a
+              lock between two real processes and prints a SUPPORTED/UNSUPPORTED verdict, exiting 0
+              only when supported. Run it before pointing a shared nnCacheDir at a network or FUSE
+              mount, where flock can silently succeed for everyone.
+
 runtests : Test important board algorithms and datastructures
 runnncachebench : Measure what the nn cache's inline hash tag costs and buys
 benchnncachepolicy : Sweep the nn cache policy matrix over a recorded operation trace
@@ -126,6 +131,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
   // instrument check_vectors.py drives, not an operator verb.
   else if(subcommand == "chdvectordriver")
     return MainCmds::chdvectordriver(subArgs);
+  else if(subcommand == "lockfsprobe")
+    return MainCmds::lockfsprobe(subArgs);
   else if(subcommand == "runnncachefrozenbench")
     return MainCmds::runnncachefrozenbench(subArgs);
   else if(subcommand == "runnncachetwolevelbench")

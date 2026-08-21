@@ -21,6 +21,7 @@ namespace MainCmds {
   int runnncachebench(const std::vector<std::string>& args);
   int benchnncachepolicy(const std::vector<std::string>& args);
   int chdvectordriver(const std::vector<std::string>& args);
+  int lockfsprobe(const std::vector<std::string>& args);
   int runnncachefrozenbench(const std::vector<std::string>& args);
   int runnncachetwolevelbench(const std::vector<std::string>& args);
   int runnncachecountlogbench(const std::vector<std::string>& args);

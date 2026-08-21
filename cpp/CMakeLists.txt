@@ -1147,6 +1147,7 @@ add_executable(katago
   command/genbook.cpp
   command/gputest.cpp
   command/gtp.cpp
+  command/lockfsprobe.cpp
   command/match.cpp
   command/misc.cpp
   command/runtests.cpp

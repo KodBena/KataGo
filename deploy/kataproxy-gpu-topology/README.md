@@ -72,12 +72,74 @@ Against `ws://192.168.122.68:1235`, e.g. with `websocat`:
 
 ## NN disk cache pairing (the point of the exercise)
 
-Once the file-locking work lands in this repo's KataGo: give **1301 and 1302
+The file locking this rests on is in this repo's KataGo as of commit
+`f9be19cc`. Give **1301 and 1302
 the same nnCache directory** in their katago configs — same model, same
 host, shared page cache; concurrent attach is shared-locked, dumps are
 exclusive-locked. Give **1401 its own directory**: a different model cannot
 corrupt a shared cache (keys include model identity) but would bloat every
 container with entries the other model's leaves load and never use.
+
+## Shared-cache bring-up: probe the directory, then run the suite
+
+Do these two steps **before** 1301 and 1302 are pointed at a shared
+directory, and repeat them whenever that directory moves — in particular
+when it moves onto the sshfs mount at `~/nncache`. Both commands are safe to
+run against a live-but-idle directory and clean up after themselves.
+
+### Step 1 — does file locking actually EXCLUDE there?
+
+```sh
+mkdir -p ~/nncache                  # or mount it; KataGo will not create it
+./cpp/build/katago lockfsprobe ~/nncache; echo "exit=$?"
+```
+
+Exit **0** = `LOCKFS VERDICT: SUPPORTED`, safe to share. Exit **1** =
+`UNSUPPORTED`, **do not** point 1301 and 1302 at that directory — give each
+leaf its own instead. Exit **2** = the probe could not run (directory
+missing, not a directory), which is not a verdict.
+
+This is the step that cannot be skipped or replaced by reasoning. The probe
+forks a second process and makes the two contend for a real
+`NNCacheFileLock` in the target directory, because a single process calling
+`flock()` and getting `0` back has learned nothing — that is exactly what a
+no-op `flock` returns too. sshfs is FUSE, and FUSE lock semantics depend on
+the mount options in use (`-o nolock`-style behaviour, or a server that does
+not support it), so the answer for `~/nncache` is an empirical one and this
+is how it is obtained. A `SUPPORTED` verdict is printed only after one
+process was made to *wait* for the other and then observed to acquire.
+
+### Step 2 — do two real engines actually share it?
+
+```sh
+python3 cpp/tests/e2e/sharedcache_e2e_witness.py --cache-dir ~/nncache
+echo "exit=$?"
+```
+
+Sixteen legs across three scenarios, driving real `katago analysis`
+processes over the analysis protocol; roughly four seconds against a local
+disk. Prints `PASS`/`FAIL` per leg with the numbers it read. Exit **0** =
+all green, **1** = a leg failed, **2** = it could not run (and it runs
+`lockfsprobe` itself first, so a directory that cannot lock is refused in
+plain text with nothing written and nothing started).
+
+- **SC1** one process evaluates and dumps; a later process attaches and is
+  served entirely by the first one's keys — witnessed by three independent
+  numbers, `entriesInLevelZero`, `NN rows: 0`, and a second dump with
+  nothing to add.
+- **SC2** the same, with **both engines alive at once**, which is the
+  1301/1302 shape.
+- **SC3** one engine attaches over and over *while* the other dumps; every
+  observation must show the whole pre-dump or whole post-dump state, never
+  anything in between and never a torn tail.
+
+Useful flags: `--model` (defaults to `/home/bork/kg/14.gz`), `--config` (an
+analysis config template holding `@CACHE_DIR@`), `--keep` to leave this
+run's cache files behind for inspection, `--only sc3` to run one scenario.
+`--cache-dir` may also be given as `$KATAGO_SHARED_CACHE_DIR`. Run it
+against a local directory first: that establishes what a healthy result
+looks like on this host, so a difference on the mount is attributable to
+the mount.
 
 ## Rollback
 
