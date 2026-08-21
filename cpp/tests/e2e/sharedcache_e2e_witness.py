@@ -46,6 +46,7 @@ import glob
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -555,31 +556,43 @@ class Suite:
       "the context appears in cache_stats without ever being attached by wire, the wire dump "
       "writes the new keys, and the wire detach takes it",
     )
+    # THE ABSENCE IS ONLY MEANINGFUL IF THE PRESENCE WOULD HAVE BEEN SEEN. Asserting that no
+    # shutdown-dump line matches would pass just as well if the log line's wording had changed and
+    # the regex matched nothing anywhere - so the same engine's STARTUP line, read by the sibling
+    # regex over the same prefix, is required to be present in the same log.
+    c_attaches = startup_attaches(c_err, ctx)
     self.w.check(
       "SC5f and the shutdown then dumps NOTHING for a context the client detached -- the "
       "lifecycle does not overrule the client",
-      not shutdown_dumps(c_err, ctx),
-      "shutdown dumps of %s after the wire detach: %s" % (ctx, shutdown_dumps(c_err, ctx)),
-      "no shutdown dump line for this context at all",
+      not shutdown_dumps(c_err, ctx) and len(c_attaches) == 1,
+      "shutdown dumps of %s after the wire detach: %s; startup attach lines in the SAME log: %s"
+      % (ctx, shutdown_dumps(c_err, ctx), c_attaches),
+      "no shutdown dump line for this context -- in a log where this engine's own startup attach "
+      "line IS found, so the absence is a fact about the dump and not about the reader",
     )
 
-    # SC5g: the startup refusal. A leaf pointed at a directory that is not there must NOT come
-    # up serving an empty cache while the operator believes it is attached.
-    missing = os.path.join(self.cache_dir, "definitely-not-a-directory-" + str(os.getpid()))
-    bad_cfg = self.lifecycle_config(
-      "sharedcache-sc5-baddir.cfg", missing, ["nnCacheAttachContext = " + ctx],
+    # SC5g: the refusal that belongs to the LIFECYCLE ITSELF. A context name outside the path
+    # alphabet cannot be turned into a file, and only analysisCacheStartupAttach can refuse it at
+    # startup: delete that call and this leg goes red. (The neighbouring case - a cache directory
+    # that is not there - is nnCacheDir's own pre-existing check, which fires while the models load
+    # and would fire with no lifecycle configured at all. It is covered in the C++ suite and is
+    # deliberately NOT the leg here, because a leg that passes with the feature deleted witnesses
+    # the feature's absence just as happily as its presence.)
+    bad_name_cfg = self.lifecycle_config(
+      "sharedcache-sc5-badname.cfg", self.cache_dir, ["nnCacheAttachContext = ../escaping"],
     )
-    proc = subprocess.run([self.binary, "analysis", "-config", bad_cfg, "-model", self.net],
+    proc = subprocess.run([self.binary, "analysis", "-config", bad_name_cfg, "-model", self.net],
                           input="", capture_output=True, text=True, timeout=600)
     combined = (proc.stdout or "") + (proc.stderr or "")
     self.w.check(
-      "SC5g an engine whose configured cache directory is not there REFUSES TO START, and says "
-      "which key",
-      proc.returncode != 0 and "nnCacheDir" in combined and not os.path.exists(missing),
-      "rc=%d, message names nnCacheDir=%s, the directory was NOT created=%s; %r"
-      % (proc.returncode, "nnCacheDir" in combined, not os.path.exists(missing),
-         combined.strip()[-220:]),
-      "nonzero exit, the refusal names nnCacheDir, and the engine did not silently create it",
+      "SC5g an engine whose configured context name cannot be a file REFUSES TO START, naming "
+      "nnCacheAttachContext",
+      proc.returncode != 0 and "nnCacheAttachContext" in combined
+      and not os.path.exists(os.path.join(self.cache_dir, "..", "escaping.nncounts")),
+      "rc=%d, message names nnCacheAttachContext=%s; %r"
+      % (proc.returncode, "nnCacheAttachContext" in combined, combined.strip()[-260:]),
+      "nonzero exit, the refusal names the key the operator set, and nothing was written outside "
+      "the cache directory",
     )
     print()
 
@@ -670,6 +683,90 @@ class Suite:
       "rc=%d NN rows=%d over the same %d queries the killed engine had paid for"
       % (b_rc, b_rows, len(queries)),
       "NN rows == 0 exactly -- the killed process's work was already on disk",
+    )
+    print()
+
+  # ---------------------------------------------------------------------------------------
+  # SC7: the engine is SIGTERMed - what a supervisor actually does - and dumps on the way out.
+  # ---------------------------------------------------------------------------------------
+  def sc7_sigterm_dumps_before_dying(self):
+    """SIGTERM is how a pooled leaf is stopped, and it is not the shutdown-dump path.
+
+    The shutdown dump fires when STDIN CLOSES. Nothing else reaches it. systemd, Kubernetes,
+    supervisord, a shell wrapper and a bare `kill` all send SIGTERM, and a leaf that got one used
+    to die with its whole session in RAM - the periodic dump bounding the loss to one interval,
+    never to nothing.
+
+    So this leg sets the interval LONG (an hour: long enough that no periodic pass can fire
+    inside the leg, which is what makes the result attributable to the signal and to nothing
+    else), sends real queries, sends a real SIGTERM, and then asks a second engine whether the
+    work is there. It also checks the exit status, because the fix must not change how the
+    process dies: a supervisor that expected 'terminated by SIGTERM' must still see exactly that.
+    """
+    print("== SC7: engine A is SIGTERMed -- it dumps on the way out and still dies of SIGTERM ==")
+    ctx = self.context + "-sc7"
+    queries = positions(3)
+    cfg = self.lifecycle_config(
+      "sharedcache-sc7.cfg", self.cache_dir,
+      ["nnCacheAttachContext = " + ctx,
+       "nnCacheDumpMinObservations = 0",
+       # An hour: no interval pass can fire during this leg, so anything on disk came from the
+       # signal. Without this the leg would be SC6 wearing a different name.
+       "nnCacheDumpIntervalMinutes = 60"],
+    )
+
+    def evals_bytes():
+      return sum(os.path.getsize(p) for p in context_files(self.cache_dir, ctx)
+                 if p.endswith(".nnevals"))
+
+    a = Engine(self.binary, cfg, [self.net])
+    try:
+      for i, q in enumerate(queries):
+        a.ask(dict(q, id="q%d" % i))
+      before = evals_bytes()
+      a.proc.send_signal(signal.SIGTERM)
+      # STDIN IS LEFT OPEN, and that is the whole point of the leg. subprocess.communicate()
+      # CLOSES stdin, which is the engine's ordinary shutdown trigger - calling it here would
+      # race the signal against a stdin-close and could witness the shutdown dump while claiming
+      # to witness the signal one. (It did, on the first run of this leg, and that is how the
+      # swallowed-signal race in the watcher was found.) So: wait for the process to die of the
+      # signal, and only then collect its output.
+      wait_until = time.time() + 600.0
+      while a.proc.poll() is None and time.time() < wait_until:
+        time.sleep(0.02)
+      a_rc = a.proc.returncode
+      _, a_err = a.proc.communicate(timeout=60)
+    finally:
+      a.kill()
+    after = evals_bytes()
+    signal_dumps = [line for line in a_err.splitlines() if "on a termination signal" in line]
+
+    self.w.check(
+      "SC7a *** nothing was on disk before the signal, and the container GREW after it -- the "
+      "dump is attributable to SIGTERM and to nothing else ***",
+      before == 0 and after > 0,
+      ".nnevals bytes before the signal=%d, after=%d (the dump interval was 60 min, so no "
+      "periodic pass can have fired)" % (before, after),
+      "0 bytes before, more than 0 after",
+    )
+    self.w.check(
+      "SC7b and the engine still DIES OF SIGTERM -- the exit status a supervisor expects is "
+      "unchanged",
+      a_rc == -signal.SIGTERM and len(signal_dumps) == 1,
+      "exit status=%s (expected %d, i.e. killed by SIGTERM); the engine logged %d "
+      "termination-signal dump line(s)" % (a_rc, -signal.SIGTERM, len(signal_dumps)),
+      "the process is killed by SIGTERM rather than turned into a clean exit(0), and its log "
+      "carries exactly one termination-signal dump line -- so SC7a's bytes are attributable to "
+      "that dump and not to a shutdown dump the test triggered by accident",
+    )
+
+    b_reqs = [dict(q, id="q%d" % i) for i, q in enumerate(queries)]
+    _, b_rows, b_rc = self.session(b_reqs, config=cfg)
+    self.w.check(
+      "SC7c *** a later engine pays ZERO neural net rows for the SIGTERMed engine's queries ***",
+      b_rc == 0 and b_rows == 0,
+      "rc=%d NN rows=%d over the same %d queries" % (b_rc, b_rows, len(queries)),
+      "NN rows == 0 exactly",
     )
     print()
 
@@ -823,7 +920,7 @@ def main():
                  help="Do not run lockfsprobe first. Only for a directory already probed.")
   p.add_argument("--keep", action="store_true", help="Leave this run's cache files behind.")
   p.add_argument("--only", action="append", default=None,
-                 choices=["sc1", "sc2", "sc3", "sc4", "sc5", "sc6"],
+                 choices=["sc1", "sc2", "sc3", "sc4", "sc5", "sc6", "sc7"],
                  help="Run only these scenarios. Repeatable.")
   args = p.parse_args()
 
@@ -880,7 +977,7 @@ def main():
 
   w = Witness()
   suite = Suite(w, binary, config, args.model, cache_dir, context, workdir)
-  chosen = args.only or ["sc1", "sc2", "sc3", "sc4", "sc5", "sc6"]
+  chosen = args.only or ["sc1", "sc2", "sc3", "sc4", "sc5", "sc6", "sc7"]
   try:
     if "sc1" in chosen:
       suite.sc1_sequential_reuse()
@@ -894,6 +991,8 @@ def main():
       suite.sc5_config_driven_lifecycle()
     if "sc6" in chosen:
       suite.sc6_periodic_dump_survives_a_kill()
+    if "sc7" in chosen:
+      suite.sc7_sigterm_dumps_before_dying()
   finally:
     if args.keep:
       print("kept: %s" % [os.path.basename(f) for f in context_files(cache_dir, context + "-sc1")
@@ -901,9 +1000,10 @@ def main():
                           + context_files(cache_dir, context + "-sc3")
                           + context_files(cache_dir, context + "-sc4")
                           + context_files(cache_dir, context + "-sc5")
-                          + context_files(cache_dir, context + "-sc6")])
+                          + context_files(cache_dir, context + "-sc6")
+                          + context_files(cache_dir, context + "-sc7")])
     else:
-      for suffix in ("-sc1", "-sc2", "-sc3", "-sc4", "-sc5", "-sc6"):
+      for suffix in ("-sc1", "-sc2", "-sc3", "-sc4", "-sc5", "-sc6", "-sc7"):
         for f in context_files(cache_dir, context + suffix):
           try:
             os.remove(f)

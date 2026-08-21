@@ -195,17 +195,26 @@ nnCacheAttachContext = mycard
 
 With `nnCacheAttachContext` set, the engine:
 
-  * **attaches that context to every hosted model at startup**, after the models load and before it
-    accepts a single request, with the same defaults a bare `cache_attach` gets - the whole of level 0,
-    no level-1 fill;
+  * **attaches that context to every hosted searchable model at startup**, after the models load and
+    before it accepts a single request, with the same defaults a bare `cache_attach` gets - the whole of
+    level 0, no level-1 fill;
   * **dumps it back every 15 minutes** while it runs, `what: "both"`, on a thread of its own;
+  * **dumps it back when it is sent SIGTERM or SIGINT** - which is how a supervised leaf is actually
+    stopped - and then dies of that signal, with the exit status the supervisor expects;
   * **dumps it back at shutdown** too, when stdin closes - on both the ordinary exit and
     `-quit-without-waiting`, because by then every analysis thread has already been joined on either
     path and a session's earned evaluations should not survive or not survive depending on a flag about
     the queue.
 
-One context name covers every hosted model; each model still gets its own `<context>.<model>.nnevals`, so
-this is the same card evaluated by each net, not a collision. There is no per-model override.
+A `-human-model` companion is **not** attached and not dumped: its evaluations are conditioned on SGF
+metadata a context does not carry.
+
+One context name covers every searchable model, and there is no per-model override. Each model gets its
+own `<context>.<model>.nnevals`, so two nets' evaluations are never confused. The `<context>.nncounts`
+file, though, is **per context and not per model** - a cache key does not depend on which net produced
+the evaluation - so on a multi-model leaf the observation threshold below counts what the *leaf* saw,
+not what a given net saw. A position each of two hosted nets evaluated once clears
+`nnCacheDumpMinObservations = 2` for both.
 
 #### The periodic dump, and why it is on by default
 
@@ -232,6 +241,20 @@ Two things about the timing are worth knowing:
   * The dump runs **off the request path**, so it never blocks a search and never stops the engine
     reading stdin. It can make a client's own `cache_attach` / `cache_detach` / `cache_dump` /
     `cache_stats` wait for a pass in flight, which is a session-boundary cost and never a query cost.
+
+#### Stopping the engine
+
+A `kill`, a `systemctl stop`, a container shutdown and Ctrl-C all send **SIGTERM or SIGINT**, and none of
+them close stdin - so none of them used to reach any dump at all. With `nnCacheAttachContext` set, the
+engine handles both: it performs one last dump, logs what it wrote, and then re-raises the signal under
+the default handler, so it still dies of the signal it was sent and a supervisor sees the same exit
+status it always did. The delay is one dump.
+
+Handlers are installed **only** when `nnCacheAttachContext` is set. An engine with no persisted cache
+keeps exactly the Ctrl-C behaviour it has always had, because it has nothing to save.
+
+SIGKILL (`kill -9`) cannot be handled by anything, by design of the signal. There the periodic dump is
+the whole of your protection, which is the reason it is on by default.
 
 #### What the engine's own dumps admit
 
@@ -632,9 +655,10 @@ Attaches a context's persisted cache content to a model, for the session that is
      model started with `-model`.
    * `level0 (object)`: Optional. How much of the context goes into the frozen, pre-warmed level 0.
      Exactly one of:
-       * `{"minLookups":N}` - every position the count log records at least `N` retrievals for. A position
-         the count log has never mentioned is never admitted by this at any `N` above 0: its count is not
-         zero, it is unknown.
+       * `{"minObservations":N}` - every position the count log records at least `N` observations for. A
+         position the count log has never mentioned is never admitted by this at any `N` above 0: its
+         count is not zero, it is unknown. (`{"minLookups":N}` is refused by name - see `cache_dump`'s
+         `admission` field for why the rename is a refusal and not an alias.)
        * `{"maxEntries":N}` - the `N` most-retrieved positions.
        * `{"maxBytes":B}` - the most-retrieved positions that fit in `B` bytes of memory. `B` counts the
          memory the entries will actually occupy, not the size of the file.
@@ -650,7 +674,7 @@ Attaches a context's persisted cache content to a model, for the session that is
 
 Example:
 ```
-{"id":"a1","action":"cache_attach","context":"card-5455","level0":{"minLookups":2},"level1Fill":{"maxBytes":268435456}}
+{"id":"a1","action":"cache_attach","context":"card-5455","level0":{"minObservations":2},"level1Fill":{"maxBytes":268435456}}
 ```
 
 The response echoes the query and adds:
@@ -761,18 +785,22 @@ automatically. Fields:
    * `model (string)`: Optional. Defaults to the model started with `-model`.
    * `what (string)`: **Required**, one of `"counts"`, `"evaluations"` or `"both"`. There is no default:
      which of the two files a write touched is not something to infer from a field you did not send.
-   * `admission (object)`: **Required**, exactly one of `{"minLookups":N}` or `{"all":true}`. There is
-     no default: a dump writes to disk, and which entries it admits is not something to infer from an
-     absent field (SSD wear is a real cost, and picking a currency to gate admission on -- retrievals
-     vs. raw presentations vs. deduplicated-per-search presentations -- is deliberately left for the
-     operator to decide per dump, not baked in here). `{"minLookups":N}` writes only positions the count
-     log records at least `N` retrievals for; `{"minLookups":2}` is the usual "only keep what I have
-     seen more than once" policy. `{"all":true}` writes everything this context earned and does not
-     already have on disk -- the old default, still reachable, only explicitly.
+   * `admission (object)`: Optional, exactly one of `{"minObservations":N}` or `{"all":true}`. Omitted
+     means `{"minObservations":2}` - "only keep what has been seen at least twice", which under
+     observation currency is reachable across sessions: a position observed once in one session and once
+     in the next clears it. `{"minObservations":N}` writes only positions the count log records at least
+     `N` **observations** for - every time the engine was asked for the position, hit or miss, which is
+     the number of forward passes carrying it would have avoided. `{"all":true}` writes everything this
+     context earned and does not already have on disk.
+
+     `{"minLookups":N}` is **refused by name**, not accepted as an alias. The quantity changed, not just
+     the word: a lookup was a *retrieval* (a hit on a key an earlier dump had already stored), and every
+     key that was ever evaluated fresh counts higher under observations - so honoring the old spelling
+     would admit strictly more to disk than you asked for, and no response field would say so.
 
 Example:
 ```
-{"id":"a3","action":"cache_dump","context":"card-5455","what":"both","admission":{"minLookups":2}}
+{"id":"a3","action":"cache_dump","context":"card-5455","what":"both","admission":{"minObservations":2}}
 ```
 
 With `"both"`, counts are written first and the evaluations are then admitted against the freshly written
@@ -787,7 +815,7 @@ does not inflate your counts.
 The response echoes the query and adds `context`, `model`, `openRequestsAtDump`, and:
 
    * `counts (object)`, when counts were written: `bytesAppended`, `tornTailBytesDiscarded`,
-     `rewroteTheFile`, `compacted`, `rowsInLog`, `unattributedLookups`, `tail`.
+     `rewroteTheFile`, `compacted`, `rowsInLog`, `unattributedObservations`, `tail`.
    * `evaluations (object)`, when evaluations were written: `entriesWritten`, `bytesAppended`,
      `tornTailBytesDiscarded`, `rewroteTheFile`, `compacted`, `markedPersisted`, `admission`, and three
      figures naming everything that was *not* written, separately because they have different remedies:

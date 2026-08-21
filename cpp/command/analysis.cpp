@@ -495,17 +495,26 @@ int MainCmds::analysis(const vector<string>& args) {
   std::mutex openRequestsMutex;
   std::map<int64_t, AnalyzeRequest*> openRequests;
 
-  //What the cache actions have attached to each hosted model. Read and written ONLY on the request
-  //loop below, which is a single thread, so it takes no lock; see AnalysisCacheAttachments.
+  //What the cache actions have attached to each hosted model.
   AnalysisCacheAttachments cacheAttachments(modelHosts.numSearchable());
 
-  //WHAT MAKES THE ABOVE TRUE ONCE A PERIODIC DUMPER EXISTS. cacheAttachments and a model's level-0
-  //resolution list used to be touched by the request loop alone; the config-driven periodic dump
-  //reads both, from its own thread, because a dump takes real time under an exclusive file lock and
-  //must not be run on the thread that reads stdin. This mutex is the whole of that design: the
-  //request loop holds it around every cache action, the dumper holds it around each pass, and
-  //nothing else touches those structures. It is NOT on any search's path -- an analysis thread's
-  //get/set goes nowhere near it -- so its cost to a query is exactly zero.
+  //WHO TOUCHES THAT REGISTRY, exhaustively, because it takes no lock of its own and this is the
+  //only place the rule can be stated. It is FOUR, not one, and the comment here used to say one:
+  //
+  //  1. THIS THREAD, before any other exists, for the startup attach a few lines below.
+  //  2. The REQUEST LOOP, for the four wire cache actions.
+  //  3. The PERIODIC DUMP THREAD, and the TERMINATION-SIGNAL WATCHER, each for one dumping pass.
+  //  4. THIS THREAD again, after every other has been joined, for the shutdown dump.
+  //
+  //1 and 4 are ordered against everything else by thread creation and thread join, which is why
+  //they take no lock and need none. 2 and 3 genuinely overlap in time, and this mutex is the whole
+  //of what keeps them apart: the request loop holds it around every cache action, each dumper holds
+  //it around each pass, and nothing else touches the registry at all.
+  //
+  //NO SEARCH TOUCHES IT. An analysis thread's get/set goes nowhere near this mutex or this
+  //registry, so its cost to a query is exactly zero. (A dump reads the cache TABLE, which is
+  //thread-safe on its own and is why a dump is legal while requests are open; it does not read a
+  //model's level-0 resolution list, which only attach and detach touch -- and those are case 2.)
   std::mutex cacheActionMutex;
 
   //THE STARTUP ATTACH, and its position is the point of it: after every model is loaded and the
@@ -535,6 +544,22 @@ int MainCmds::analysis(const vector<string>& args) {
     [&logger](const string& line) { logger.write(line); }
   );
   periodicDumper.start();
+
+  //THE OTHER WAY THIS PROCESS ENDS, and the more common one. The shutdown dump below fires when
+  //STDIN CLOSES and on no other path: not on SIGTERM, which is what every supervisor and every
+  //`kill` sends, and not on SIGINT. A leaf stopped either way used to die with its whole session
+  //in RAM. This performs one last dump and then lets the signal kill the process exactly as it
+  //would have -- same signal, same exit status. Installed only when a lifecycle is configured, so
+  //an engine with no persisted cache keeps precisely the Ctrl-C behaviour it has always had.
+  AnalysisCacheTerminationSignalDumper signalDumper(
+    modelHosts, cacheAttachments, cacheActionMutex, cacheLifecycle,
+    [&openRequestsMutex,&openRequests]() {
+      std::lock_guard<std::mutex> lock(openRequestsMutex);
+      return (int64_t)openRequests.size();
+    },
+    [&logger](const string& line) { logger.write(line); }
+  );
+  signalDumper.start();
 
   auto reportError = [&pushToWrite,&logger,&logErrorsAndWarnings](const string& s) {
     json ret;
@@ -1751,6 +1776,9 @@ int MainCmds::analysis(const vector<string>& args) {
     //together, and so nothing is still writing when the evaluators below are deleted. This waits
     //out a pass already in progress, deliberately: abandoning a half-written append to save a
     //second would leave a torn tail for the next reader to repair.
+    //The signal watcher goes first: past this line the shutdown dump owns the state, and a signal
+    //dump firing beside it would be two writers where the whole design says one.
+    signalDumper.stop();
     periodicDumper.stop();
     if(periodicDumper.passesPerformed() > 0)
       logger.write(

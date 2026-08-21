@@ -278,9 +278,13 @@ void testABadContextNameRefusesTheStartupAttachNamingTheKey() {
        << endl;
 }
 
-// A DIRECTORY THAT IS NOT THERE. nnCacheDir's own existence check fires while the models load, so
-// this is the same fail-loud from the other side: the lifecycle cannot be honored and the engine
-// does not start.
+// A DIRECTORY THAT IS NOT THERE, and this leg is honest about WHOSE refusal it observes: it is
+// nnCacheDir's own pre-existing existence check, which fires while the models load and would fire
+// with no lifecycle configured at all. It is here because an operator reaching it has set
+// nnCacheAttachContext and needs to know their leaf will not come up -- not because it witnesses
+// anything this file added. The refusal that IS this file's own is the one above, on the context
+// name; delete analysisCacheStartupAttach's call site and THAT one goes red while this one does
+// not (ADR-0021: a leg is named for the property it actually observes).
 void testAMissingCacheDirectoryRefusesBeforeAnythingAttaches() {
   const std::optional<string> refusal = refusalOf([&]() {
     Engine engine("/definitely/not/a/directory/here", string("nnCacheAttachContext = ") + CONTEXT + "\n");
@@ -512,6 +516,93 @@ void testThePeriodicDumperWritesWithNobodyAskingAndNoCleanExit() {
   }
 }
 
+// THE CONFIGURED ADMISSION MUST ACTUALLY GOVERN THE DUMP, and until this leg existed nothing
+// checked it: every other leg either configured minObservations(0) -- which is behaviourally
+// identical to all() -- or asserted on modelsDumped without looking at what was written. A
+// regression that ignored the config and hardcoded all() passed the whole suite.
+//
+// So this one runs at the DEFAULT admission, which is minObservations(2), over a session whose
+// keys are deliberately split: one key presented twice, two presented once. The dump must write
+// exactly the one and refuse exactly the two.
+void testTheConfiguredAdmissionGovernsWhatTheDumpWrites() {
+  TestCommon::ScopedTempDir cacheDir(TMP_DIR_PREFIX);
+  // No nnCacheDumpMinObservations: the default is the point.
+  Engine engine(
+    cacheDir.path(),
+    string("nnCacheAttachContext = ") + CONTEXT + "\nnnCacheDumpIntervalMinutes = 0\n"
+  );
+  testAssert(
+    engine.lifecycle.dumpAdmission().describe() ==
+    NNCacheDiskAdmission::minObservations(cacheDumpDefaultAdmissionObservations()).describe()
+  );
+  (void)analysisCacheStartupAttach(*engine.hosts, engine.attachments, engine.lifecycle);
+
+  const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+  NNEvaluator& eval = *engine.hosts->searchableEval(model);
+  const NNCacheContextId contextId = engine.attachments.attachmentFor(model, CONTEXT).contextId;
+  const NNCacheAttribution attribution = NNCacheAttribution::toContext(contextId);
+  for(int serial = 1; serial <= 3; serial++) {
+    (void)eval.cacheTable().present(nthKey(serial), attribution);
+    eval.cacheTable().set(makeOutput(serial), attribution);
+  }
+  // Key 1 asked for a second time: now observed twice, and the only one that clears the default.
+  shared_ptr<NNOutput> got;
+  (void)eval.cacheTable().present(nthKey(1), attribution);
+  testAssert(eval.cacheTable().get(nthKey(1), got));
+
+  const AnalysisCacheDumpReport report = analysisCacheDumpAttachedContexts(
+    *engine.hosts, engine.attachments, engine.lifecycle, AnalysisCacheDumpOccasion::Shutdown, 0
+  );
+  testAssert(report.modelsFailed == 0);
+  // THE NUMBER IS 1, NOT "SOME". A hardcoded all() would make it 3 and this assert would fail.
+  testAssert(report.entriesWritten == 1);
+
+  // And the two refused really are refused, off the FILE and not off the report: a later engine
+  // attaching this context finds exactly the one admitted key.
+  {
+    Engine second(cacheDir.path(), string("nnCacheAttachContext = ") + CONTEXT + "\n");
+    (void)analysisCacheStartupAttach(*second.hosts, second.attachments, second.lifecycle);
+    NNEvaluator& secondEval = *second.hosts->searchableEval(model);
+    shared_ptr<NNOutput> admitted;
+    testAssert(secondEval.cacheTable().get(nthKey(1), admitted));
+    shared_ptr<NNOutput> refused;
+    testAssert(!secondEval.cacheTable().get(nthKey(2), refused));
+    testAssert(!secondEval.cacheTable().get(nthKey(3), refused));
+  }
+  cout << "  the DEFAULT admission really governs: of 3 earned keys the dump wrote the 1 seen "
+          "twice, and a later engine finds only that one on disk" << endl;
+}
+
+// THE TERMINATION-SIGNAL DUMP, exercised as the act it is. This process cannot send itself SIGTERM
+// without killing the test run, so what is checked here is that the act dumps and labels itself;
+// that a real engine PROCESS does it when really signalled is SC7 in the e2e witness.
+void testTheTerminationSignalDumpWritesAndNamesItsOccasion() {
+  TestCommon::ScopedTempDir cacheDir(TMP_DIR_PREFIX);
+  Engine engine(
+    cacheDir.path(),
+    string("nnCacheAttachContext = ") + CONTEXT +
+    "\nnnCacheDumpMinObservations = 0\nnnCacheDumpIntervalMinutes = 0\n"
+  );
+  (void)analysisCacheStartupAttach(*engine.hosts, engine.attachments, engine.lifecycle);
+  const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+  NNEvaluator& eval = *engine.hosts->searchableEval(model);
+  const NNCacheContextId contextId = engine.attachments.attachmentFor(model, CONTEXT).contextId;
+  const NNCacheAttribution attribution = NNCacheAttribution::toContext(contextId);
+  for(int serial = 1; serial <= 2; serial++) {
+    (void)eval.cacheTable().present(nthKey(serial), attribution);
+    eval.cacheTable().set(makeOutput(serial), attribution);
+  }
+
+  std::mutex cacheActionMutex;
+  const AnalysisCacheDumpReport report = analysisCacheDumpForTerminationSignal(
+    *engine.hosts, engine.attachments, cacheActionMutex, engine.lifecycle, 0
+  );
+  testAssert(report.modelsFailed == 0 && report.entriesWritten == 2);
+  testAssert(report.lines[0].find("on a termination signal") != string::npos);
+  cout << "  the termination-signal dump writes, and its log line says which occasion it was"
+       << endl;
+}
+
 // An interval of 0 is not "a thread that wakes up and does nothing"; there is no thread.
 void testAnIntervalOfZeroRunsNoPassesAtAll() {
   TestCommon::ScopedTempDir cacheDir(TMP_DIR_PREFIX);
@@ -553,5 +644,7 @@ void Tests::runAnalysisCacheLifecycleTests() {
   testTheDumpIntervalIsOnByDefaultAndOffOnlyWhenSaidSo();
   testThePeriodicDumperWritesWithNobodyAskingAndNoCleanExit();
   testAnIntervalOfZeroRunsNoPassesAtAll();
+  testTheConfiguredAdmissionGovernsWhatTheDumpWrites();
+  testTheTerminationSignalDumpWritesAndNamesItsOccasion();
   cout << "Done" << endl;
 }

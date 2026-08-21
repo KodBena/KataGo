@@ -148,13 +148,28 @@ class AnalysisCacheLifecycle {
 // own order, recording each attachment in `attachments` exactly as a wire cache_attach does.
 // Does nothing and reports nothing when the lifecycle is not configured.
 //
-// ONE CONTEXT NAME FOR EVERY HOSTED MODEL, and no per-model override. A context is a CARD -- a
-// body of positions someone is studying -- and each model already gets its own file for it
-// (<context>.<model>.nnevals), so one name across the hosted models is not a collision, it is
-// the same card evaluated by each net. That is the deployment: a pool of leaves hosting the same
-// nets, sharing one directory. A per-model key would need a model-name-to-key mapping and a
-// refusal for a key naming a model this process does not host, for no witnessed need; it is
-// filed, not built.
+// EVERY SEARCHABLE MODEL, and the qualifier is load-bearing: a -human-model companion is a hosted
+// model by this codebase's own definition (it answers to a name in query_models) and it is NOT
+// attached here, because hosts.searchableIdxs() does not name it. That is deliberate -- a human-SL
+// net's evaluations are conditioned on SGF metadata a card does not carry -- but it is a fact an
+// operator has to be told rather than left to notice.
+//
+// ONE CONTEXT NAME FOR EVERY MODEL, and no per-model override. A context is a CARD -- a body of
+// positions someone is studying -- and one name across the hosted models is the same card
+// evaluated by each net. That is the deployment: a pool of leaves hosting the same nets, sharing
+// one directory. A per-model key would need a model-name-to-key mapping and a refusal for a key
+// naming a model this process does not host, for no witnessed need; it is filed, not built.
+//
+// WHAT THE PER-MODEL FILE SEPARATION DOES AND DOES NOT COVER, stated because the easy version of
+// this justification is wrong. The EVALUATIONS are separated: <context>.<model>.nnevals is one file
+// per (context, model), and its header carries and verifies the model's internal name and version,
+// so two nets' evaluations of one position can never be confused. The OBSERVATION COUNTS are not:
+// <context>.nncounts is one file per context with no model column, and a cache key does not depend
+// on which net evaluated the position -- so in a MULTI-MODEL engine the admission threshold is per
+// LEAF and not per net. A position each of two hosted nets saw once clears minObservations(2) for
+// both. Nothing is corrupted by that and it is not new (a client driving the wire verbs has always
+// had it), but "each model has its own file" does not make it untrue, and an operator setting a
+// threshold on a two-net leaf should know which quantity they are thresholding.
 //
 // THE BOUNDS ARE THE WIRE DEFAULTS: every key into level 0, no level-1 fill, no foreign sources.
 // Exposing them as further config keys is filed for the same reason -- the leaf deployment wants
@@ -164,8 +179,14 @@ class AnalysisCacheLifecycle {
 // attach -- a bad context name, an unreadable or unlockable directory, a store torn beyond
 // recovery. The engine must then NOT start: a leaf that silently served an empty cache because
 // its shared directory was unreachable is the failure this whole feature exists to notice
-// (ADR-0002). Nothing has been written to disk at that point, and the partially-attached
-// in-memory state dies with the refusing process.
+// (ADR-0002). The partially-attached in-memory state dies with the refusing process.
+//
+// ONE THING IS LEFT ON DISK BY A REFUSED STARTUP, and saying "nothing was written" would be false:
+// reading a container takes a shared lock, and NNCacheFileLock creates <context>.nnlock with
+// O_CREAT if it is not there. So a refusal after the first model attached leaves that empty lock
+// file behind. It carries no content, the next attempt reuses it, and no evaluation or count was
+// appended by any model -- but the file exists, and an operator inspecting the directory after a
+// failed start will see it.
 //
 // Returns one human-readable line per model, for the caller to log. It returns them rather than
 // logging them so that this file needs no Logger and a test can read what an operator would.
@@ -182,6 +203,7 @@ class AnalysisCacheLifecycle {
 enum class AnalysisCacheDumpOccasion {
   Interval,
   Shutdown,
+  TerminationSignal,
 };
 
 // What one engine-driven dumping pass did, in the figures an operator has to be able to read off
@@ -222,9 +244,12 @@ struct AnalysisCacheDumpReport {
 // reads `attachments`, which the request loop's cache verbs write.
 //
 // `openRequestCount` is reported in each dump's response, verbatim, as the engine's own record of
-// whether this dump was taken at rest. At shutdown it is zero and that is a fact rather than a
-// sample -- every analysis thread has been joined. On the interval it is whatever was open, which
-// is exactly what a client reading the log wants to know.
+// whether this dump was taken at rest. At shutdown the caller passes zero, and that is a fact
+// rather than a sample -- not because the process is down to one thread (it is not: an
+// NNEvaluator's own server threads live until its destructor, which runs later still) but because
+// every ANALYSIS thread has been joined and every bot destroyed, so no request can be issued or
+// outstanding. On the interval it is whatever was open, which is exactly what a client reading the
+// log wants to know.
 [[nodiscard]] AnalysisCacheDumpReport analysisCacheDumpAttachedContexts(
   const AnalysisModelHosts& hosts,
   AnalysisCacheAttachments& attachments,
@@ -315,5 +340,95 @@ class AnalysisCachePeriodicDumper {
   std::atomic<int64_t> passesWithAFailure_{0};
   std::atomic<int64_t> entriesWritten_{0};
 };
+
+// ONE LAST DUMP WHEN THE PROCESS IS ASKED TO DIE, because "asked to die" is how a pooled leaf
+// actually stops and it is not the path the shutdown dump is on.
+//
+// THE GAP THIS CLOSES. The shutdown dump fires when STDIN CLOSES. Nothing else reaches it: not
+// SIGTERM, which is what systemd, Kubernetes, supervisord, a shell wrapper and `kill` all send;
+// not SIGINT, which is Ctrl-C. A leaf stopped any of those ways died with its whole session in
+// RAM and no line anywhere saying so. The periodic dump above bounds that loss to one interval,
+// which is a bound and not a fix -- the last interval's work is still lost, every time, on the
+// most ordinary way of stopping the thing.
+//
+// WHAT IT DOES, AND WHAT IT DELIBERATELY DOES NOT. On SIGTERM or SIGINT it performs exactly one
+// dumping pass -- the same act, under the same mutex, as an interval pass -- and then RESTORES THE
+// DEFAULT HANDLER AND RE-RAISES THE SIGNAL, so the process dies of the signal it was sent, with
+// the same exit status a supervisor would have seen before. It does not try to unwind the engine,
+// does not close the request loop, does not turn a signal into a clean exit. Turning SIGTERM into
+// stdin-close would be the more ambitious fix and it is NOT taken: it would rest on whether
+// libstdc++ and glibc return EINTR out of a getline blocked on stdin rather than restarting it,
+// which is implementation-defined, and a persistence mechanism resting on that is a mechanism that
+// works on this machine.
+//
+// WHY A POLLING THREAD RATHER THAN A DUMP IN THE HANDLER. A signal handler may do essentially
+// nothing: not allocate, not lock, not touch a file. So the handler stores the signal number in a
+// lock-free atomic -- the only thing it is allowed to do -- and a thread polling that atomic does
+// the work. The poll is every few tens of milliseconds and costs nothing measurable; it exists
+// because there is no async-signal-safe way to wake a condition variable.
+//
+// INSTALLED ONLY WHEN A LIFECYCLE IS CONFIGURED, and that limit is deliberate. An analysis engine
+// with no persisted cache keeps EXACTLY the signal behaviour it has always had -- Ctrl-C kills it
+// at once -- because there is nothing for a handler to save and a delay would be a behaviour
+// change charged to users who asked for none. An engine with nnCacheAttachContext set has asked
+// for its cache to live on disk, and pays one dump's worth of delay on the way out.
+//
+// AT MOST ONE OF THESE MAY BE STARTED IN A PROCESS. Signal dispositions are process-global, so a
+// second instance would silently take the first one's handlers; start() refuses instead.
+class AnalysisCacheTerminationSignalDumper {
+ public:
+  // `report` is called from the watching thread. It runs while the process is dying, so it should
+  // be something that reaches the operator promptly -- Logger::write is.
+  AnalysisCacheTerminationSignalDumper(
+    const AnalysisModelHosts& hosts,
+    AnalysisCacheAttachments& attachments,
+    std::mutex& cacheActionMutex,
+    const AnalysisCacheLifecycle& lifecycle,
+    std::function<int64_t()> openRequestCount,
+    std::function<void(const std::string&)> report
+  );
+  ~AnalysisCacheTerminationSignalDumper();
+  AnalysisCacheTerminationSignalDumper(const AnalysisCacheTerminationSignalDumper&) = delete;
+  AnalysisCacheTerminationSignalDumper& operator=(const AnalysisCacheTerminationSignalDumper&) = delete;
+
+  // Installs the handlers and starts watching. A no-op when the lifecycle is unconfigured.
+  // Throws StringError if another instance is already started in this process, or if this
+  // platform's std::atomic<int> is not lock-free -- in which case the handler could not store the
+  // signal safely and the mechanism would be a mechanism that only appears to work (ADR-0002).
+  void start();
+  // Restores the previous handlers and joins the watching thread. Idempotent.
+  void stop();
+
+  // For a test, and for the engine's own end-of-run accounting.
+  [[nodiscard]] bool isWatching() const;
+
+ private:
+  void watch();
+
+  const AnalysisModelHosts& hosts;
+  AnalysisCacheAttachments& attachments;
+  std::mutex& cacheActionMutex;
+  const AnalysisCacheLifecycle& lifecycle;
+  std::function<int64_t()> openRequestCount;
+  std::function<void(const std::string&)> report;
+
+  std::thread thread;
+  std::atomic<bool> stopping{false};
+  bool started = false;
+};
+
+// THE DUMP A TERMINATION SIGNAL TRIGGERS, EXPOSED FOR A WITNESS THAT CANNOT SEND ONE.
+// A unit test in this process cannot send itself SIGTERM without killing the test run, so the leg
+// that checks "the signal path dumps what an interval pass would have" calls this instead. It is
+// the same call the watching thread makes, with the same occasion, under the same mutex --
+// exposing it is what keeps the test off a duplicate of the body (ADR-0021 Rule 1: the witness
+// observes the act, and here it can only reach the act by name).
+[[nodiscard]] AnalysisCacheDumpReport analysisCacheDumpForTerminationSignal(
+  const AnalysisModelHosts& hosts,
+  AnalysisCacheAttachments& attachments,
+  std::mutex& cacheActionMutex,
+  const AnalysisCacheLifecycle& lifecycle,
+  int64_t openRequestCount
+);
 
 #endif  // COMMAND_ANALYSISCACHELIFECYCLE_H_

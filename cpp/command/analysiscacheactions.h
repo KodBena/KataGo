@@ -236,9 +236,15 @@ struct CacheAttachmentRecord {
 // time under an exclusive file lock and cannot be run on the thread that reads stdin.
 //
 // SO THE RULE IS AN EXTERNAL ONE, AND IT IS THE ENGINE'S: a single mutex, owned by
-// MainCmds::analysis, is held by the request loop around every cache action and by the periodic
-// dumper around every pass. Those are the only two callers. NOTHING HERE MAY BE CALLED FROM AN
-// ANALYSIS THREAD, which is unchanged and is what keeps every search off this structure entirely.
+// MainCmds::analysis, is held by the request loop around every cache action and by each of the
+// engine's own dumpers -- the periodic one and the termination-signal watcher -- around every pass.
+// MainCmds::analysis also touches this registry itself, for the startup attach before any other
+// thread exists and for the shutdown dump after every other has been joined; those two are ordered
+// by thread creation and thread join rather than by the mutex, and need no lock. That enumeration
+// is exhaustive and it lives in full at the mutex's declaration in analysis.cpp.
+//
+// NOTHING HERE MAY BE CALLED FROM AN ANALYSIS THREAD, which is unchanged and is what keeps every
+// search off this structure entirely.
 //
 // This class does not take that lock itself, and deliberately: a lock inside it would guard each
 // call and not the ACT, and an act here is several calls (isAttached, then attachmentFor, then a

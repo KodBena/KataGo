@@ -1,6 +1,7 @@
 #include "../command/analysiscachelifecycle.h"
 
 #include <chrono>
+#include <csignal>
 #include <typeinfo>
 
 #include "../core/global.h"
@@ -216,9 +217,26 @@ vector<string> analysisCacheStartupAttach(
     const CacheAttachRequest request{
       context, NNCacheLevelZeroBound::all(), optional<int64_t>(), vector<string>()
     };
-    json result;
+    // THE RESPONSE IS READ INSIDE THE try, AND THAT IS NOT TIDINESS. `result` is a non-const json,
+    // so operator[] on a key the response did not carry INSERTS a null and .get<int64_t>() then
+    // throws nlohmann::json::type_error -- which is not a StringError, is caught by nothing here,
+    // and (main.cpp installs no top-level handler outside Windows) reaches the operator as an
+    // abort instead of the key-naming refusal every other line of this function exists to produce.
+    // Same contract, same two files, same treatment as the dump side's requiredInt (ADR-0002).
     try {
-      result = cacheAttachExecute(hosts, modelIdx, attachments, request);
+      const json result = cacheAttachExecute(hosts, modelIdx, attachments, request);
+      lines.push_back(
+        Global::strprintf(
+          "%s: model \"%s\" attached context \"%s\": %s entries in level 0, %s payload bytes, "
+          "container tail %s, count log tail %s, %.1f ms",
+          AnalysisCacheLifecycle::KEY_ATTACH_CONTEXT, modelName.c_str(), context.c_str(),
+          Global::int64ToString(result.at("entriesInLevelZero").get<int64_t>()).c_str(),
+          Global::int64ToString(result.at("levelZeroPayloadBytes").get<int64_t>()).c_str(),
+          result.at("containerTail").get<string>().c_str(),
+          result.at("countLogTail").get<string>().c_str(),
+          result.at("buildMilliseconds").get<double>()
+        )
+      );
     }
     catch(const StringError& e) {
       // NAMED AT THE KEY THE OPERATOR CAN ACT ON. The underlying refusal is about a container,
@@ -230,18 +248,13 @@ vector<string> analysisCacheStartupAttach(
         "operator believes it is attached."
       );
     }
-    lines.push_back(
-      Global::strprintf(
-        "%s: model \"%s\" attached context \"%s\": %s entries in level 0, %s payload bytes, "
-        "container tail %s, count log tail %s, %.1f ms",
-        AnalysisCacheLifecycle::KEY_ATTACH_CONTEXT, modelName.c_str(), context.c_str(),
-        Global::int64ToString(result["entriesInLevelZero"].get<int64_t>()).c_str(),
-        Global::int64ToString(result["levelZeroPayloadBytes"].get<int64_t>()).c_str(),
-        result["containerTail"].get<string>().c_str(),
-        result["countLogTail"].get<string>().c_str(),
-        result["buildMilliseconds"].get<double>()
-      )
-    );
+    catch(const std::exception& e) {
+      throw StringError(
+        "Config key '" + string(AnalysisCacheLifecycle::KEY_ATTACH_CONTEXT) + " = " + context +
+        "' could not be honored for hosted model \"" + modelName +
+        "\", and the cause is one this layer does not model (" + typeid(e).name() + "): " + e.what()
+      );
+    }
   }
   return lines;
 }
@@ -253,6 +266,7 @@ namespace {
 const char* occasionPhrase(AnalysisCacheDumpOccasion occasion) {
   if(occasion == AnalysisCacheDumpOccasion::Interval) return "on the dump interval";
   if(occasion == AnalysisCacheDumpOccasion::Shutdown) return "at shutdown";
+  if(occasion == AnalysisCacheDumpOccasion::TerminationSignal) return "on a termination signal";
   // Not a switch: the build turns on -Wswitch-default, so a switch over a closed enum would need
   // a default case that can never run and that would then hide a missing case from -Wswitch.
   throw StringError("AnalysisCacheDumpOccasion: unhandled occasion in a dump report line.");
@@ -434,4 +448,166 @@ int64_t AnalysisCachePeriodicDumper::passesWithAFailure() const {
 
 int64_t AnalysisCachePeriodicDumper::entriesWritten() const {
   return entriesWritten_.load();
+}
+
+//-------------------------------------------------------------------------------------
+// The dump a termination signal triggers
+//-------------------------------------------------------------------------------------
+
+AnalysisCacheDumpReport analysisCacheDumpForTerminationSignal(
+  const AnalysisModelHosts& hosts,
+  AnalysisCacheAttachments& attachments,
+  std::mutex& cacheActionMutex,
+  const AnalysisCacheLifecycle& lifecycle,
+  int64_t openRequestCount
+) {
+  std::lock_guard<std::mutex> lock(cacheActionMutex);
+  return analysisCacheDumpAttachedContexts(
+    hosts, attachments, lifecycle, AnalysisCacheDumpOccasion::TerminationSignal, openRequestCount
+  );
+}
+
+namespace {
+
+// THE ONLY THING A SIGNAL HANDLER MAY TOUCH, and it is process-global because signal dispositions
+// are. Zero means nothing has arrived. `sig_atomic_t` would be the C answer; a lock-free
+// std::atomic<int> is the C++ one and start() REFUSES if this platform's is not lock-free rather
+// than installing a handler that would be undefined behaviour (the same check contribute.cpp makes
+// for the same reason).
+std::atomic<int> terminationSignalReceived(0);
+// Whether an AnalysisCacheTerminationSignalDumper currently owns the dispositions. Two would each
+// believe they had them.
+std::atomic<bool> terminationSignalHandlerInstalled(false);
+
+extern "C" void analysisCacheTerminationSignalHandler(int sig) {
+  // One store, to a lock-free atomic, and nothing else. No allocation, no lock, no I/O.
+  terminationSignalReceived.store(sig);
+}
+
+// How often the watching thread looks at that atomic. Small enough that a supervisor's SIGTERM is
+// acted on immediately by any human measure, large enough that the thread is not measurable.
+const int WATCH_POLL_MILLISECONDS = 25;
+
+}  // namespace
+
+AnalysisCacheTerminationSignalDumper::AnalysisCacheTerminationSignalDumper(
+  const AnalysisModelHosts& hosts_,
+  AnalysisCacheAttachments& attachments_,
+  std::mutex& cacheActionMutex_,
+  const AnalysisCacheLifecycle& lifecycle_,
+  std::function<int64_t()> openRequestCount_,
+  std::function<void(const string&)> report_
+)
+  :hosts(hosts_),
+   attachments(attachments_),
+   cacheActionMutex(cacheActionMutex_),
+   lifecycle(lifecycle_),
+   openRequestCount(std::move(openRequestCount_)),
+   report(std::move(report_))
+{}
+
+AnalysisCacheTerminationSignalDumper::~AnalysisCacheTerminationSignalDumper() {
+  stop();
+}
+
+void AnalysisCacheTerminationSignalDumper::start() {
+  if(!lifecycle.isConfigured())
+    return;
+  if(!std::atomic_is_lock_free(&terminationSignalReceived))
+    throw StringError(
+      "This platform's std::atomic<int> is not lock-free, so a signal handler cannot store the "
+      "signal number safely, so the persisted cache CANNOT be dumped on SIGTERM here. Refusing to "
+      "install a handler that would only appear to work. Set '" +
+      string(AnalysisCacheLifecycle::KEY_DUMP_INTERVAL_MINUTES) + "' low enough that the periodic "
+      "dump alone bounds the loss you are willing to take, and stop this engine by closing its "
+      "stdin rather than by signalling it."
+    );
+  if(terminationSignalHandlerInstalled.exchange(true))
+    throw StringError(
+      "A persisted-cache termination-signal dumper is already installed in this process. Signal "
+      "dispositions are process-global, so a second one would silently take the first one's "
+      "handlers and the first one would never fire again."
+    );
+  terminationSignalReceived.store(0);
+  stopping.store(false);
+  std::signal(SIGINT, analysisCacheTerminationSignalHandler);
+  std::signal(SIGTERM, analysisCacheTerminationSignalHandler);
+  started = true;
+  thread = std::thread([this]() { this->watch(); });
+}
+
+void AnalysisCacheTerminationSignalDumper::stop() {
+  if(!started)
+    return;
+  stopping.store(true);
+  if(thread.joinable())
+    thread.join();
+  // RESTORED, so that a signal arriving after this point kills the process exactly as it would
+  // have before this class existed. Leaving the handler installed past the point where anything
+  // is left to dump would mean a signal was swallowed by a thread that is no longer watching.
+  std::signal(SIGINT, SIG_DFL);
+  std::signal(SIGTERM, SIG_DFL);
+  terminationSignalHandlerInstalled.store(false);
+  started = false;
+}
+
+bool AnalysisCacheTerminationSignalDumper::isWatching() const {
+  return started;
+}
+
+void AnalysisCacheTerminationSignalDumper::watch() {
+  while(true) {
+    // THE SIGNAL IS CHECKED BEFORE THE STOP FLAG, and the order is a bug fix rather than a
+    // preference. Checked the other way round, a SIGTERM that arrived a few milliseconds before a
+    // normal shutdown began was SWALLOWED: stop() set stopping, the loop saw it first and returned
+    // without dumping, and the signal the operator sent did nothing. The e2e witness caught
+    // exactly that (SC7b), which is what a witness is for.
+    //
+    // A WINDOW REMAINS AND IS NOT PAPERED OVER: a signal delivered after this load and before
+    // stop() joins is not acted on by this thread. It is harmless in every case that matters --
+    // the shutdown dump immediately following writes the same state, so the work still reaches
+    // disk -- and closing it properly would mean holding a lock across a signal delivery, which is
+    // the thing a signal handler may not do. The mechanism is "the work gets written", not "this
+    // particular thread writes it" (ADR-0002: the residual is stated, not hidden).
+    const int sig = terminationSignalReceived.load();
+    if(sig == 0) {
+      if(stopping.load())
+        return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(WATCH_POLL_MILLISECONDS));
+      continue;
+    }
+
+    report(
+      Global::strprintf(
+        "%s: signal %d received -- dumping the persisted cache before this process dies",
+        AnalysisCacheLifecycle::KEY_ATTACH_CONTEXT, sig
+      )
+    );
+    // MAY WAIT on a periodic pass already in flight, by design: the mutex is what makes one writer
+    // at a time true, and a signal is not a reason to append into a file another thread is
+    // appending into. The wait is bounded by one pass.
+    const AnalysisCacheDumpReport dumped = analysisCacheDumpForTerminationSignal(
+      hosts, attachments, cacheActionMutex, lifecycle, openRequestCount()
+    );
+    for(size_t i = 0; i < dumped.lines.size(); i++)
+      report(dumped.lines[i]);
+    report(
+      Global::strprintf(
+        "%s: %s model(s) dumped, %s failed, %s entries written; re-raising signal %d",
+        AnalysisCacheLifecycle::KEY_ATTACH_CONTEXT,
+        Global::int64ToString(dumped.modelsDumped).c_str(),
+        Global::int64ToString(dumped.modelsFailed).c_str(),
+        Global::int64ToString(dumped.entriesWritten).c_str(), sig
+      )
+    );
+
+    // THE PROCESS DIES OF THE SIGNAL IT WAS SENT, with the exit status a supervisor expects, and
+    // this call does not return. Restoring the default disposition first is what makes the raise
+    // fatal rather than re-entering the handler above.
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+    // Unreachable for SIGINT and SIGTERM under SIG_DFL. If some platform ever returned here, the
+    // honest thing is to stop watching rather than to loop dumping forever.
+    return;
+  }
 }
