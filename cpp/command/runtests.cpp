@@ -147,23 +147,16 @@ int MainCmds::runnnevalcontainerbench(const vector<string>& args) {
   // args[0] is the subcommand name itself, per handleSubcommand's own slicing in main.cpp.
   if(args.size() < 2 || args.size() > 5)
     throw StringError(
-      "runnnevalcontainerbench: expected DIRECTORY [TARGET_MIB] [ENTRIES_PER_DUMP] [full], "
-      "where 'full' additionally performs the payload-decoding load."
+      "runnnevalcontainerbench: expected DIRECTORY [TARGET_MIB] [ENTRIES_PER_DUMP] [MODE], "
+      "where MODE is index (the default), full, synth or append -- see Tests::"
+      "runNNEvalContainerLoadIOBench for what each one does."
     );
   const int64_t targetMiB = args.size() >= 3 ? (int64_t)Global::stringToInt64(args[2]) : 1024;
   const int64_t entriesPerDump = args.size() >= 4 ? (int64_t)Global::stringToInt64(args[3]) : 20000;
-  bool doFullLoad = false;
-  if(args.size() >= 5) {
-    if(args[4] == "full")
-      doFullLoad = true;
-    else if(args[4] != "index")
-      throw StringError(
-        "runnnevalcontainerbench: the fourth argument is 'full' or 'index', not '" + args[4] + "'."
-      );
-  }
+  const string mode = args.size() >= 5 ? args[4] : string("index");
   Board::initHash();
   ScoreValue::initTables();
-  Tests::runNNEvalContainerLoadIOBench(args[1], targetMiB, entriesPerDump, doFullLoad);
+  Tests::runNNEvalContainerLoadIOBench(args[1], targetMiB, entriesPerDump, mode);
   ScoreValue::freeTables();
   return 0;
 }

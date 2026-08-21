@@ -264,7 +264,7 @@ int64_t sizeOfOrZero(const string& path) {
 //-------------------------------------------------------------------------------------
 
 void Tests::runNNEvalContainerLoadIOBench(
-  const string& directory, int64_t targetMiB, int64_t entriesPerDump, bool doFullLoad
+  const string& directory, int64_t targetMiB, int64_t entriesPerDump, const string& mode
 ) {
   if(!FileUtils::isDirectory(directory))
     throw StringError("runnnevalcontainerbench: '" + directory + "' is not an existing directory.");
@@ -272,9 +272,56 @@ void Tests::runNNEvalContainerLoadIOBench(
     throw StringError("runnnevalcontainerbench: the target size in MiB must be at least 1.");
   if(entriesPerDump < 1)
     throw StringError("runnnevalcontainerbench: the entries per dump must be at least 1.");
+  const bool doFullLoad = mode == "full";
+  const bool synthOnly = mode == "synth";
+  const bool appendOnly = mode == "append";
+  if(mode != "full" && mode != "index" && !synthOnly && !appendOnly)
+    throw StringError(
+      "runnnevalcontainerbench: mode '" + mode + "' has no reading; it is one of "
+      "full, index, synth, append."
+    );
 
   const NNEvalContainer container =
     NNEvalContainer::forContextAndModel(directory, "loadiobench", BENCH_MODEL, BENCH_MODEL_VERSION);
+
+  // THE APPEND-ONLY MODE: one dump onto the container already on disk, and nothing else.
+  // The serial it starts from is derived from the file's size rather than remembered, so
+  // this process shares no state with the one that synthesised the container -- which is the
+  // whole point, since the two are deliberately separate processes with an external
+  // truncate(1) and two sha256 passes between them.
+  if(appendOnly) {
+    if(!FileUtils::exists(container.path()))
+      throw StringError(
+        "runnnevalcontainerbench: append mode found no container at " + container.path() +
+        ". Run the synth mode first."
+      );
+    const int64_t sizeBefore = sizeOfOrZero(container.path());
+    const int64_t bytesPerEntry = NNEvalContainer::bytesForEntry(BENCH_EDGE, BENCH_EDGE, BENCH_OWNERMAP);
+    // Past every serial the synthesis can have used, so the appended keys are new.
+    const int64_t serialBase = sizeBefore / bytesPerEntry + 1000000;
+    const vector<shared_ptr<const NNOutput>> entries = makeDump(serialBase, entriesPerDump);
+    const int64_t wBefore = writeBytesSoFar();
+    const int64_t rBefore = readBytesSoFar();
+    const chrono::steady_clock::time_point t0 = chrono::steady_clock::now();
+    const NNEvalContainerAppendResult appended = container.appendBlock(entries);
+    const double seconds = secondsSince(t0);
+    const int64_t wAfter = writeBytesSoFar();
+    const int64_t rAfter = readBytesSoFar();
+    cout << "=== append onto an existing container ===" << endl;
+    cout << "    seconds=" << seconds
+         << "  tornTailBytesDiscarded=" << appended.tornTailBytesDiscarded
+         << "  rewroteTheFile=" << (appended.rewroteTheFile ? "true" : "false")
+         << "  bytesAppended=" << appended.bytesAppended << endl;
+    printBytes("write_bytes", (wBefore < 0 || wAfter < 0) ? -1 : wAfter - wBefore);
+    printBytes("read_bytes", (rBefore < 0 || rAfter < 0) ? -1 : rAfter - rBefore);
+    cout << "    file size before=" << sizeBefore << "  after=" << sizeOfOrZero(container.path()) << endl;
+    const NNEvalContainerIndex index = container.loadIndex();
+    cout << "    after append: tail=" << (index.tail() == NNEvalContainerTail::Intact ? "Intact" : "Truncated")
+         << "  blocksApplied=" << index.blocksApplied()
+         << "  entriesApplied=" << index.entriesApplied()
+         << "  liveKeys=" << index.entries().size() << endl;
+    return;
+  }
 
   // A fresh container every run: a measurement that resumed a leftover file would be
   // measuring a different file than the one it reports.
@@ -326,6 +373,11 @@ void Tests::runNNEvalContainerLoadIOBench(
   if(ioAvailable) {
     printBytes("synthesis write_bytes", synthWriteBytes);
     printBytes("synthesis read_bytes", synthReadBytes);
+  }
+
+  if(synthOnly) {
+    cout << "=== synthesis only; the container is left at " << container.path() << " ===" << endl;
+    return;
   }
 
   //-----------------------------------------------------------------------------------

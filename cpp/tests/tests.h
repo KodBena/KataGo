@@ -198,11 +198,21 @@ namespace Tests {
   // Not part of runtests, for the two reasons the count log's bench is not: it is a
   // measurement rather than an assertion, and it writes real files -- of GiB scale here --
   // so the directory is named on the command line rather than defaulted. `targetMiB` is the
-  // container size to synthesise, `entriesPerDump` the block size to synthesise it in, and
-  // `doFullLoad` asks for the payload-decoding load, which holds the whole live set in
-  // memory and is therefore refusable on a machine smaller than the container.
+  // container size to synthesise and `entriesPerDump` the block size to synthesise it in.
+  // `mode` is one of:
+  //   "index"  -- synthesise, time the cold key-set scan, then the torn-tail repair.
+  //   "full"   -- the same, plus the payload-decoding load, which holds the whole live set
+  //               in memory and so is not performable on a machine smaller than the container.
+  //   "synth"  -- synthesise and STOP, leaving the container on disk.
+  //   "append" -- append one dump to the container already on disk, and stop.
+  // The last two exist so the torn-tail witness can be taken from OUTSIDE the process:
+  // synthesise, hash the intact prefix, tear the tail with truncate(1), append, hash the
+  // same prefix again. Within one process there is no moment between synthesis and the tear
+  // at which an external hash could be taken, so a single-process bench can report the
+  // repair's byte counts but can never witness the surviving bytes themselves.
   void runNNEvalContainerLoadIOBench(
-    const std::string& directory, int64_t targetMiB, int64_t entriesPerDump, bool doFullLoad);
+    const std::string& directory, int64_t targetMiB, int64_t entriesPerDump,
+    const std::string& mode);
 
   // Not part of runtests: it is a measurement, not an assertion. Reached by the
   // runnncachefrozenbench subcommand.
