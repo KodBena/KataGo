@@ -179,8 +179,27 @@ uint64_t NNCacheFileName::hashOf(const std::string& name) {
 // The durability primitives
 //-------------------------------------------------------------------------------------
 
+namespace {
+  // Whether a stdio mode string opens a stream that can write. Every mode but a bare "r"
+  // family can: "w", "a" and any mode carrying '+' all write. Read once at construction
+  // rather than re-parsed, and used only to refuse a page-cache drop on a write handle.
+  bool modeCanWrite(const char* mode) {
+    if(mode == nullptr || mode[0] == '\0')
+      return true;  // an unreadable mode is treated as writable, which is the safe answer
+    if(mode[0] != 'r')
+      return true;
+    for(const char* p = mode; *p != '\0'; p++) {
+      if(*p == '+')
+        return true;
+    }
+    return false;
+  }
+}
+
 NNCacheFileHandle::NNCacheFileHandle(const std::string& path, const char* mode)
-  :file_(std::fopen(path.c_str(), mode))
+  :file_(std::fopen(path.c_str(), mode)),
+   canWrite_(modeCanWrite(mode)),
+   path_(path)
 {}
 
 NNCacheFileHandle::~NNCacheFileHandle() {
@@ -224,6 +243,17 @@ bool NNCacheFileHandle::useSequentialStreamBuffer() {
 }
 
 void NNCacheFileHandle::dropCachedRange(int64_t offset, int64_t bytes) {
+  // A WRITE HANDLE IS REFUSED BY NAME. On a stream that can write, the pages this would
+  // discard may be pages this process has written and not yet flushed, and asking the kernel
+  // to forget them is asking it to lose data. It is a caller error rather than a runtime
+  // condition, so it is a refusal and not a silent no-op (ADR-0002).
+  if(canWrite_)
+    throw StringError(
+      "NNCacheFileHandle: a page-cache drop was requested on " + path_ +
+      ", which is open for writing. Dropping cached pages of a stream that can write risks "
+      "discarding bytes this process has not flushed; this is only ever correct on a handle "
+      "opened for reading."
+    );
   if(file_ == nullptr || offset < 0 || bytes <= 0)
     return;
 #ifndef _WIN32
@@ -348,6 +378,25 @@ void NNCacheFileTruncate::toLength(const std::string& path, int64_t bytes) {
   // The length lives in the inode, not the directory entry, so no directory fsync is needed
   // -- unlike the rename this replaces, which is a directory operation. Stated because the
   // asymmetry with rewriteAsOneBlock's directory fsync is otherwise an apparent omission.
+}
+
+const char* NNCacheFileReport::nameOf(NNCacheFileTailRepair repair) {
+  switch(repair) {
+    case NNCacheFileTailRepair::NotNeeded: return "notNeeded";
+    case NNCacheFileTailRepair::Truncated: return "truncated";
+  }
+  // Unreachable for a value of the enum; present so a future value added without visiting
+  // this switch is a compile warning here rather than a silent empty string at the operator.
+  throw StringError("NNCacheFileReport: a tail-repair disposition has no name.");
+}
+
+const char* NNCacheFileReport::nameOf(NNCacheFileMaintenance maintenance) {
+  switch(maintenance) {
+    case NNCacheFileMaintenance::Nothing: return "nothing";
+    case NNCacheFileMaintenance::TruncatedTornTail: return "truncatedTornTail";
+    case NNCacheFileMaintenance::Compacted: return "compacted";
+  }
+  throw StringError("NNCacheFileReport: a maintenance disposition has no name.");
 }
 
 //-------------------------------------------------------------------------------------

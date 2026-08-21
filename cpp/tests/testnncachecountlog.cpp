@@ -8,6 +8,7 @@
 
 #include "../core/fileutils.h"
 #include "../core/rand.h"
+#include "../neuralnet/nncachefileformat.h"
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncachecountlog.h"
 
@@ -141,7 +142,7 @@ void testCountLogRoundTripsCountsExactly() {
 
   const NNCacheCountLogAppendResult appended = log.appendDump(deltaOf({{1, 7}, {2, 0}, {3, 4000000000u}}, 0));
   testAssert(appended.tornTailBytesDiscarded == 0);
-  testAssert(appended.rewroteTheFile == false);
+  testAssert(appended.tailRepair == NNCacheFileTailRepair::NotNeeded);
   // A first dump writes the file header too; the block itself is the framing plus the rows.
   testAssert(appended.bytesAppended ==
              (int64_t)NNCacheCountLog::fileHeaderBytes() + NNCacheCountLog::bytesForDumpOf(3));
@@ -199,7 +200,7 @@ void testCountLogEmptyDumpAppendsNothing() {
   const NNCacheCountLogAppendResult firstAppend = log.appendDump(deltaOf({}, 0));
   testAssert(firstAppend.bytesAppended == 0);
   testAssert(firstAppend.tornTailBytesDiscarded == 0);
-  testAssert(firstAppend.rewroteTheFile == false);
+  testAssert(firstAppend.tailRepair == NNCacheFileTailRepair::NotNeeded);
   testAssert(!FileUtils::exists(log.path()));
 
   // A real dump creates the file and writes one block ...
@@ -210,7 +211,7 @@ void testCountLogEmptyDumpAppendsNothing() {
   const NNCacheCountLogAppendResult secondAppend = log.appendDump(deltaOf({}, 0));
   testAssert(secondAppend.bytesAppended == 0);
   testAssert(secondAppend.tornTailBytesDiscarded == 0);
-  testAssert(secondAppend.rewroteTheFile == false);
+  testAssert(secondAppend.tailRepair == NNCacheFileTailRepair::NotNeeded);
   testAssert(sizeOf(log.path()) == sizeAfterOneDump);
 
   const NNCacheCountLogContents contents = log.load();
@@ -373,7 +374,7 @@ void testCountLogTornTailIsRepairedByTruncationBeforeTheNextAppend() {
 
   const NNCacheCountLogAppendResult appended = log.appendDump(deltaOf({{4, 40}}, 0));
   testAssert(appended.tornTailBytesDiscarded == tornBytes);
-  testAssert(appended.rewroteTheFile == false);
+  testAssert(appended.tailRepair == NNCacheFileTailRepair::Truncated);
   testAssert(readBytesAt(log.path(), 0, (size_t)sizeAfterOneDump) == intactPrefix);
   testAssert(sizeOf(log.path()) == sizeAfterOneDump + appended.bytesAppended);
 
@@ -418,8 +419,8 @@ void testCountLogCompactionPreservesTotalsAndSurvivesACrash() {
   testAssert(afterStale.rows().size() == 2);
   testAssert(sizeOf(log.path()) == sizeBefore);
 
-  const bool compacted = log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple());
-  testAssert(compacted == true);
+  const NNCacheFileMaintenance compacted = log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple());
+  testAssert(compacted == NNCacheFileMaintenance::Compacted);
 
   const NNCacheCountLogContents after = log.load();
   testAssert(after.tail() == NNCacheCountLogTail::Intact);
@@ -437,7 +438,7 @@ void testCountLogCompactionPreservesTotalsAndSurvivesACrash() {
   testAssert(!FileUtils::exists(stalePath));
 
   // Under the multiple, a fresh compaction does not fire.
-  testAssert(log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple()) == false);
+  testAssert(log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple()) == NNCacheFileMaintenance::Nothing);
 }
 
 // Ordering is by observations. Nothing here ranks by sessions.

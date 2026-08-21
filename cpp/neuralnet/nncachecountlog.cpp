@@ -203,8 +203,17 @@ struct ScanResult {
   std::vector<NNCacheCountLogBlock> blocks;
 };
 
+// `accumulateRows` false is the FRAMING-ONLY scan: the framing is walked and every byte is
+// still checksummed -- that is what "intact" means -- but the merged row set is not built.
+// It is what the append path needs and all it needs, since the torn-tail repair became a
+// truncation and there is no longer a rewrite to hand the rows to. The saving is not I/O but
+// memory and CPU, and it is not small at the size this file actually reaches: a card holding
+// 10-20 GB of evaluations has millions of keys, so the map and vector this builds are
+// hundreds of megabytes of nodes, constructed and thrown away on every fifteen-minute dump.
+// The claim that "a count log is megabytes" did not survive its own arithmetic.
 ScanResult scanLog(
-  const std::string& path, const std::string& context, uint64_t contextHash, bool collectBlocks = false
+  const std::string& path, const std::string& context, uint64_t contextHash,
+  bool collectBlocks = false, bool accumulateRows = true
 ) {
   ScanResult result;
 
@@ -212,6 +221,11 @@ ScanResult scanLog(
   if(!f.isOpen())
     return result;  // Absent is a normal answer: no dump has happened here yet.
   result.fileExists = true;
+  // THE READ POSTURE, the same one the evaluation container's scans take, and taken here for
+  // the same reason rather than skipped because this file is "the small one": read in large
+  // strides, and do not keep what has been read. See the page-cache paragraph in
+  // nncachefileformat.h for why this is one fact about the file family and not two.
+  (void)f.useSequentialStreamBuffer();
 
   if(std::fseek(f.get(), 0, SEEK_END) != 0)
     throw StringError("NNCacheCountLog: could not seek " + path + ".");
@@ -253,8 +267,19 @@ ScanResult scanLog(
       break;  // torn: not even a whole block header left
 
     uint8_t blockHeader[BLOCK_HEADER_BYTES];
-    if(std::fread(blockHeader, 1, BLOCK_HEADER_BYTES, f.get()) != BLOCK_HEADER_BYTES)
-      break;  // torn: the file shrank under us, or the read failed
+    if(std::fread(blockHeader, 1, BLOCK_HEADER_BYTES, f.get()) != BLOCK_HEADER_BYTES) {
+      // AN I/O ERROR IS NOT A TORN TAIL. A short read at end of file is a crash artifact; a
+      // read that FAILED is a device that could not answer, and says nothing about the file.
+      // The write path acts on this verdict by truncating, in place and irreversibly, so
+      // conflating the two would shorten a good log to wherever the disk hiccuped (ADR-0002).
+      if(std::ferror(f.get()) != 0)
+        throw StringError(
+          "NNCacheCountLog: could not read a block header of " + path + " at offset " +
+          Global::int64ToString(offset) + ". This is a read failure, not a torn tail, and the "
+          "file is left exactly as it was found."
+        );
+      break;  // torn: the file shrank under us
+    }
 
     // The header checksums ITSELF before its record count is believed. Everything after
     // this point trusts a length that came out of a file a crash may have half-written, so
@@ -272,8 +297,15 @@ ScanResult scanLog(
       break;
 
     payload.resize((size_t)payloadBytes);
-    if(payloadBytes > 0 && std::fread(payload.data(), 1, (size_t)payloadBytes, f.get()) != (size_t)payloadBytes)
+    if(payloadBytes > 0 && std::fread(payload.data(), 1, (size_t)payloadBytes, f.get()) != (size_t)payloadBytes) {
+      if(std::ferror(f.get()) != 0)
+        throw StringError(
+          "NNCacheCountLog: could not read the records of a block of " + path + " at offset " +
+          Global::int64ToString(offset + (int64_t)BLOCK_HEADER_BYTES) + ". This is a read "
+          "failure, not a torn tail, and the file is left exactly as it was found."
+        );
       break;
+    }
     if(get64(blockHeader + 16) != checksumOf(payload.data(), (size_t)payloadBytes, contextHash))
       break;
 
@@ -283,10 +315,17 @@ ScanResult scanLog(
     if(collectBlocks)
       thisBlock.rows.reserve(recordCount);
     for(uint32_t i = 0; i < recordCount; i++) {
+      if(!accumulateRows && !collectBlocks)
+        break;  // the framing-only scan: the block is verified and nothing is built from it
       const uint8_t* r = payload.data() + (size_t)i * RECORD_BYTES;
       const Hash128 key(get64(r + 0), get64(r + 8));
       const uint32_t observations = get32(r + 16);
       const uint32_t sessions = get32(r + 20);
+      if(!accumulateRows) {
+        if(collectBlocks)
+          thisBlock.rows.push_back(NNCacheCountLogBlockRow{key, (uint64_t)observations, (uint64_t)sessions});
+        continue;
+      }
       const std::pair<uint64_t,uint64_t> mapKey(key.hash0, key.hash1);
       const std::map<std::pair<uint64_t,uint64_t>, size_t>::iterator it = indexOfKey.find(mapKey);
       if(it == indexOfKey.end()) {
@@ -313,11 +352,18 @@ ScanResult scanLog(
     }
     result.blocksApplied += 1;
     result.recordsApplied += (int64_t)recordCount;
+    const int64_t blockStart = offset;
     offset += (int64_t)BLOCK_HEADER_BYTES + payloadBytes;
     result.intactEndOffset = offset;
+    // Drop-behind: this block is verified and everything wanted from it is in memory, so its
+    // pages are handed back rather than left to evict the machine's working set.
+    f.dropCachedRange(blockStart, offset - blockStart);
   }
 
   result.tornTailBytes = fileSize - result.intactEndOffset;
+  f.dropCachedRange(0, (int64_t)FILE_HEADER_BYTES);
+  if(result.tornTailBytes > 0)
+    f.dropCachedRange(result.intactEndOffset, result.tornTailBytes);
   return result;
 }
 
@@ -584,7 +630,7 @@ NNCacheCountLogContents NNCacheCountLog::compactUnlocked() const {
   );
 }
 
-bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
+NNCacheFileMaintenance NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   if(liveSetMultiple < 1)
     throw StringError(
       "NNCacheCountLog: a compaction multiple of " + Global::intToString(liveSetMultiple) +
@@ -602,7 +648,7 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   const bool torn = scan.tornTailBytes > 0;
   const bool overMultiple = liveSet > 0 && scan.recordsApplied > (int64_t)liveSetMultiple * liveSet;
   if(!torn && !overMultiple)
-    return false;
+    return NNCacheFileMaintenance::Nothing;
   // A TORN TAIL ALONE IS REPAIRED BY TRUNCATION, NEVER BY COMPACTION -- the same rule the
   // evaluation container states, for the same reason: the size trigger did not fire, so
   // nothing here authorises rewriting a log the operator did not ask to have rewritten.
@@ -610,7 +656,7 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   // from the intact part and the torn tail goes with the old inode.
   if(torn && !overMultiple) {
     NNCacheFileTruncate::toLength(path_, scan.intactEndOffset);
-    return true;
+    return NNCacheFileMaintenance::TruncatedTornTail;
   }
   // DELEGATES rather than rewriting here. "Rewrite this log" has exactly one home; a
   // second call to rewriteAsOneBlock at this site would be a second statement of the same
@@ -621,7 +667,7 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   // the UNLOCKED form because the exclusive lock is already held above.
   const NNCacheCountLogContents written = compactUnlocked();
   (void)written;
-  return true;
+  return NNCacheFileMaintenance::Compacted;
 }
 
 NNCacheObservationDelta::NNCacheObservationDelta(NNCacheObservationLedger ledger)
@@ -669,12 +715,16 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheObservation
   NNCacheCountLogAppendResult result;
   result.bytesAppended = 0;
   result.tornTailBytesDiscarded = 0;
-  result.rewroteTheFile = false;
+  result.tailRepair = NNCacheFileTailRepair::NotNeeded;
 
   // Scan first. A torn tail must be repaired BEFORE anything is appended: an append past a
   // torn tail lands at an offset no loader ever reaches, so every subsequent dump would be
   // silently lost while every call reported success.
-  const ScanResult scan = scanLog(path_, context_, contextHash_);
+  // THE FRAMING-ONLY SCAN, because the only thing this needs from the file is where its
+  // intact part ends. The merged row set it used to build was handed to the rewrite; with
+  // the repair a truncation there is nothing to hand it to, and building it was hundreds of
+  // megabytes of map nodes on every dump of a card-sized log.
+  const ScanResult scan = scanLog(path_, context_, contextHash_, false, false);
   if(scan.tornTailBytes > 0) {
     // TRUNCATION, NOT A REWRITE, and the reason is the SHARED CONTRACT rather than this
     // file's own size. The evaluation container repairs a torn tail by shortening back to
@@ -689,9 +739,8 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheObservation
     // compact.
     NNCacheFileTruncate::toLength(path_, scan.intactEndOffset);
     result.tornTailBytesDiscarded = scan.tornTailBytes;
-    // Shortened, not rewritten; a repair is recognised by tornTailBytesDiscarded being
-    // positive, and this stays false so the two facts do not collapse into one.
-    result.rewroteTheFile = false;
+    // Shortened, not rewritten, said outright rather than inferred from the byte count.
+    result.tailRepair = NNCacheFileTailRepair::Truncated;
   }
 
   // EVERY ROW THE DELTA CARRIES, including a key observed exactly once, and including a row

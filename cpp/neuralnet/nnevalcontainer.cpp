@@ -567,19 +567,55 @@ void walkBlockHeaderArray(
     );
 }
 
-// Streams `regionBytes` bytes from the current position through a bounded buffer and returns
-// their checksum, or false if the file was short. Nothing is retained: this is how a 69 MB
-// block is verified without being held.
-bool checksumRegion(std::FILE* f, int64_t regionBytes, uint64_t seed, uint64_t& ret) {
+// How much of a region this pass is willing to leave resident behind itself before it starts
+// telling the kernel to forget it. See checksumRegion for why the drop happens INSIDE the
+// stream rather than once per block.
+const int64_t DROP_BEHIND_CHUNK_BYTES = 8 << 20;
+
+// Streams `regionBytes` bytes from `f`'s current position -- which the caller states as
+// `regionStartOffset`, since a drop-behind needs absolute offsets -- through a bounded
+// buffer, and returns their checksum. Nothing is retained: this is how a 69 MB block is
+// verified without being held.
+//
+// THE DROP-BEHIND IS INSIDE THIS LOOP AND NOT MERELY ONCE PER BLOCK, and the difference is
+// the difference between a bound and a wish. A scan that dropped a block's pages only after
+// finishing the block would keep ONE BLOCK resident in flight -- fine for the ~59 MB blocks
+// an interval dump writes, and useless for the file compaction produces, which is a header
+// plus exactly ONE block. On a compacted 10-20 GB card "bounded by one block" is bounded by
+// the whole card, which is no bound at all. Dropping every DROP_BEHIND_CHUNK_BYTES bounds it
+// by a figure that does not depend on how the file happened to be written.
+//
+// Returns false if the file was short, and sets `readFailed` if the shortness was an I/O
+// ERROR rather than an end of file. The caller must tell those apart: one is a torn tail and
+// the other is a disk that could not be read, and treating the second as the first would
+// have the write path truncate a perfectly good card down to wherever the read happened to
+// fail (ADR-0002).
+bool checksumRegion(
+  NNCacheFileHandle& f,
+  int64_t regionStartOffset,
+  int64_t regionBytes,
+  uint64_t seed,
+  uint64_t& ret,
+  bool& readFailed
+) {
   NNCacheFileChecksum sum(seed);
   std::vector<uint8_t> buf(STREAM_BUFFER_BYTES);
   int64_t left = regionBytes;
+  int64_t consumedFrom = regionStartOffset;
+  int64_t consumedTo = regionStartOffset;
   while(left > 0) {
     const size_t want = (size_t)std::min<int64_t>(left, (int64_t)buf.size());
-    if(std::fread(buf.data(), 1, want, f) != want)
+    if(std::fread(buf.data(), 1, want, f.get()) != want) {
+      readFailed = std::ferror(f.get()) != 0;
       return false;
+    }
     sum.update(buf.data(), want);
     left -= (int64_t)want;
+    consumedTo += (int64_t)want;
+    if(consumedTo - consumedFrom >= DROP_BEHIND_CHUNK_BYTES) {
+      f.dropCachedRange(consumedFrom, consumedTo - consumedFrom);
+      consumedFrom = consumedTo;
+    }
   }
   ret = sum.finish();
   return true;
@@ -679,8 +715,21 @@ ScanResult scanContainer(
       break;  // torn: not even a whole block header left
 
     uint8_t blockHeader[BLOCK_HEADER_BYTES];
-    if(std::fread(blockHeader, 1, BLOCK_HEADER_BYTES, f.get()) != BLOCK_HEADER_BYTES)
-      break;  // torn: the file shrank under us, or the read failed
+    if(std::fread(blockHeader, 1, BLOCK_HEADER_BYTES, f.get()) != BLOCK_HEADER_BYTES) {
+      // AN I/O ERROR IS NOT A TORN TAIL, and the two must not be conflated here. A short
+      // read at end of file is a crash artifact and is kept quiet; a read that FAILED is a
+      // device or filesystem that could not answer, and the file it could not answer about
+      // is not evidence of anything. The write path acts on this verdict by TRUNCATING, in
+      // place and irreversibly, so mistaking the second for the first would shorten a
+      // perfectly good card to wherever the disk happened to hiccup (ADR-0002).
+      if(std::ferror(f.get()) != 0)
+        throw StringError(
+          "NNEvalContainer: could not read a block header of " + path + " at offset " +
+          Global::int64ToString(offset) + ". This is a read failure, not a torn tail, and the "
+          "file is left exactly as it was found."
+        );
+      break;  // torn: the file shrank under us
+    }
 
     // The header checksums ITSELF before its lengths are believed. Everything after this
     // point trusts numbers that came out of a file a crash may have half-written, so this is
@@ -708,8 +757,16 @@ ScanResult scanContainer(
 
     const int64_t regionStart = offset + (int64_t)BLOCK_HEADER_BYTES;
     uint64_t actualChecksum = 0;
-    if(!checksumRegion(f.get(), regionBytes, contextHash, actualChecksum))
+    bool readFailed = false;
+    if(!checksumRegion(f, regionStart, regionBytes, contextHash, actualChecksum, readFailed)) {
+      if(readFailed)
+        throw StringError(
+          "NNEvalContainer: could not read the entries of a block of " + path + " at offset " +
+          Global::int64ToString(regionStart) + ". This is a read failure, not a torn tail, and "
+          "the file is left exactly as it was found."
+        );
       break;
+    }
     if(get64(blockHeader + 16) != actualChecksum)
       break;
 
@@ -748,6 +805,13 @@ ScanResult scanContainer(
   }
 
   result.tornTailBytes = fileSize - result.intactEndOffset;
+  // The two ranges the per-block drop cannot reach: the file header, which is read before
+  // the first block, and a torn trailing region, which checksumRegion streamed through page
+  // cache before the loop gave up on it. The second is the one that matters -- a torn tail
+  // is a partial block and a block here is tens of megabytes.
+  f.dropCachedRange(0, headerBytes);
+  if(result.tornTailBytes > 0)
+    f.dropCachedRange(result.intactEndOffset, result.tornTailBytes);
   return result;
 }
 
@@ -789,13 +853,29 @@ ScannedEntries scanEntries(
 // The FRAMING-ONLY read: where the intact part of the file ends, and nothing else.
 //
 // It is the cheapest of the three scans and it is what the TORN-TAIL REPAIR needs, which is
-// the only question the write path asks before it appends. It still reads and checksums
-// every byte -- that is what "intact" means and there is no cheaper sound answer, since a
-// block header can checksum correctly over a payload that never reached the device -- and it
-// still WALKS every block's header array, so every refusal a malformed file can earn is
-// still earned here, at the same moment it was before. What it does not do is read a payload
-// or build an entry: it holds nothing per entry beyond the header array the scan already
-// read.
+// the only question the write path asks before it appends. It decodes no payload and builds
+// no entry, holding nothing per entry beyond the header array the scan already read -- and
+// it still WALKS every block's header array, so every refusal a malformed file can earn is
+// still earned here, at the same moment it was before.
+//
+// IT STILL READS AND CHECKSUMS EVERY BYTE OF THE FILE, AND A CHEAPER SOUND ANSWER DOES
+// EXIST. Saying otherwise would be the comfortable version of this comment, so: every block
+// header self-checksums and states its region's exact length, so the framing could be walked
+// header to header in O(blocks) thirty-two-byte reads, checksumming only the LAST block's
+// region -- and that is SOUND for the question the write path asks, by induction on fsync:
+// every append fsyncs the block it wrote, so an interior block was durable before the append
+// that followed it, and the only block a crash can leave partial is the last one.
+//
+// IT WAS NOT TAKEN, AND THE REASON IS A TRADE RATHER THAN AN IMPOSSIBILITY. That walk
+// answers "did a crash tear the tail" and stops answering "is any block in this file
+// damaged". Today an interior block that lost bytes to bit rot is found by the writer, which
+// repairs by discarding from that block onward; under a header-only walk the writer would
+// append past it and only readers would notice, silently losing every block after the rotten
+// one with nothing recording that it happened. Trading a corruption detector for read
+// bandwidth is a decision with its own charter and its own evidence, and it is not this
+// one's to make quietly. The cost of not making it is stated plainly so it can be weighed:
+// at 10-20 GB per card and a dump every fifteen minutes, this scan reads the whole card each
+// time.
 //
 // WHAT THIS REPLACED, because the difference is the whole point: appendBlock used to ask
 // scanEntries, which decodes every payload in the file into a heap NNOutput and merges them
@@ -1270,18 +1350,24 @@ void NNEvalContainer::readEntriesInto(
     out.whiteOwnerMap =
       h.hasOwnerMap ? sink.ownerMapFor(i, (size_t)h.nnXLen * (size_t)h.nnYLen) : NULL;
     decodePayloadInto(out, h, payload.data(), path_);
+
+    // This entry is now in the caller's memory and its bytes will never be read again, so
+    // the pages holding it are dropped as the pass goes.
+    //
+    // ONLY THE RANGES THIS PASS ACTUALLY READ, and never the whole file. posix_fadvise
+    // invalidates clean pages of the INODE, globally -- not of this descriptor and not of
+    // this process -- and the deployment deliberately puts several engine processes on one
+    // cache directory. A whole-file drop here would discard a peer's freshly-read pages
+    // along with this pass's own, sending it back to the device for bytes it had just
+    // fetched. The ranges this pass did not touch are not its to forget.
+    f.dropCachedRange(loc.headerFileOffset, (int64_t)ENTRY_HEADER_BYTES);
+    f.dropCachedRange(loc.payloadFileOffset, h.payloadBytes);
   }
 
-  // Everything this pass touched is now decoded into the caller's memory and will never be
-  // re-read from the file, so the pages it pulled in are dropped rather than left to evict
-  // the machine's working set. Whole-file rather than per-range, because the pass visits
-  // scattered offsets and the ranges it did NOT touch hold nothing anyway.
-  //
-  // NO LARGE SEQUENTIAL BUFFER HERE, unlike every scan: this reads a selection at scattered
-  // offsets in ascending order, and a megabyte of readahead per two-kilobyte entry would
-  // fetch far more than it used. The buffer is a decision about a streaming read and this is
-  // not one.
-  f.dropCachedRange(0, fileSize);
+  // NO LARGE SEQUENTIAL BUFFER IN THIS FUNCTION, unlike every scan: it reads a selection at
+  // scattered offsets in ascending order, and a megabyte of readahead per two-kilobyte entry
+  // would fetch far more than it used. The buffer is a decision about a streaming read and
+  // this is not one.
 }
 
 NNEvalContainerContents NNEvalContainer::compact() const {
@@ -1308,7 +1394,7 @@ NNEvalContainerContents NNEvalContainer::compactUnlocked() const {
   );
 }
 
-bool NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
+NNCacheFileMaintenance NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
   if(liveSetMultiple < 1)
     throw StringError(
       "NNEvalContainer: a compaction multiple of " + Global::intToString(liveSetMultiple) +
@@ -1332,7 +1418,7 @@ bool NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
   const bool torn = scan.scan.tornTailBytes > 0;
   const bool overMultiple = liveSet > 0 && scan.scan.entriesApplied > (int64_t)liveSetMultiple * liveSet;
   if(!torn && !overMultiple)
-    return false;
+    return NNCacheFileMaintenance::Nothing;
   // A TORN TAIL ALONE IS REPAIRED BY TRUNCATION, NEVER BY COMPACTION. The two are separate
   // decisions and only one of them was made here: the size trigger did not fire, so nothing
   // authorises rewriting a card the operator did not ask to have rewritten. Compaction, when
@@ -1340,7 +1426,7 @@ bool NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
   // part and the torn tail is gone with the old inode.
   if(torn && !overMultiple) {
     NNCacheFileTruncate::toLength(path_, scan.scan.intactEndOffset);
-    return true;
+    return NNCacheFileMaintenance::TruncatedTornTail;
   }
   // DELEGATES rather than rewriting here, so "rewrite this container" has exactly one home
   // and a change to it cannot leave this path saying the old thing. The cost is one extra
@@ -1349,7 +1435,7 @@ bool NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
   // time and wait out its own deadline against itself.
   const NNEvalContainerContents written = compactUnlocked();
   (void)written;
-  return true;
+  return NNCacheFileMaintenance::Compacted;
 }
 
 NNEvalContainerAppendResult NNEvalContainer::appendBlock(
@@ -1377,7 +1463,7 @@ NNEvalContainerAppendResult NNEvalContainer::appendBlock(
   NNEvalContainerAppendResult result;
   result.bytesAppended = 0;
   result.tornTailBytesDiscarded = 0;
-  result.rewroteTheFile = false;
+  result.tailRepair = NNCacheFileTailRepair::NotNeeded;
 
   // Scan first. A torn tail must be repaired BEFORE anything is appended: an append past a
   // torn tail lands at an offset no loader ever reaches, so every subsequent dump would be
@@ -1397,10 +1483,9 @@ NNEvalContainerAppendResult NNEvalContainer::appendBlock(
     // NNCacheFileTruncate for the crash story and for why this does not compact.
     NNCacheFileTruncate::toLength(path_, scan.intactEndOffset);
     result.tornTailBytesDiscarded = scan.tornTailBytes;
-    // The file was SHORTENED, not rewritten, and the two are different facts an operator
-    // reads differently: this stays false, and a repair is recognised by
-    // tornTailBytesDiscarded being positive.
-    result.rewroteTheFile = false;
+    // The file was SHORTENED, not rewritten, and the disposition says so outright rather
+    // than leaving an operator to infer it from the byte count beside it.
+    result.tailRepair = NNCacheFileTailRepair::Truncated;
   }
 
   const auto entryAt = [&entries](size_t i) -> const NNOutput& { return *entries[i]; };

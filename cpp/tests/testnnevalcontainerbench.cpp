@@ -19,6 +19,7 @@
 #include <ghc/filesystem.hpp>
 
 #include "../core/fileutils.h"
+#include "../neuralnet/nncachefileformat.h"
 #include "../neuralnet/nnevalcontainer.h"
 
 using namespace std;
@@ -310,7 +311,7 @@ void Tests::runNNEvalContainerLoadIOBench(
     cout << "=== append onto an existing container ===" << endl;
     cout << "    seconds=" << seconds
          << "  tornTailBytesDiscarded=" << appended.tornTailBytesDiscarded
-         << "  rewroteTheFile=" << (appended.rewroteTheFile ? "true" : "false")
+         << "  tailRepair=" << NNCacheFileReport::nameOf(appended.tailRepair)
          << "  bytesAppended=" << appended.bytesAppended << endl;
     printBytes("write_bytes", (wBefore < 0 || wAfter < 0) ? -1 : wAfter - wBefore);
     printBytes("read_bytes", (rBefore < 0 || rAfter < 0) ? -1 : rAfter - rBefore);
@@ -472,7 +473,7 @@ void Tests::runNNEvalContainerLoadIOBench(
 
     cout << "    seconds=" << seconds
          << "  tornTailBytesDiscarded=" << appended.tornTailBytesDiscarded
-         << "  rewroteTheFile=" << (appended.rewroteTheFile ? "true" : "false")
+         << "  tailRepair=" << NNCacheFileReport::nameOf(appended.tailRepair)
          << "  bytesAppended=" << appended.bytesAppended << endl;
     printBytes("repair+append write_bytes", (wBefore < 0 || wAfter < 0) ? -1 : wAfter - wBefore);
     printBytes("repair+append read_bytes", (rBefore < 0 || rAfter < 0) ? -1 : rAfter - rBefore);

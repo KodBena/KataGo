@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "../core/hash.h"
+#include "../neuralnet/nncachefileformat.h"
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncacheobservations.h"
 
@@ -336,10 +337,13 @@ struct NNCacheCountLogAppendResult {
   // Bytes of torn tail this call had to discard before it could append. Zero on every
   // ordinary append; positive exactly when the previous writer died mid-dump.
   int64_t tornTailBytesDiscarded;
-  // Whether this call rewrote the file (a torn-tail repair, or a triggered compaction)
-  // rather than appending to it in place. Rewrites are what write volume per dump is
-  // bounded by the changed set EXCEPT for.
-  bool rewroteTheFile;
+  // WHAT THIS CALL DID ABOUT THE TAIL IT FOUND -- the same typed disposition the evaluation
+  // container reports, because it is the same act. Coupled to the count above: NotNeeded
+  // exactly when it is zero, Truncated exactly when it is positive. It replaces a
+  // `bool rewroteTheFile` that no writer could set once the repair became a truncation. With
+  // the repair no longer a rewrite, write volume per dump is bounded by the changed set with
+  // no exception at all. See NNCacheFileTailRepair.
+  NNCacheFileTailRepair tailRepair;
 };
 
 //-------------------------------------------------------------------------------------
@@ -508,11 +512,13 @@ class NNCacheCountLog {
   // its header plus one block; torn but under the multiple it is a TRUNCATION back to the end
   // of the last intact block and nothing else, because the size trigger did not fire and
   // nothing else here authorises a rewrite. A compaction subsumes the repair. This is the
-  // same rule the evaluation container states, and it is one rule rather than two.
+  // same rule the evaluation container states, and it is one rule rather than two. Returns
+  // WHICH of the three it did, for the same reason the container does: the caller reports the
+  // answer to an operator, and a bool cannot tell a truncation from a rewrite.
   //
   // Throws StringError if liveSetMultiple is below 1: a multiple of zero would compact on
   // every call and a negative one has no reading.
-  bool compactIfNeeded(int liveSetMultiple) const;
+  NNCacheFileMaintenance compactIfNeeded(int liveSetMultiple) const;
 
   // The default multiple. At 4 the file is bounded at about four times the live set and one
   // compaction, which writes one live set, buys three live sets of appends -- about 1.33

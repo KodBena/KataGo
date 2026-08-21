@@ -271,7 +271,7 @@ void testEvalContainerRoundTripsWithAndWithoutOwnershipMaps() {
   const vector<shared_ptr<const NNOutput>> entries = {asStored(a), asStored(b), asStored(c), asStored(d)};
   const NNEvalContainerAppendResult appended = container.appendBlock(entries);
   testAssert(appended.tornTailBytesDiscarded == 0);
-  testAssert(appended.rewroteTheFile == false);
+  testAssert(appended.tailRepair == NNCacheFileTailRepair::NotNeeded);
 
   // The byte arithmetic is quoted from the implementation rather than from a second copy of
   // the numbers (ADR-0012 P1).
@@ -768,7 +768,7 @@ void testEvalContainerACorruptBlockHeaderDoesNotProduceAPartialApplication() {
 // they say it exactly: the surviving prefix is byte-for-byte what stood there before the
 // tear (a rewrite would have re-encoded it into one collapsed block, changing those bytes);
 // the file's new length is that prefix plus the appended block and not one byte more; and
-// the append reports rewroteTheFile false with a positive discard count. The reason to
+// the append reports its tail repair as Truncated with a positive discard count. The reason
 // assert this rather than leave it to the byte counts of a bench: at the deployment's 10-20
 // GB per card, a repair that quietly went back to rewriting would cost a full card written
 // to flash for every engine killed mid-dump, and nothing else in this suite would notice.
@@ -791,7 +791,7 @@ void testEvalContainerTornTailIsRepairedByTruncationBeforeTheNextAppend() {
   const shared_ptr<NNOutput> d = makeOutput(4, 1, 19, 19, true);
   const NNEvalContainerAppendResult appended = container.appendBlock({asStored(d)});
   testAssert(appended.tornTailBytesDiscarded == tornBytes);
-  testAssert(appended.rewroteTheFile == false);
+  testAssert(appended.tailRepair == NNCacheFileTailRepair::Truncated);
 
   // The surviving prefix, unchanged. A rewrite would have replaced these bytes with a
   // re-encoding of the live set, so this is the assertion that distinguishes the two
@@ -831,7 +831,7 @@ void testEvalContainerRepairsAContainerWhoseIntactPartIsEmpty() {
   const shared_ptr<NNOutput> b = makeOutput(2, 1, 19, 19, false);
   const NNEvalContainerAppendResult appended = container.appendBlock({asStored(b)});
   testAssert(appended.tornTailBytesDiscarded == 12);
-  testAssert(appended.rewroteTheFile == false);
+  testAssert(appended.tailRepair == NNCacheFileTailRepair::Truncated);
   // The header is part of what was appended, because the file had none left.
   testAssert(sizeOf(container.path()) == appended.bytesAppended);
 
@@ -885,7 +885,7 @@ void testEvalContainerCompactionPreservesTheLiveSetAndSurvivesAStaleTemp() {
     testAssert(sizeOf(container.path()) == sizeBefore);
   }
 
-  testAssert(container.compactIfNeeded(NNEvalContainer::defaultCompactionMultiple()) == true);
+  testAssert(container.compactIfNeeded(NNEvalContainer::defaultCompactionMultiple()) == NNCacheFileMaintenance::Compacted);
 
   const NNEvalContainerContents after = container.load();
   testAssert(after.tail() == NNEvalContainerTail::Intact);
@@ -908,7 +908,7 @@ void testEvalContainerCompactionPreservesTheLiveSetAndSurvivesAStaleTemp() {
   testAssert(!FileUtils::exists(stalePath));
 
   // Under the multiple, a fresh compaction does not fire.
-  testAssert(container.compactIfNeeded(NNEvalContainer::defaultCompactionMultiple()) == false);
+  testAssert(container.compactIfNeeded(NNEvalContainer::defaultCompactionMultiple()) == NNCacheFileMaintenance::Nothing);
 }
 
 // The boundary refuses what it cannot honor and never coerces it into something plausible.

@@ -141,7 +141,7 @@ NNCacheEvaluationDumpResult nnCacheDumpEvaluations(
     // very defect this file exists to close.
     result.append.bytesAppended = 0;
     result.append.tornTailBytesDiscarded = 0;
-    result.append.rewroteTheFile = false;
+    result.append.tailRepair = NNCacheFileTailRepair::NotNeeded;
     return result;
   }
   // Marked only after this returns: see the header's crash contract.

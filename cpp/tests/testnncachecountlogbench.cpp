@@ -9,6 +9,7 @@
 #include <ghc/filesystem.hpp>
 
 #include "../core/fileutils.h"
+#include "../neuralnet/nncachefileformat.h"
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncachecountlog.h"
 
@@ -106,7 +107,7 @@ void measureSecondDumpOntoAnExistingLog(const string& dir, int64_t numRows) {
 
   cout << "second dump onto an existing " << numRows << "-row log:"
        << "  format bytes=" << appended.bytesAppended
-       << "  rewrote=" << (appended.rewroteTheFile ? "yes" : "no");
+       << "  tailRepair=" << NNCacheFileReport::nameOf(appended.tailRepair);
   if(before < 0 || after < 0)
     cout << "  measured write_bytes=UNAVAILABLE";
   else

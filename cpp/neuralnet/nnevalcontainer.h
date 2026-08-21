@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "../core/hash.h"
+#include "../neuralnet/nncachefileformat.h"
 #include "../neuralnet/nninputs.h"
 
 // An APPEND-ONLY CONTAINER of persisted NN evaluations for one (context, model) pair --
@@ -209,9 +210,15 @@ struct NNEvalContainerAppendResult {
   // Bytes of torn tail this call had to discard before it could append. Zero on every
   // ordinary append; positive exactly when the previous writer died mid-dump.
   int64_t tornTailBytesDiscarded;
-  // Whether this call rewrote the file (a torn-tail repair, or a triggered compaction)
-  // rather than appending to it in place.
-  bool rewroteTheFile;
+  // WHAT THIS CALL DID ABOUT THE TAIL IT FOUND. Coupled to the count above: NotNeeded
+  // exactly when it is zero, Truncated exactly when it is positive.
+  //
+  // It replaces a `bool rewroteTheFile`, which said whether the repair had rewritten the
+  // whole file. Once the repair became a truncation no code path could set that flag, so it
+  // was a field that documented an outcome it could no longer report and left a reader to
+  // infer that a repair had happened at all from a byte count beside a flag that was always
+  // false. See NNCacheFileTailRepair.
+  NNCacheFileTailRepair tailRepair;
 };
 
 //-------------------------------------------------------------------------------------
@@ -420,8 +427,9 @@ class NNEvalContainer {
   NNEvalContainerContents compact() const;
 
   // Compacts if the file holds more than `liveSetMultiple` times as many entries as it has
-  // distinct keys; repairs a torn tail either way. Returns whether it CHANGED THE FILE --
-  // which is two different acts and the caller is owed both readings:
+  // distinct keys; repairs a torn tail either way. Returns WHICH OF THE THREE THINGS it did,
+  // because a bool could not tell two of them apart and the caller reports the answer to an
+  // operator:
   //
   //   OVER THE MULTIPLE: a compaction, the whole file rewritten as its header plus one block
   //   holding the merged live set.
@@ -437,7 +445,7 @@ class NNEvalContainer {
   //
   // Throws StringError if liveSetMultiple is below 1: a multiple of zero would compact on
   // every call and a negative one has no reading.
-  bool compactIfNeeded(int liveSetMultiple) const;
+  NNCacheFileMaintenance compactIfNeeded(int liveSetMultiple) const;
 
   // The default multiple, the count log's, for the same amortisation reason.
   static int defaultCompactionMultiple();

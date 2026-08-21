@@ -38,7 +38,11 @@
 //   re-read: the deployment's corpus is ~100 GB against a machine that cannot cache a
 //   fraction of it, so every byte either format reads is a byte of somebody else's working
 //   set evicted unless the kernel is told otherwise. The advice is one fact about how this
-//   file family is used, not two.
+//   file family is used, not two, and BOTH formats' scans take it -- which is stated here
+//   because for a while only one of them did, on the reasoning that a count log is small.
+//   That reasoning does not survive its own arithmetic: a card holding 10-20 GB of
+//   evaluations has millions of keys, and at 24 bytes a record its count log is hundreds of
+//   megabytes, not the few this header once assumed.
 //
 // Nothing here knows what either format's records mean. It is the byte layer under both.
 
@@ -166,10 +170,17 @@ class NNCacheFileHandle {
   // cache that holds a fraction of one card, so a load that leaves its bytes resident buys
   // nothing (they are never re-read) and costs everything else that was cached.
   //
-  // Best-effort and silent: a kernel that declines, or a platform with no such call, leaves
-  // the pages resident, which is a performance fact and never a correctness one. It is also
-  // deliberately NOT fsync-coupled -- this is only ever called on a handle opened for
-  // reading, where there is nothing dirty to lose.
+  // Best-effort and silent about the KERNEL's answer: a kernel that declines, or a platform
+  // with no such call, leaves the pages resident, which is a performance fact and never a
+  // correctness one.
+  //
+  // LOUD about the CALLER, though, and that is why the handle records its open mode. This is
+  // deliberately not fsync-coupled: it is only ever correct on a handle opened for reading,
+  // where there is nothing dirty to lose. On a write handle, DONTNEED against not-yet-flushed
+  // pages would be a request to discard data this process has not finished writing, so a
+  // write handle is REFUSED by name rather than served (ADR-0002). The precondition used to
+  // be a sentence in this comment that a future caller could break in silence; now it is a
+  // fact the type carries.
   void dropCachedRange(int64_t offset, int64_t bytes);
 
   // Flushes the stdio buffer and then forces the bytes to the device. Returns false, rather
@@ -185,6 +196,11 @@ class NNCacheFileHandle {
 
  private:
   std::FILE* file_;
+  // Whether the mode this was opened with can write. Read from the mode string at
+  // construction and never re-derived, because it is what dropCachedRange refuses on.
+  bool canWrite_;
+  // The path, for a refusal that has to name the file it is about.
+  std::string path_;
   // The storage setvbuf was handed. It is owned HERE because setvbuf does not copy: the
   // buffer must outlive every read through the stream, and the only object whose lifetime
   // is already exactly that is this handle.
@@ -236,6 +252,47 @@ namespace NNCacheFileTruncate {
   // Refuses a negative length, and refuses to GROW a file: this is a repair primitive, and
   // ftruncate's zero-filling extension has no reading in either format.
   void toLength(const std::string& path, int64_t bytes);
+}
+
+// WHAT A WRITE PATH DID ABOUT THE TAIL IT WAS HANDED. Every append in this file family
+// scans before it writes, and this is what that scan's verdict authorised.
+//
+// It is a TYPE and not a bool because the bool it replaces became a lie. The old result
+// carried `rewroteTheFile`, which meant "the repair rewrote the whole file"; once the repair
+// became a truncation, no writer could ever set it and its documentation promised a fact the
+// code could no longer produce. An operator reading a dump report was left to infer that a
+// repair happened at all from a byte count being positive beside a flag that was always
+// false. The disposition says it outright, and the byte count says how much.
+enum class NNCacheFileTailRepair {
+  // The tail was intact. Nothing was discarded and nothing was written but the append.
+  NotNeeded,
+  // The file was shortened back to the end of its last intact block.
+  Truncated,
+};
+
+// WHAT A MAINTENANCE PASS DID TO A FILE -- the three-valued answer compactIfNeeded owes its
+// caller, in place of a bool that could not tell two of them apart.
+//
+// The bool said "did it compact". After the repair became a truncation that was wrong for
+// one of its two true cases: a torn tail under the size trigger now shortens the file and
+// rewrites nothing, and reporting that to an operator as "compacted" describes a full
+// rewrite of a 10-20 GB card that did not happen. The three cases are genuinely three, so
+// they are three values (ADR-0000).
+enum class NNCacheFileMaintenance {
+  // The size trigger did not fire and the tail was intact. The file was not touched.
+  Nothing,
+  // The tail was torn and the size trigger did not fire: shortened, not rewritten.
+  TruncatedTornTail,
+  // The size trigger fired: the whole file rewritten as its header plus one block. This
+  // subsumes a repair, since it writes a fresh file from the intact part.
+  Compacted,
+};
+
+namespace NNCacheFileReport {
+  // The disposition in one lowercase word, for a report or a JSON field: "notNeeded",
+  // "truncated"; "nothing", "truncatedTornTail", "compacted".
+  const char* nameOf(NNCacheFileTailRepair repair);
+  const char* nameOf(NNCacheFileMaintenance maintenance);
 }
 
 //-------------------------------------------------------------------------------------

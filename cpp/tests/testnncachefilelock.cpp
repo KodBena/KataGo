@@ -435,8 +435,10 @@ void testCompactionReplacesTheDataInodeAndNeverTheLockInode() {
 
   const uint64_t lockInodeBefore = inodeOf(lockPath);
   const uint64_t dataInodeBefore = inodeOf(container.path());
-  const bool compacted = container.compactIfNeeded(1);
-  testAssert(compacted);
+  const NNCacheFileMaintenance compacted = container.compactIfNeeded(1);
+  // Compacted by name and not merely "it did something": this test goes on to prove the data
+  // file's inode was replaced, and a truncation would not replace it.
+  testAssert(compacted == NNCacheFileMaintenance::Compacted);
   const uint64_t lockInodeAfter = inodeOf(lockPath);
   const uint64_t dataInodeAfter = inodeOf(container.path());
 

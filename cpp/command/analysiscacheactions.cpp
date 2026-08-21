@@ -967,12 +967,18 @@ json cacheDumpExecute(
         request.context + "\" are lost from the record. Nothing else about this context changed."
       );
     }
-    const bool compacted = log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple());
+    const NNCacheFileMaintenance maintenance =
+      log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple());
     json counts;
     counts["bytesAppended"] = appended.bytesAppended;
     counts["tornTailBytesDiscarded"] = appended.tornTailBytesDiscarded;
-    counts["rewroteTheFile"] = appended.rewroteTheFile;
-    counts["compacted"] = compacted;
+    // NAMED RATHER THAN FLAGGED. Both of these were booleans, and both had stopped being able
+    // to say what they claimed: the torn-tail repair is a truncation, so "rewroteTheFile" was
+    // permanently false, and "compacted" said true for a truncation that rewrote nothing. At
+    // 10-20 GB per card, telling an operator a card was rewritten when it was shortened -- or
+    // the reverse -- is not a wording problem.
+    counts["tailRepair"] = NNCacheFileReport::nameOf(appended.tailRepair);
+    counts["maintenance"] = NNCacheFileReport::nameOf(maintenance);
     const NNCacheCountLogContents contents = log.load();
     counts["rowsInLog"] = (int64_t)contents.rows().size();
     counts["unattributedObservations"] = contents.unattributedObservations();
@@ -992,13 +998,14 @@ json cacheDumpExecute(
     const NNCacheEvaluationDumpResult result = nnCacheDumpEvaluations(
       container, eval.cacheTable(), record.contextId, request.admission, observations.rows()
     );
-    const bool compacted = container.compactIfNeeded(NNEvalContainer::defaultCompactionMultiple());
+    const NNCacheFileMaintenance maintenance =
+      container.compactIfNeeded(NNEvalContainer::defaultCompactionMultiple());
     json evaluations;
     evaluations["entriesWritten"] = (int64_t)result.plan.keys.size();
     evaluations["bytesAppended"] = result.append.bytesAppended;
     evaluations["tornTailBytesDiscarded"] = result.append.tornTailBytesDiscarded;
-    evaluations["rewroteTheFile"] = result.append.rewroteTheFile;
-    evaluations["compacted"] = compacted;
+    evaluations["tailRepair"] = NNCacheFileReport::nameOf(result.append.tailRepair);
+    evaluations["maintenance"] = NNCacheFileReport::nameOf(maintenance);
     evaluations["markedPersisted"] = result.marked;
     // EVERY EXCLUSION, COUNTED AND NAMED. A dump that wrote 12 of 40,000 earned keys and
     // reported only "12 written" would read the same as a dump that lost 39,988 of them.
