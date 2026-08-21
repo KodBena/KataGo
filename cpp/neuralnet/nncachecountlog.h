@@ -503,7 +503,12 @@ class NNCacheCountLog {
   NNCacheCountLogContents compact() const;
 
   // Compacts if the file holds more than `liveSetMultiple` times as many records as it has
-  // distinct keys. Returns whether it compacted.
+  // distinct keys; repairs a torn tail either way. Returns whether it CHANGED THE FILE, which
+  // is two different acts: over the multiple it is a compaction, the whole file rewritten as
+  // its header plus one block; torn but under the multiple it is a TRUNCATION back to the end
+  // of the last intact block and nothing else, because the size trigger did not fire and
+  // nothing else here authorises a rewrite. A compaction subsumes the repair. This is the
+  // same rule the evaluation container states, and it is one rule rather than two.
   //
   // Throws StringError if liveSetMultiple is below 1: a multiple of zero would compact on
   // every call and a negative one has no reading.

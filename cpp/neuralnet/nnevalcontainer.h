@@ -420,7 +420,20 @@ class NNEvalContainer {
   NNEvalContainerContents compact() const;
 
   // Compacts if the file holds more than `liveSetMultiple` times as many entries as it has
-  // distinct keys, or if its tail is torn. Returns whether it compacted.
+  // distinct keys; repairs a torn tail either way. Returns whether it CHANGED THE FILE --
+  // which is two different acts and the caller is owed both readings:
+  //
+  //   OVER THE MULTIPLE: a compaction, the whole file rewritten as its header plus one block
+  //   holding the merged live set.
+  //
+  //   TORN BUT UNDER THE MULTIPLE: a TRUNCATION back to the end of the last intact block,
+  //   and nothing else. The size trigger did not fire, so nothing here authorises rewriting
+  //   a card the operator did not ask to have rewritten -- and at 10-20 GB per card that
+  //   distinction is the difference between a metadata operation and a full rewrite. A
+  //   compaction, when it does fire, subsumes the repair: it writes a fresh file from the
+  //   intact part and the torn tail goes with the old inode.
+  //
+  //   BOTH: the compaction, which subsumes the repair.
   //
   // Throws StringError if liveSetMultiple is below 1: a multiple of zero would compact on
   // every call and a negative one has no reading.
