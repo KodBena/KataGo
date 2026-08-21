@@ -163,9 +163,15 @@ struct ScanResult {
   int64_t intactEndOffset = 0;
   int64_t tornTailBytes = 0;
   bool fileExists = false;
+  // Each applied block's own rows, in file order -- populated only when scanLog is asked
+  // for them (loadDetailedUnlocked's caller), and left empty otherwise so the ordinary
+  // load()/appendDump()/compact() scans do not pay for a vector no one reads.
+  std::vector<NNCacheCountLogBlock> blocks;
 };
 
-ScanResult scanLog(const std::string& path, const std::string& context, uint64_t contextHash) {
+ScanResult scanLog(
+  const std::string& path, const std::string& context, uint64_t contextHash, bool collectBlocks = false
+) {
   ScanResult result;
 
   ScopedFile f(path, "rb");
@@ -239,6 +245,9 @@ ScanResult scanLog(const std::string& path, const std::string& context, uint64_t
 
     // The block is whole. Apply it -- and only now advance intactEndOffset, so a block that
     // fails any check above leaves the offset pointing at its own first byte.
+    NNCacheCountLogBlock thisBlock;
+    if(collectBlocks)
+      thisBlock.rows.reserve(recordCount);
     for(uint32_t i = 0; i < recordCount; i++) {
       const uint8_t* r = payload.data() + (size_t)i * RECORD_BYTES;
       const Hash128 key(get64(r + 0), get64(r + 8));
@@ -258,8 +267,16 @@ ScanResult scanLog(const std::string& path, const std::string& context, uint64_t
         result.rows[it->second].lookups += (uint64_t)lookups;
         result.rows[it->second].sessions += (uint64_t)sessions;
       }
+      // As-recorded, never accumulated -- this block's own delta row, kept beside (not
+      // instead of) the running merge above.
+      if(collectBlocks)
+        thisBlock.rows.push_back(NNCacheCountLogBlockRow{key, (uint64_t)lookups, (uint64_t)sessions});
     }
     result.unattributedLookups += (int64_t)get64(blockHeader + 8);
+    if(collectBlocks) {
+      thisBlock.unattributedLookups = (int64_t)get64(blockHeader + 8);
+      result.blocks.push_back(std::move(thisBlock));
+    }
     result.blocksApplied += 1;
     result.recordsApplied += (int64_t)recordCount;
     offset += (int64_t)BLOCK_HEADER_BYTES + payloadBytes;
@@ -408,6 +425,19 @@ NNCacheCountLogContents NNCacheCountLogContents::of(
     std::move(rows), unattributedLookups, tail, discardedTailBytes, blocksApplied, recordsApplied);
 }
 
+NNCacheCountLogDetailedContents::NNCacheCountLogDetailedContents(
+  NNCacheCountLogContents aggregate, std::vector<NNCacheCountLogBlock> blocks
+)
+  :aggregate_(std::move(aggregate)),
+   blocks_(std::move(blocks))
+{}
+
+NNCacheCountLogDetailedContents NNCacheCountLogDetailedContents::of(
+  NNCacheCountLogContents aggregate, std::vector<NNCacheCountLogBlock> blocks
+) {
+  return NNCacheCountLogDetailedContents(std::move(aggregate), std::move(blocks));
+}
+
 std::vector<NNCacheCountRow> NNCacheCountLogContents::byDescendingLookups() const {
   std::vector<NNCacheCountRow> sorted = rows_;
   std::sort(sorted.begin(), sorted.end(), [](const NNCacheCountRow& a, const NNCacheCountRow& b) {
@@ -453,6 +483,14 @@ int64_t NNCacheCountLog::bytesForDumpOf(int64_t numRows) {
   return (int64_t)BLOCK_HEADER_BYTES + numRows * (int64_t)RECORD_BYTES;
 }
 
+const std::string& NNCacheCountLog::countsCurrencyDescription() {
+  static const std::string desc =
+    "RECORDED RETRIEVALS -- cache hits for a key some earlier dump had already stored -- "
+    "not would-be forward passes. A key evaluated once and never looked up again earns no "
+    "row here at all.";
+  return desc;
+}
+
 NNCacheCountLogContents NNCacheCountLog::load() const {
   // SHARED: admits every other reader, excludes every writer. A read concurrent with an
   // unlocked append would see the partial block as a torn tail and discard it along with
@@ -469,6 +507,23 @@ NNCacheCountLogContents NNCacheCountLog::load() const {
     scan.blocksApplied,
     scan.recordsApplied
   );
+}
+
+NNCacheCountLogDetailedContents NNCacheCountLog::loadDetailedUnlocked() const {
+  // Deliberately no lock: see the declaration's comment in nncachecountlog.h. The scan
+  // itself is exactly load()'s -- one function answers "where does the intact part of this
+  // file end" (ADR-0012 P1) -- with collectBlocks=true asking it to additionally keep each
+  // block's own rows rather than only their running merge.
+  ScanResult scan = scanLog(path_, context_, contextHash_, /*collectBlocks=*/true);
+  NNCacheCountLogContents aggregate = NNCacheCountLogContents::of(
+    scan.rows,
+    scan.unattributedLookups,
+    scan.tornTailBytes > 0 ? NNCacheCountLogTail::Truncated : NNCacheCountLogTail::Intact,
+    scan.tornTailBytes,
+    scan.blocksApplied,
+    scan.recordsApplied
+  );
+  return NNCacheCountLogDetailedContents::of(std::move(aggregate), std::move(scan.blocks));
 }
 
 NNCacheCountLogContents NNCacheCountLog::compact() const {

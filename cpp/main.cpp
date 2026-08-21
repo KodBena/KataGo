@@ -66,6 +66,10 @@ lockfsprobe : Does file locking actually EXCLUDE on a given directory's filesyst
               only when supported. Run it before pointing a shared nnCacheDir at a network or FUSE
               mount, where flock can silently succeed for everyone.
 
+nncountsdump : Renders a .nncounts (NN cache count log) file's contents human-readably, or as
+               --json. Read-only; usable on the storage side of a mount where the engine-side
+               lock does not bind.
+
 runtests : Test important board algorithms and datastructures
 runnncachebench : Measure what the nn cache's inline hash tag costs and buys
 benchnncachepolicy : Sweep the nn cache policy matrix over a recorded operation trace
@@ -133,6 +137,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::chdvectordriver(subArgs);
   else if(subcommand == "lockfsprobe")
     return MainCmds::lockfsprobe(subArgs);
+  else if(subcommand == "nncountsdump")
+    return MainCmds::nncountsdump(subArgs);
   else if(subcommand == "runnncachefrozenbench")
     return MainCmds::runnncachefrozenbench(subArgs);
   else if(subcommand == "runnncachetwolevelbench")

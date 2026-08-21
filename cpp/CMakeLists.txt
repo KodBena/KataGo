@@ -1103,6 +1103,7 @@ add_executable(katago
   tests/testanalysiscacheactions.cpp
   tests/testanalysismodels.cpp
   tests/testnncachecountlogbench.cpp
+  tests/testnncountsdump.cpp
   tests/testnncachebench.cpp
   tests/testnnevalcanary.cpp
   tests/testbackendreference.cpp
@@ -1148,6 +1149,7 @@ add_executable(katago
   command/gputest.cpp
   command/gtp.cpp
   command/lockfsprobe.cpp
+  command/nncountsdump.cpp
   command/match.cpp
   command/misc.cpp
   command/runtests.cpp

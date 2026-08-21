@@ -252,6 +252,47 @@ class NNCacheCountLogContents {
   int64_t recordsApplied_;
 };
 
+// One block's own rows, as recorded -- never accumulated. A block is one dump's delta (see
+// NNCacheCountLog's class comment below, "A BLOCK IS ONE DUMP AND ITS RECORDS ARE
+// INCREMENTS"), and this is that unit kept separate rather than merged, for a caller that
+// wants to show dump-by-dump history rather than only the totals NNCacheCountLogContents
+// gives.
+struct NNCacheCountLogBlockRow {
+  Hash128 key;
+  uint64_t lookups;
+  uint64_t sessions;
+};
+
+// One applied block, in file order.
+struct NNCacheCountLogBlock {
+  std::vector<NNCacheCountLogBlockRow> rows;
+  // Lookups this one dump could not attribute to any key. See
+  // NNCacheCountLogContents::unattributedLookups for the sum of these over every block.
+  int64_t unattributedLookups;
+};
+
+// load()'s answer, but with every applied block's own rows kept separate as well as merged
+// into the usual totals.
+//
+// A SEPARATE TYPE RATHER THAN A FIELD ADDED TO NNCacheCountLogContents, because every
+// existing caller of load() wants only the merged totals and gains nothing from carrying a
+// whole file's raw blocks along for the ride; the two are different questions asked of the
+// same scan, and a caller states which one it wants by which method it calls.
+class NNCacheCountLogDetailedContents {
+ public:
+  static NNCacheCountLogDetailedContents of(
+    NNCacheCountLogContents aggregate, std::vector<NNCacheCountLogBlock> blocks
+  );
+
+  const NNCacheCountLogContents& aggregate() const { return aggregate_; }
+  const std::vector<NNCacheCountLogBlock>& blocks() const { return blocks_; }
+
+ private:
+  NNCacheCountLogDetailedContents(NNCacheCountLogContents aggregate, std::vector<NNCacheCountLogBlock> blocks);
+  NNCacheCountLogContents aggregate_;
+  std::vector<NNCacheCountLogBlock> blocks_;
+};
+
 // What one appendDump did.
 struct NNCacheCountLogAppendResult {
   // Bytes this call added to the file, framing included.
@@ -353,6 +394,9 @@ class NNCacheCountLog {
 
   const std::string& path() const { return path_; }
   const std::string& context() const { return context_; }
+  // The identity this context's header carries and verifies against on every read. Exposed
+  // for a report that names it (e.g. nncountsdump) rather than recomputing it a second way.
+  uint64_t contextHash() const { return contextHash_; }
 
   // Appends one dump, then fsyncs, so that when this returns the bytes are on the device
   // rather than in a page cache.
@@ -387,6 +431,24 @@ class NNCacheCountLog {
   // would attribute one context's counts to another.
   [[nodiscard]] NNCacheCountLogContents load() const;
 
+  // load(), but keeping each applied block's own rows separate as well as merged -- for a
+  // reader that wants to show dump-by-dump history rather than only the merged totals. See
+  // NNCacheCountLogDetailedContents.
+  //
+  // NO LOCK IS TAKEN, unlike every other public operation here (see the class comment
+  // above). Its one caller today is nncountsdump, a storage-side inspection tool that has
+  // to remain usable on a mount where the engine-side lock does not bind (an NFS mount with
+  // no working flock, say) -- proceeding unlocked with a caveat is the whole point of that
+  // tool, not an oversight here. A caller that CAN take the lock is expected to hold its own
+  // NNCacheFileLock::overContext(..., Shared) around this call rather than have this call
+  // take a second, nested one. Reading against a log an appender is mid-write to still gets
+  // the right answer for the reason load() already states about a torn tail: this applies
+  // every whole, checksum-verified block and reports the remainder as the tail, never a
+  // wrong number for a block it only partially observed.
+  //
+  // Throws StringError under the same conditions as load().
+  [[nodiscard]] NNCacheCountLogDetailedContents loadDetailedUnlocked() const;
+
   // Rewrites the log as its header plus one block holding the accumulated totals, via a
   // temp file and an atomic rename. Repairs a torn tail as a side effect, since it writes
   // only what load() applied. Returns what it wrote.
@@ -417,6 +479,16 @@ class NNCacheCountLog {
   static size_t recordBytes();
   // The exact bytes a dump of `numRows` rows adds to an existing file.
   static int64_t bytesForDumpOf(int64_t numRows);
+
+  // WHAT EVERY COUNT IN THIS LOG CURRENTLY MEASURES, as one sentence for a reader to print
+  // rather than invent its own wording of. TODAY that is a RECORDED RETRIEVAL: a cache hit
+  // for a key some earlier dump had already stored, not a forward pass. This is the one home
+  // for that sentence so that a later re-denomination of what the log counts changes it once,
+  // here, and every reader (nncountsdump among them) picks up the new wording rather than one
+  // copy drifting from another -- see the currency confusion this already caused once
+  // (ledger rows 1651/1654) and the tracked follow-up that will change what this file counts
+  // (ledger rows 1717/1722/1723).
+  static const std::string& countsCurrencyDescription();
 
  private:
   NNCacheCountLog(std::string path, std::string directory, std::string context, uint64_t contextHash);

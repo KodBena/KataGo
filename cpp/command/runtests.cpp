@@ -74,6 +74,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runNNCacheContextTests();
   Tests::runNNCacheDumpTests();
   Tests::runNNCacheFileLockTests();
+  Tests::runNNCountsDumpTests();
   Tests::runAnalysisModelNameSpaceTests();
   Tests::runAnalysisCacheActionTests();
 

@@ -180,6 +180,9 @@ namespace Tests {
   //testnncachefilelock.cpp
   void runNNCacheFileLockTests();
 
+  //testnncountsdump.cpp
+  void runNNCountsDumpTests();
+
   //testanalysismodels.cpp
   void runAnalysisModelNameSpaceTests();
   void runAnalysisCacheActionTests();
