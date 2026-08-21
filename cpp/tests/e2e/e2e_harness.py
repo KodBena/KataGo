@@ -81,6 +81,36 @@ def digest_dir(path):
   return out
 
 
+def expected_files_for_context(context, model_names):
+  """The COMPLETE set of files a context's on-disk footprint is entitled to hold, for a leg
+  that asserts an EXACT set against digest_dir().
+
+  ONE HOME for this set-shape, because a leg that hand-duplicates a literal set of filenames
+  drifts from the format silently -- exactly what happened to P1d (audit-reports/
+  p1d-diagnosis.md): the lock file (nncachefileformat.h's NNCacheFileLock) was added to the
+  C++ format two days after the literal was written, and nothing forced the two to move
+  together. `nncachefileformat.h`'s own comment blocks (the count-log/container pair,
+  `<context>.nncounts` and `<context>.<model>.nnevals`; and the lock, `<context>.nnlock`,
+  "on a file of its own... never renamed, never truncated, never written") are the C++
+  authority this function mirrors. A real codegen bridge from that header into Python was
+  judged not worth building for three filenames with no independent parameters beyond
+  `context` and a model name already in hand at every call site -- that is a judgment call,
+  not a silent shortcut, and the reason it is safe is that this is the ONLY place in the e2e
+  suite duplicating the shape (grep for `set(on_disk)` / exact digest_dir comparisons before
+  assuming a second one is fine to add by hand).
+
+  `model_names` is every model whose container has been dumped for `context` in the session
+  under test -- most legs pass a single name, but the function takes an iterable so a leg
+  that dumps under two models is representable without a second literal.
+  """
+  if isinstance(model_names, str):
+    raise TypeError("model_names is an iterable of names, not a single string")
+  names = set(model_names)
+  return {"%s.nncounts" % context, "%s.nnlock" % context} | {
+    "%s.%s.nnevals" % (context, name) for name in names
+  }
+
+
 def fingerprint(answer):
   """The numbers that identify WHICH NET EVALUATED the root -- the net-identity claim.
 

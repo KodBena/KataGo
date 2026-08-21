@@ -85,6 +85,22 @@ THE GROUPS
                     populated: identical observations, so the salt is not what produces them.
 
 -----------------------------------------------------------------------------------------
+--only IS A SEEN-RED CONVENIENCE, NOT A MERGE GATE: RE-RUN THE WHOLE SUITE ON A SIBLING CHANGE
+
+`--only` exists so a worker chasing one group's red can re-run just that group under a
+mutated build without paying for the rest. It is NOT evidence that a change scoped to one
+group's area cannot affect another group's legs. P1d went red for two days after
+`f9be19cc` (the cross-process context lock, `<context>.nnlock`) merged into this line,
+because nobody re-ran group P (or the full suite) against the merge that carried it -- the
+lock touches every context's file footprint, which is exactly what group P observes,
+but the branch that added it was reviewed and tested as a locking change, not as a
+persistence-e2e change (audit-reports/p1d-diagnosis.md). Before trusting a green result
+from `--only` after ANY change to `cpp/neuralnet/nncachefileformat.*`,
+`nncachecountlog.*`, `nnevalcontainer.*`, or the cache-dir layout more generally, run the
+FULL suite (all groups, no `--only`) at least once -- a change under one of those files is a
+sibling of every group here, not a member of the one that happens to be under active work.
+
+-----------------------------------------------------------------------------------------
 A KNOWN RACE THIS WITNESS DOES NOT WORK AROUND
 
 cpp/command/analysis.cpp writes a query's response BEFORE erasing that query from

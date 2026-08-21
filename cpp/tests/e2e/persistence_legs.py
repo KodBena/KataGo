@@ -9,8 +9,8 @@ import json
 import os
 
 from e2e_harness import (
-  COUNT_LOG_BLOCK_HEADER_BYTES, POSITION, context_of, digest_dir, disposition, fingerprint,
-  observation_profile, search_shape,
+  COUNT_LOG_BLOCK_HEADER_BYTES, POSITION, context_of, digest_dir, disposition,
+  expected_files_for_context, fingerprint, observation_profile, search_shape,
 )
 
 
@@ -87,11 +87,29 @@ def run_persistence(w, h, name_a):
     "no error and sourcesDetached==1",
   )
   on_disk = digest_dir(p_dir)
+  # The lock file (card-5455.nnlock) is a PERMANENT member of this set, not incidental
+  # debris: nncachefileformat.h ("THE LOCK IS ON A FILE OF ITS OWN... never renamed, never
+  # truncated, never written") documents that release drops only the flock, never the path,
+  # because unlinking it would reopen the very rename/inode race the file-of-its-own design
+  # exists to close. expected_files_for_context is the one place that fact and this leg's
+  # expectation are tied together, so a fourth file added to the format changes one function
+  # rather than requiring every leg's literal to be remembered and hand-edited (this is
+  # exactly the edit P1d needed and did not get when nnlock shipped -- audit-reports/
+  # p1d-diagnosis.md).
+  expected = expected_files_for_context("card-5455", [name_a])
   w.check(
-    "P1d both files are on disk, the container under the MODEL'S OWN name",
-    set(on_disk) == {"card-5455.nncounts", "card-5455.%s.nnevals" % name_a},
+    "P1d exactly the files the format is entitled to create are on disk: the count log, "
+    "the container under the MODEL'S OWN name, and the permanent context lock",
+    set(on_disk) == expected,
     str(sorted(on_disk)),
-    "exactly card-5455.nncounts and card-5455.%s.nnevals" % name_a,
+    str(sorted(expected)),
+  )
+  lock_size = on_disk.get("card-5455.nnlock", (None, None))[0]
+  w.check(
+    "P1f the lock file is present and EMPTY -- created-and-locked, never written",
+    lock_size == 0,
+    "size=%s" % (lock_size,),
+    "size==0 (nncachefileformat.h: the lock file is never written, only created and locked)",
   )
   w.check("P1e the engine exits cleanly", out["__rc__"] == 0, "rc=%d" % out["__rc__"], "rc==0")
   print()
@@ -179,6 +197,15 @@ def run_persistence(w, h, name_a):
     % (" | ".join(disposition(r) for r in steps if "error" in r) or "no refusals", rows3[net_a]),
     "no refusals, and zero neural net rows -- the process asked no query. A refusal here is "
     "either the property or the KNOWN-RACE labelled in the witness's own header",
+  )
+  lock = "card-5455.nnlock"
+  w.check(
+    "P3f the lock file stays EMPTY across attach/dump/detach/re-attach/dump -- "
+    "created-and-locked, never written, exactly as nncachefileformat.h documents",
+    ok_seq and state1.get(lock, (None,))[0] == 0 and state2.get(lock, (None,))[0] == 0,
+    "before=%s after=%s" % (state1.get(lock), state2.get(lock)),
+    "size==0 both times -- a non-zero or growing lock file would mean it is being written, "
+    "which is the failure mode the file-of-its-own design exists to avoid",
   )
   evals = "card-5455.%s.nnevals" % name_a
   w.check(
