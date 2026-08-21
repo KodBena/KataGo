@@ -353,7 +353,10 @@ void testTheSwapRefusalNamesTheOpenRequestCount() {
 // model's internal name -- so a stub would make every model's container one file.
 class RealEngineCache {
  public:
-  RealEngineCache()
+  // `admissionSignalMeasurement` is false by default, matching the operator's own gate default
+  // (ledger rows 1652/1655/1660): most callers of this fixture want the byte-identical default
+  // engine, and the one test that wants the gate on says so explicitly at its own call site.
+  explicit RealEngineCache(bool admissionSignalMeasurement = false)
     : dir(TMP_DIR_PREFIX),
       cacheDir(TMP_DIR_PREFIX),
       logger(nullptr, false, false, false, false),
@@ -363,7 +366,8 @@ class RealEngineCache {
       "nnCacheSizePowerOfTwo = 12\n"
       "nnMutexPoolSizePowerOfTwo = 8\n"
       "numSearchThreads = 1\n"
-      "nnCacheDir = " + cacheDir.path() + "\n"
+      "nnCacheDir = " + cacheDir.path() + "\n" +
+      (admissionSignalMeasurement ? "nnCacheAdmissionSignalMeasurement = true\n" : "")
     );
     cfg.initialize(cfgIn);
     const bool randFileName = true;
@@ -953,6 +957,114 @@ void testStatsReportsWhatIsResidentAndWhatIsAttached(RealEngineCache& engine) {
   (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, true});
 }
 
+// nncache-admission-currency-measurement (ledger rows 1652/1655/1660). Gate off is the byte-
+// identical default: cache_stats carries no "admissionSignalMeasurement" key at all, neither
+// whole-table nor per-context, because a caller reading json::contains would otherwise have to
+// tell "measured, and zero" apart from "not measuring" by some OTHER field.
+void testAdmissionSignalMeasurementIsAbsentUnlessTheGateIsOn() {
+  RealEngineCache gateOff(false);
+  const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+  NNEvaluator& eval = *gateOff.hosts->searchableEval(model);
+  (void)cacheAttachExecute(*gateOff.hosts, model, gateOff.attachments, attachAll(OTHER_CONTEXT));
+  const NNCacheContextId contextId = gateOff.attachments.attachmentFor(model, OTHER_CONTEXT).contextId;
+  eval.cacheTable().set(makeOutput(301, false), NNCacheAttribution::toContext(contextId));
+  const json stats = cacheStatsExecute(*gateOff.hosts, model, gateOff.attachments);
+  testAssert(!stats.contains("admissionSignalMeasurement"));
+  testAssert(!stats["contexts"][0].contains("admissionSignalMeasurement"));
+  (void)cacheDetachExecute(*gateOff.hosts, model, gateOff.attachments, CacheDetachRequest{OTHER_CONTEXT, true});
+  cout << "  admissionSignalMeasurement is absent from cache_stats with the gate off" << endl;
+}
+
+// Gate ON: a scripted get/set sequence built so the three candidate currencies DISAGREE, and
+// the arithmetic below is checked against nncache-admission-currency-measurement's own
+// definitions rather than assumed.
+//
+//   key A: set once, then get() 3 times, ALL within one measurement window (one "search").
+//     retrievals   (existing hit ledger)         = 3  (every get after the set is a hit)
+//     rawPresentations                           = 4  (the set, plus the 3 gets: every
+//                                                       offer counts, hit or miss)
+//     dedupedPresentations                       = 1  (one window; A is presented many
+//                                                       times in it, counted once)
+//
+//   key B: set once, then get() twice -- once in the SAME window as the set, once after a
+//   NEW window has opened.
+//     retrievals                                 = 2
+//     rawPresentations                           = 3  (set + 2 gets)
+//     dedupedPresentations                       = 2  (window 1 sees the set and the first
+//                                                       get -> counted once; the new window
+//                                                       sees the second get -> counted again)
+//
+// Totals over both keys: retrievals=5, rawPresentations=7, dedupedPresentations=3 -- three
+// different numbers, which is the whole point: a currency choice here is not a wash.
+void testAdmissionSignalMeasurementCountsThreeDifferingCurrenciesExactly() {
+  RealEngineCache gateOn(true);
+  const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+  NNEvaluator& eval = *gateOn.hosts->searchableEval(model);
+  (void)cacheAttachExecute(*gateOn.hosts, model, gateOn.attachments, attachAll(CONTEXT));
+  const NNCacheContextId contextId = gateOn.attachments.attachmentFor(model, CONTEXT).contextId;
+  const NNCacheAttribution attribution = NNCacheAttribution::toContext(contextId);
+  NNCacheTable& table = eval.cacheTable();
+
+  // Window 1 (the analysis engine opens the first one implicitly; nothing has closed one yet).
+  // Key A's every presentation happens in this one window; key B straddles the window that
+  // opens below, which is exactly what makes their dedupedPresentations differ (1 vs 2)
+  // while their rawPresentations are close (4 vs 3).
+  shared_ptr<NNOutput> got;
+  table.set(makeOutput(401, false), attribution);  // key A: set (presentation 1 of 4)
+  table.set(makeOutput(402, false), attribution);  // key B: set (presentation 1 of 3)
+  testAssert(table.get(nthKey(401), got));  // A hit 1 (retrieval 1, presentation 2)
+  testAssert(table.get(nthKey(401), got));  // A hit 2 (retrieval 2, presentation 3)
+  testAssert(table.get(nthKey(401), got));  // A hit 3 (retrieval 3, presentation 4) -- still window 1
+  testAssert(table.get(nthKey(402), got));  // B hit 1 (retrieval 1, presentation 2), same window
+
+  // A new window opens -- what cache_dump's analysis-request boundary does between requests.
+  // Only key B is presented again; key A is never touched after this, so its
+  // dedupedPresentations stays at 1.
+  table.beginAdmissionSignalMeasurementWindow();
+  testAssert(table.get(nthKey(402), got));  // B hit 2 (retrieval 2, presentation 3), new window
+
+  const NNCacheHitLedger hits = table.harvestHitCountsFor(contextId);
+  testAssert(hits.isCounted());
+  const NNCachePresentationLedger presentations = table.harvestPresentationCountsFor(contextId);
+  testAssert(presentations.isCounted());
+
+  int64_t retrievalsA = 0, retrievalsB = 0;
+  for(size_t i = 0; i < hits.entries().size(); i++) {
+    if(hits.entries()[i].key == nthKey(401)) retrievalsA = hits.entries()[i].hits;
+    if(hits.entries()[i].key == nthKey(402)) retrievalsB = hits.entries()[i].hits;
+  }
+  testAssert(retrievalsA == 3);
+  testAssert(retrievalsB == 2);
+
+  int64_t rawA = 0, rawB = 0, dedupedA = 0, dedupedB = 0;
+  for(size_t i = 0; i < presentations.entries().size(); i++) {
+    if(presentations.entries()[i].key == nthKey(401)) {
+      rawA = presentations.entries()[i].rawPresentations;
+      dedupedA = presentations.entries()[i].dedupedPresentations;
+    }
+    if(presentations.entries()[i].key == nthKey(402)) {
+      rawB = presentations.entries()[i].rawPresentations;
+      dedupedB = presentations.entries()[i].dedupedPresentations;
+    }
+  }
+  testAssert(rawA == 4);
+  testAssert(dedupedA == 1);
+  testAssert(rawB == 3);
+  testAssert(dedupedB == 2);
+
+  // And cache_stats surfaces the same totals, read-only, gate on.
+  const json stats = cacheStatsExecute(*gateOn.hosts, model, gateOn.attachments);
+  testAssert(stats.contains("admissionSignalMeasurement"));
+  testAssert(stats["admissionSignalMeasurement"]["totalRawPresentations"].get<int64_t>() == 7);
+  testAssert(stats["admissionSignalMeasurement"]["totalDedupedPresentations"].get<int64_t>() == 3);
+  testAssert(stats["contexts"][0]["admissionSignalMeasurement"]["totalRawPresentations"].get<int64_t>() == 7);
+  testAssert(stats["contexts"][0]["admissionSignalMeasurement"]["totalDedupedPresentations"].get<int64_t>() == 3);
+
+  cout << "  gate on: retrievals(5) != rawPresentations(7) != dedupedPresentations(3), each exact"
+       << endl;
+  (void)cacheDetachExecute(*gateOn.hosts, model, gateOn.attachments, CacheDetachRequest{CONTEXT, true});
+}
+
 // THE DEBUG TRIPWIRE THAT STOOD HERE IS GONE, AND SO IS THE BYPASS IT WITNESSED.
 //
 // It attached a level-0 source through NNEvaluator directly, with an evaluation in flight on
@@ -1048,5 +1160,7 @@ void Tests::runAnalysisCacheActionTests() {
   }
   testTheSwapPermitCannotBeMintedHere();
   testAnEngineWithoutACacheDirectoryRefusesEveryAct();
+  testAdmissionSignalMeasurementIsAbsentUnlessTheGateIsOn();
+  testAdmissionSignalMeasurementCountsThreeDifferingCurrenciesExactly();
   cout << "Done" << endl;
 }

@@ -929,6 +929,28 @@ json cacheStatsExecute(
     out["unrecordedAttributions"] = attribution.unrecordedAttributions();
   }
 
+  // GATED, READ-ONLY, and present ONLY when NNCacheConfig::admissionSignalMeasurement is on
+  // (ledger rows 1652/1655/1660). This changes no admission decision anywhere; it exists so
+  // the operator can compare three candidate currencies -- retrievals (retrievalsThisSession
+  // above), raw presentations, and presentations deduplicated per measurement window --
+  // against real traffic before choosing one for cache_dump's "admission" field.
+  const NNCachePresentationLedger presentations = eval.cacheTable().harvestPresentationCounts();
+  if(presentations.isCounted()) {
+    json signal;
+    int64_t totalRaw = 0;
+    int64_t totalDeduped = 0;
+    for(size_t i = 0; i < presentations.entries().size(); i++) {
+      totalRaw += (int64_t)presentations.entries()[i].rawPresentations;
+      totalDeduped += (int64_t)presentations.entries()[i].dedupedPresentations;
+    }
+    signal["countedKeys"] = (int64_t)presentations.entries().size();
+    signal["totalRawPresentations"] = totalRaw;
+    signal["totalDedupedPresentations"] = totalDeduped;
+    signal["unrecordedRawPresentations"] = presentations.unrecordedRaw();
+    signal["unrecordedDedupedPresentations"] = presentations.unrecordedDeduped();
+    out["admissionSignalMeasurement"] = signal;
+  }
+
   json contexts = json::array();
   const vector<string> attached = attachments.attachedContexts(modelIdx);
   for(size_t i = 0; i < attached.size(); i++) {
@@ -938,6 +960,25 @@ json cacheStatsExecute(
     context["levelOneFilled"] = record.levelOneFilled;
     context["levelOneFilledBytes"] = record.levelOneFilledBytes;
     context["unpersistedEntries"] = (int64_t)eval.cacheTable().unpersistedKeysFor(record.contextId).size();
+    // Same gate as the whole-table block above, and the same scope note: this is EARNED
+    // keys only (attributedKeysFor's own population), so a card served entirely out of a
+    // pre-warmed level 0 with nothing set() this session reports zero rows here while
+    // still contributing to the whole-table admissionSignalMeasurement above.
+    const NNCachePresentationLedger contextPresentations =
+      eval.cacheTable().harvestPresentationCountsFor(record.contextId);
+    if(contextPresentations.isCounted()) {
+      json contextSignal;
+      int64_t contextRaw = 0;
+      int64_t contextDeduped = 0;
+      for(size_t j = 0; j < contextPresentations.entries().size(); j++) {
+        contextRaw += (int64_t)contextPresentations.entries()[j].rawPresentations;
+        contextDeduped += (int64_t)contextPresentations.entries()[j].dedupedPresentations;
+      }
+      contextSignal["earnedKeys"] = (int64_t)contextPresentations.entries().size();
+      contextSignal["totalRawPresentations"] = contextRaw;
+      contextSignal["totalDedupedPresentations"] = contextDeduped;
+      context["admissionSignalMeasurement"] = contextSignal;
+    }
     json sources = json::array();
     for(size_t s = 0; s < record.sources.size(); s++)
       sources.push_back(sourceToJson(record.sources[s]));

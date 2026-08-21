@@ -580,10 +580,17 @@ class NNCacheTwoLevelTable : public NNCacheTable {
 // default table's memory, so the counts for level-1-owned keys live in one table here,
 // holding the full 128-bit key beside each count so a count is never attributed to the
 // wrong key. Throws if either argument cannot be honored.
+//
+// `admissionSignalMeasurement` gates the admission-signal-candidate side counters (see
+// NNCachePresentationLedger). Defaulted to false so every pre-existing caller -- every test
+// in cpp/tests/ that built a two-level table before this axis existed -- keeps building
+// exactly the table it always built, unchanged (ADR-0012 P11: an added parameter must not
+// silently change what an untouched call site gets).
 std::unique_ptr<NNCacheTwoLevelTable> makeTwoLevelNNCacheTable(
   std::unique_ptr<NNCacheFrozen> levelZero,
   std::unique_ptr<NNCacheTable> levelOne,
-  int hitLedgerPowerOfTwo
+  int hitLedgerPowerOfTwo,
+  bool admissionSignalMeasurement = false
 );
 
 // The exact resident cost of the level-1 hit ledger that factory allocates. Named here so

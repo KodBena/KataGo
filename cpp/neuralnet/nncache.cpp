@@ -25,6 +25,7 @@ const char* const NNCacheConfig::KEY_MAX_BYTES = "nnCacheMaxBytes";
 const char* const NNCacheConfig::KEY_REPLACEMENT = "nnCacheReplacement";
 const char* const NNCacheConfig::KEY_SIGHTING_GHOST_POW = "nnCacheSightingGhostPowerOfTwo";
 const char* const NNCacheConfig::KEY_DIR = "nnCacheDir";
+const char* const NNCacheConfig::KEY_ADMISSION_SIGNAL_MEASUREMENT = "nnCacheAdmissionSignalMeasurement";
 
 static const string COLLISION_DIRECT = "direct";
 static const string COLLISION_LINEAR = "linearprobe";
@@ -323,6 +324,13 @@ NNCacheConfig NNCacheConfig::fromCfg(ConfigParser& cfg, int sizePowerOfTwo, int 
       );
     config.cacheDirectory = dir;
   }
+
+  // GATED OFF BY DEFAULT (ledger rows 1652/1655/1660): measures three candidate admission
+  // currencies side by side without changing any admission decision. See
+  // NNCachePresentationLedger's own comment for what it counts and why picking a currency
+  // is deliberately left open.
+  if(cfg.contains(KEY_ADMISSION_SIGNAL_MEASUREMENT))
+    config.admissionSignalMeasurement = cfg.getBool(KEY_ADMISSION_SIGNAL_MEASUREMENT);
 
   // getString(key,possibles) already refuses an unrecognized value naming the whole
   // vocabulary; reuse it rather than re-authoring a second such check (ADR-0012 P1).
@@ -846,6 +854,76 @@ NNCacheHitLedger NNCacheTable::takeUnpersistedHitCounts() {
   return NNCacheHitLedger::notCounted();
 }
 
+//-------------------------------------------------------------------------------------
+// The admission-signal-candidate measurement's base defaults
+//-------------------------------------------------------------------------------------
+//
+// Every table's inherited answer unless NNCacheTableTwoLevel overrides it: gated off is
+// the byte-identical-default this whole axis promises, and a shape that has never heard of
+// this measurement is exactly as "gated off" as one that has but was configured false.
+
+NNCachePresentationLedger NNCacheTable::harvestPresentationCounts() const {
+  return NNCachePresentationLedger::notCounted();
+}
+
+NNCachePresentationLedger NNCacheTable::harvestPresentationCountsFor(const NNCacheContextId& context) const {
+  const vector<Hash128> keys = attributedKeysFor(context);
+  (void)keys;
+  return NNCachePresentationLedger::notCounted();
+}
+
+void NNCacheTable::beginAdmissionSignalMeasurementWindow() {
+  // Deliberately empty. See the declaration: this must be a single predictable no-op for
+  // every table not measuring, which is every table shape except the two-level one, and
+  // that one only when NNCacheConfig::admissionSignalMeasurement was set.
+}
+
+NNCachePresentationLedger::NNCachePresentationLedger(
+  NNCachePresentationLedgerDisposition disposition,
+  vector<NNCachePresentationCount> entries,
+  int64_t unrecordedRaw,
+  int64_t unrecordedDeduped
+)
+  :disposition_(disposition),
+   entries_(std::move(entries)),
+   unrecordedRaw_(unrecordedRaw),
+   unrecordedDeduped_(unrecordedDeduped)
+{}
+
+NNCachePresentationLedger NNCachePresentationLedger::notCounted() {
+  return NNCachePresentationLedger(NNCachePresentationLedgerDisposition::NotCounted, vector<NNCachePresentationCount>(), 0, 0);
+}
+
+NNCachePresentationLedger NNCachePresentationLedger::counted(
+  vector<NNCachePresentationCount> entries, int64_t unrecordedRaw, int64_t unrecordedDeduped
+) {
+  return NNCachePresentationLedger(
+    NNCachePresentationLedgerDisposition::Counted, std::move(entries), unrecordedRaw, unrecordedDeduped
+  );
+}
+
+const vector<NNCachePresentationCount>& NNCachePresentationLedger::entries() const {
+  if(disposition_ != NNCachePresentationLedgerDisposition::Counted)
+    throw StringError(
+      "NNCachePresentationLedger: this table is not measuring the admission-signal candidates "
+      "(NNCacheConfig::admissionSignalMeasurement is false, or this shape never carries the "
+      "axis), so it has no rows to hand out. Check disposition() before asking."
+    );
+  return entries_;
+}
+
+int64_t NNCachePresentationLedger::unrecordedRaw() const {
+  if(disposition_ != NNCachePresentationLedgerDisposition::Counted)
+    throw StringError("NNCachePresentationLedger: not measuring, so no unrecorded-raw count either.");
+  return unrecordedRaw_;
+}
+
+int64_t NNCachePresentationLedger::unrecordedDeduped() const {
+  if(disposition_ != NNCachePresentationLedgerDisposition::Counted)
+    throw StringError("NNCachePresentationLedger: not measuring, so no unrecorded-deduped count either.");
+  return unrecordedDeduped_;
+}
+
 // Builds the collision-resolution layer the shape asks for, then wraps it in the
 // admission layer if one is asked for. Admission is orthogonal to collision
 // resolution, so it composes over all four shapes rather than being repeated in each.
@@ -940,7 +1018,8 @@ unique_ptr<NNCacheTwoLevelTable> NNCacheTable::createWithLevelZeroList(const NNC
   unique_ptr<NNCacheTwoLevelTable> table = makeTwoLevelNNCacheTable(
     NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()),
     NNCacheTable::create(config),
-    NNCacheAttributionRecorder::defaultPowerOfTwo()
+    NNCacheAttributionRecorder::defaultPowerOfTwo(),
+    config.admissionSignalMeasurement
   );
   const vector<NNCacheLevelZeroSourceId> order = table->levelZeroResolutionOrder();
   testAssert(order.size() == 1);

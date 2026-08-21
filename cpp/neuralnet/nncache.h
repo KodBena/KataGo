@@ -236,6 +236,13 @@ struct NNCacheConfig {
   // so that the next field added here does not silently become "whatever the caller forgot".
   std::optional<std::string> cacheDirectory = std::nullopt;
 
+  // GATED OFF BY DEFAULT (ledger rows 1652/1655/1660). When true, the two-level table
+  // maintains the admission-signal-candidate side counters (NNCachePresentationLedger) and
+  // cache_stats surfaces them; every other table shape and every other behavior is
+  // unaffected. See NNCachePresentationLedger's own comment for what this measures and why
+  // it exists rather than picking a currency outright.
+  bool admissionSignalMeasurement = false;
+
   // The status-quo configuration: exactly what NNEvaluator built before the policy
   // axes existed.
   static NNCacheConfig statusQuo(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo);
@@ -256,6 +263,7 @@ struct NNCacheConfig {
   static const char* const KEY_REPLACEMENT; // nnCacheReplacement
   static const char* const KEY_SIGHTING_GHOST_POW; // nnCacheSightingGhostPowerOfTwo
   static const char* const KEY_DIR;         // nnCacheDir
+  static const char* const KEY_ADMISSION_SIGNAL_MEASUREMENT; // nnCacheAdmissionSignalMeasurement
 
   static const std::set<std::string>& collisionVocabulary();
   static const std::set<std::string>& evictionVocabulary();
@@ -360,6 +368,73 @@ class NNCacheHitLedger {
   NNCacheHitLedgerDisposition disposition_;
   std::vector<NNCacheHitCount> entries_;
   int64_t unrecordedHits_;
+};
+
+//-------------------------------------------------------------------------------------
+// The admission-signal-candidate measurement (nncache-admission-currency-measurement,
+// ledger rows 1652/1655/1660)
+//-------------------------------------------------------------------------------------
+//
+// The correct CURRENCY a disk-admission decision ought to gate on is an open empirical
+// question this file deliberately does not answer: retrievals (NNCacheHitLedger, already
+// exists), raw PRESENTATIONS (every offer to the table, get or set, hit or miss -- the
+// same quantity NNCacheReplacementPolicy's sighting axis counts; see nncachesighting.cpp's
+// own header comment), or presentations DEDUPLICATED PER SEARCH (counted at most once per
+// key per measurement window). This structure carries the latter two, gated OFF by
+// default, so the operator can compare all three against real traffic before picking one
+// as cache_dump's currency. It changes no admission decision anywhere; it only counts.
+
+// One key's two candidate signals, alongside its already-existing NNCacheHitCount.
+struct NNCachePresentationCount {
+  Hash128 key;
+  // Every get() or set() this session offered for this key, hit or miss.
+  uint32_t rawPresentations;
+  // The same, counted at most once per key per measurement window. See
+  // NNCacheTable::beginAdmissionSignalMeasurementWindow for what closes a window.
+  uint32_t dedupedPresentations;
+};
+
+// Whether a table is measuring the admission-signal candidates at all. A typed
+// disposition for the same reason NNCacheHitLedgerDisposition is one: an empty row
+// vector cannot say whether nothing was presented or the table was never asked to count.
+enum class NNCachePresentationLedgerDisposition {
+  // NNCacheConfig::admissionSignalMeasurement is false (the default), or this table shape
+  // never carries the axis. Zero memory, zero hot-path cost -- see nncachetwolevel.cpp.
+  NotCounted,
+  Counted,
+};
+
+class NNCachePresentationLedger {
+ public:
+  static NNCachePresentationLedger notCounted();
+  static NNCachePresentationLedger counted(
+    std::vector<NNCachePresentationCount> entries, int64_t unrecordedRaw, int64_t unrecordedDeduped
+  );
+
+  NNCachePresentationLedgerDisposition disposition() const { return disposition_; }
+  bool isCounted() const { return disposition_ == NNCachePresentationLedgerDisposition::Counted; }
+
+  const std::vector<NNCachePresentationCount>& entries() const;
+
+  // Presentations that occurred but could not be attributed to a row, because the
+  // measurement ledger had no room for the key (the same bounded-probe-window overflow
+  // NNCacheHitLedger reports as unrecordedHits). Two counters, not one: a raw
+  // presentation and a deduped one can overflow independently once a key's row is gone.
+  int64_t unrecordedRaw() const;
+  int64_t unrecordedDeduped() const;
+
+ private:
+  NNCachePresentationLedger(
+    NNCachePresentationLedgerDisposition disposition,
+    std::vector<NNCachePresentationCount> entries,
+    int64_t unrecordedRaw,
+    int64_t unrecordedDeduped
+  );
+
+  NNCachePresentationLedgerDisposition disposition_;
+  std::vector<NNCachePresentationCount> entries_;
+  int64_t unrecordedRaw_;
+  int64_t unrecordedDeduped_;
 };
 
 // A concurrent, hash-sharded table mapping an NN input hash to its NNOutput.
@@ -604,6 +679,41 @@ class NNCacheTable {
   //
   // NotCounted from a table that keeps no per-key hit counts, exactly as harvestHitCounts is.
   [[nodiscard]] virtual NNCacheHitLedger takeUnpersistedHitCounts();
+
+  //-----------------------------------------------------------------------------------
+  // The gated admission-signal-candidate measurement. See NNCachePresentationLedger.
+  //-----------------------------------------------------------------------------------
+
+  // The whole-table totals. NotCounted whenever NNCacheConfig::admissionSignalMeasurement
+  // was false at construction, or this table shape never carries the axis (every shape but
+  // the two-level table, today) -- the base default, deliberately not overridden except by
+  // NNCacheTableTwoLevel.
+  [[nodiscard]] virtual NNCachePresentationLedger harvestPresentationCounts() const;
+
+  // Exactly `context`'s earned keys' rows, the same intersection harvestHitCountsFor forms
+  // for retrievals. NotCounted under the same conditions as harvestPresentationCounts().
+  // Throws StringError for a context this table did not attach, exactly as
+  // harvestHitCountsFor does.
+  [[nodiscard]] virtual NNCachePresentationLedger harvestPresentationCountsFor(
+    const NNCacheContextId& context
+  ) const;
+
+  // Closes the current deduped-presentation measurement window and opens a new one: a key
+  // presented again after this call counts as a fresh deduped presentation even if it was
+  // already seen in the window just closed. A NO-OP on a table not measuring (the base
+  // default), and a no-op is exactly the right answer for the gate-off, single-predictable-
+  // check cost this axis is required to carry (ADR-0009).
+  //
+  // WHAT A "WINDOW" IS HERE, NAMED RATHER THAN LEFT IMPLICIT. The natural boundary this
+  // signal wants is one MCTS search; there is no call reachable from NNCacheTable's own
+  // surface that fires exactly there without threading a new argument through every
+  // evaluate() call on the hot path. The analysis engine already has a call it makes once
+  // per incoming analyze request, immediately before that request's search begins
+  // (cpp/command/analysis.cpp, beside bot->setCacheAttribution) -- ONE per-request boundary
+  // substitutes for ONE per-search boundary today, which is coarser only when a single
+  // analyze request's search is interrupted and resumed by a later request without an
+  // intervening dump/stats read, a case the persisted-cache protocol does not create.
+  virtual void beginAdmissionSignalMeasurementWindow();
 
   // Builds the table a config asks for. Throws, naming what is missing, for a
   // shape that is coherent but not implemented yet -- never silently substituting
