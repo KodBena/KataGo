@@ -470,7 +470,11 @@ class Suite:
     # same thing SC1 asks for with "admission": {"all": true}, here as the operator's config key.
     cfg = self.lifecycle_config(
       "sharedcache-sc5.cfg", self.cache_dir,
-      ["nnCacheAttachContext = " + ctx, "nnCacheShutdownDumpMinObservations = 0"],
+      ["nnCacheAttachContext = " + ctx, "nnCacheDumpMinObservations = 0",
+       # OFF for SC5, on purpose: this scenario's whole claim is about the STARTUP attach and the
+       # SHUTDOWN dump, and a periodic pass firing mid-scenario would make "exactly one dump line"
+       # a fact about how long the engine happened to live. SC6 is where the interval is the claim.
+       "nnCacheDumpIntervalMinutes = 0"],
     )
 
     a = Engine(self.binary, cfg, [self.net])
@@ -576,6 +580,96 @@ class Suite:
       % (proc.returncode, "nnCacheDir" in combined, not os.path.exists(missing),
          combined.strip()[-220:]),
       "nonzero exit, the refusal names nnCacheDir, and the engine did not silently create it",
+    )
+    print()
+
+  # ---------------------------------------------------------------------------------------
+  # SC6: the engine is KILLED. Its work is on disk anyway, put there by the periodic dump.
+  # ---------------------------------------------------------------------------------------
+  def sc6_periodic_dump_survives_a_kill(self):
+    """The failure mode the operator says is NORMAL, witnessed rather than assumed.
+
+    SC5 ends its engines by closing stdin, which is the clean exit. These leaves are not usually
+    stopped that way: they are long-lived, and they end at machine shutdown or at an arbitrary
+    kill when the box wants the memory back. A process that is SIGKILLed runs no shutdown code at
+    all - no atexit, no destructor, no dump - so an engine whose only persistence was the
+    shutdown dump would lose everything in exactly the case that happens most.
+
+    So this leg never lets engine A exit cleanly. It sends queries, waits for the CONTAINER FILE
+    to appear on disk while A is still running - which nothing but the periodic dump could have
+    done, since no cache verb was ever sent and A has not exited - and then kills A with SIGKILL.
+    Whether the work survived is then read off a SECOND engine, which pays for it or does not.
+
+    The first observation is deliberately of the FILESYSTEM and not of A's log: A's own log line
+    is A's opinion of itself, and the claim is about bytes (ADR-0021 Rule 1).
+    """
+    print("== SC6: engine A is KILLED, never exits cleanly, and its work is on disk anyway ==")
+    ctx = self.context + "-sc6"
+    queries = positions(3)
+    cfg = self.lifecycle_config(
+      "sharedcache-sc6.cfg", self.cache_dir,
+      ["nnCacheAttachContext = " + ctx,
+       "nnCacheDumpMinObservations = 0",
+       "nnCacheDumpIntervalMinutes = 0.05"],   # 3 seconds
+    )
+
+    def evals_bytes():
+      total = 0
+      for path in context_files(self.cache_dir, ctx):
+        if path.endswith(".nnevals"):
+          total += os.path.getsize(path)
+      return total
+
+    a = Engine(self.binary, cfg, [self.net])
+    grew_at = None
+    try:
+      for i, q in enumerate(queries):
+        a.ask(dict(q, id="q%d" % i))
+      # Wait on the PROPERTY with a deadline, never a fixed sleep: a fixed sleep is a leg that is
+      # green on an idle box and red on a loaded one and says nothing either way.
+      waiting_since = time.time()
+      deadline = waiting_since + 120.0
+      while time.time() < deadline:
+        if evals_bytes() > 0:
+          grew_at = time.time()
+          break
+        time.sleep(0.1)
+      alive_when_written = a.proc.poll() is None
+      written_bytes = evals_bytes()
+      # SIGKILL. Not stdin-close, not terminate: nothing in the engine gets to run after this.
+      a.proc.kill()
+      _, a_err = a.proc.communicate(timeout=60)
+      a_rc = a.proc.returncode
+    finally:
+      a.kill()
+
+    self.w.check(
+      "SC6a *** the container file GREW while engine A was still running, with no cache verb "
+      "ever sent -- only the periodic dump can have written it ***",
+      written_bytes > 0 and alive_when_written,
+      "%s bytes of .nnevals on disk, engine A still alive at that moment=%s, after %s"
+      % (written_bytes, alive_when_written,
+         ("%.1f s" % (grew_at - waiting_since)) if grew_at else "never"),
+      "the evaluations file is non-empty while the writing process is still running",
+    )
+    self.w.check(
+      "SC6b and engine A was KILLED, so no shutdown dump can have contributed anything",
+      a_rc is not None and a_rc < 0 and not shutdown_dumps(a_err, ctx),
+      "exit status=%s (negative means killed by a signal), shutdown dump lines=%d, "
+      "interval dump lines=%d"
+      % (a_rc, len(shutdown_dumps(a_err, ctx)),
+         len([l for l in a_err.splitlines() if "on the dump interval" in l])),
+      "killed by a signal, and NOT one shutdown dump line in its log",
+    )
+
+    b_reqs = [dict(q, id="q%d" % i) for i, q in enumerate(queries)]
+    _, b_rows, b_rc = self.session(b_reqs, config=cfg)
+    self.w.check(
+      "SC6c *** a later engine pays ZERO neural net rows for the killed engine's queries ***",
+      b_rc == 0 and b_rows == 0,
+      "rc=%d NN rows=%d over the same %d queries the killed engine had paid for"
+      % (b_rc, b_rows, len(queries)),
+      "NN rows == 0 exactly -- the killed process's work was already on disk",
     )
     print()
 
@@ -729,7 +823,7 @@ def main():
                  help="Do not run lockfsprobe first. Only for a directory already probed.")
   p.add_argument("--keep", action="store_true", help="Leave this run's cache files behind.")
   p.add_argument("--only", action="append", default=None,
-                 choices=["sc1", "sc2", "sc3", "sc4", "sc5"],
+                 choices=["sc1", "sc2", "sc3", "sc4", "sc5", "sc6"],
                  help="Run only these scenarios. Repeatable.")
   args = p.parse_args()
 
@@ -786,7 +880,7 @@ def main():
 
   w = Witness()
   suite = Suite(w, binary, config, args.model, cache_dir, context, workdir)
-  chosen = args.only or ["sc1", "sc2", "sc3", "sc4", "sc5"]
+  chosen = args.only or ["sc1", "sc2", "sc3", "sc4", "sc5", "sc6"]
   try:
     if "sc1" in chosen:
       suite.sc1_sequential_reuse()
@@ -798,15 +892,18 @@ def main():
       suite.sc4_default_admission_bootstrap()
     if "sc5" in chosen:
       suite.sc5_config_driven_lifecycle()
+    if "sc6" in chosen:
+      suite.sc6_periodic_dump_survives_a_kill()
   finally:
     if args.keep:
       print("kept: %s" % [os.path.basename(f) for f in context_files(cache_dir, context + "-sc1")
                           + context_files(cache_dir, context + "-sc2")
                           + context_files(cache_dir, context + "-sc3")
                           + context_files(cache_dir, context + "-sc4")
-                          + context_files(cache_dir, context + "-sc5")])
+                          + context_files(cache_dir, context + "-sc5")
+                          + context_files(cache_dir, context + "-sc6")])
     else:
-      for suffix in ("-sc1", "-sc2", "-sc3", "-sc4", "-sc5"):
+      for suffix in ("-sc1", "-sc2", "-sc3", "-sc4", "-sc5", "-sc6"):
         for f in context_files(cache_dir, context + suffix):
           try:
             os.remove(f)

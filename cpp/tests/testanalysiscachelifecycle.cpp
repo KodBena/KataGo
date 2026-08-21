@@ -1,7 +1,12 @@
 #include "../tests/tests.h"
 
+#include <chrono>
 #include <functional>
+#include <mutex>
 #include <sstream>
+#include <thread>
+
+#include "../core/timer.h"
 
 #include "../command/analysiscachelifecycle.h"
 #include "../core/config_parser.h"
@@ -155,7 +160,7 @@ void testAnEngineWithNoLifecycleKeysHasNoLifecycle() {
   testAssert(!lifecycle.isConfigured());
   // The two accessors refuse rather than hand back a default that would read as configured.
   testAssert(refusalOf([&]() { (void)lifecycle.context(); }).has_value());
-  testAssert(refusalOf([&]() { (void)lifecycle.shutdownAdmission(); }).has_value());
+  testAssert(refusalOf([&]() { (void)lifecycle.dumpAdmission(); }).has_value());
   cout << "  a config with neither lifecycle key yields no lifecycle, and its accessors refuse" << endl;
 }
 
@@ -171,10 +176,10 @@ void testTheContextKeyWithoutACacheDirectoryIsRefusedNamingBothKeys() {
 
 void testTheShutdownAdmissionKeyWithoutAContextIsRefused() {
   const std::optional<string> refusal = refusalOf([&]() {
-    (void)lifecycleFrom("numSearchThreads = 1\nnnCacheShutdownDumpMinObservations = 5\n");
+    (void)lifecycleFrom("numSearchThreads = 1\nnnCacheDumpMinObservations = 5\n");
   });
   testAssert(refusal.has_value());
-  testAssert(refusal.value().find(AnalysisCacheLifecycle::KEY_SHUTDOWN_MIN_OBSERVATIONS) != string::npos);
+  testAssert(refusal.value().find(AnalysisCacheLifecycle::KEY_DUMP_MIN_OBSERVATIONS) != string::npos);
   testAssert(refusal.value().find(AnalysisCacheLifecycle::KEY_ATTACH_CONTEXT) != string::npos);
   cout << "  a shutdown admission with no context to dump is refused, not silently ignored" << endl;
 }
@@ -199,24 +204,24 @@ void testTheShutdownAdmissionDefaultsToTheSameNumberAnAdmissionLessDumpGets() {
   testAssert(byDefault.isConfigured());
   testAssert(byDefault.context() == "somecard");
   testAssert(
-    byDefault.shutdownAdmission().describe() ==
+    byDefault.dumpAdmission().describe() ==
     NNCacheDiskAdmission::minObservations(cacheDumpDefaultAdmissionObservations()).describe()
   );
 
   const AnalysisCacheLifecycle overridden = lifecycleFrom(
     "numSearchThreads = 1\nnnCacheDir = /tmp\nnnCacheAttachContext = somecard\n"
-    "nnCacheShutdownDumpMinObservations = 7\n"
+    "nnCacheDumpMinObservations = 7\n"
   );
-  testAssert(overridden.shutdownAdmission().describe() ==
+  testAssert(overridden.dumpAdmission().describe() ==
              NNCacheDiskAdmission::minObservations(7).describe());
 
   // Zero is the accept-everything case, and it is reachable through this one key rather than
   // through a second key that could disagree with it.
   const AnalysisCacheLifecycle acceptAll = lifecycleFrom(
     "numSearchThreads = 1\nnnCacheDir = /tmp\nnnCacheAttachContext = somecard\n"
-    "nnCacheShutdownDumpMinObservations = 0\n"
+    "nnCacheDumpMinObservations = 0\n"
   );
-  testAssert(acceptAll.shutdownAdmission().admits(0));
+  testAssert(acceptAll.dumpAdmission().admits(0));
   cout << "  the shutdown admission defaults to the wire dump's own default, overrides, and "
           "reaches accept-all at 0" << endl;
 }
@@ -248,8 +253,10 @@ void testAnUnconfiguredEngineAttachesAndDumpsNothing() {
   Engine engine(cacheDir.path(), "");
   testAssert(!engine.lifecycle.isConfigured());
   testAssert(analysisCacheStartupAttach(*engine.hosts, engine.attachments, engine.lifecycle).empty());
-  const AnalysisCacheShutdownDumpReport report =
-    analysisCacheShutdownDump(*engine.hosts, engine.attachments, engine.lifecycle);
+  const AnalysisCacheDumpReport report =
+    analysisCacheDumpAttachedContexts(
+      *engine.hosts, engine.attachments, engine.lifecycle, AnalysisCacheDumpOccasion::Shutdown, 0
+    );
   testAssert(report.lines.empty() && report.modelsDumped == 0 && report.modelsFailed == 0);
   for(const SearchableModelIdx modelIdx: engine.hosts->searchableIdxs())
     testAssert(engine.hosts->searchableEval(modelIdx)->numLevelZeroSources() == 0);
@@ -289,7 +296,7 @@ void testAMissingCacheDirectoryRefusesBeforeAnythingAttaches() {
 void testWorkSurvivesAShutdownDumpAndIsReadBackByALaterStartupAttach() {
   TestCommon::ScopedTempDir cacheDir(TMP_DIR_PREFIX);
   const string cfgLine = string("nnCacheAttachContext = ") + CONTEXT + "\n" +
-                         "nnCacheShutdownDumpMinObservations = 0\n";
+                         "nnCacheDumpMinObservations = 0\n";
   const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
   int64_t written = 0;
 
@@ -308,8 +315,10 @@ void testWorkSurvivesAShutdownDumpAndIsReadBackByALaterStartupAttach() {
       eval.cacheTable().set(makeOutput(serial), attribution);
     }
 
-    const AnalysisCacheShutdownDumpReport report =
-      analysisCacheShutdownDump(*first.hosts, first.attachments, first.lifecycle);
+    const AnalysisCacheDumpReport report =
+      analysisCacheDumpAttachedContexts(
+      *first.hosts, first.attachments, first.lifecycle, AnalysisCacheDumpOccasion::Shutdown, 0
+    );
     testAssert(report.modelsFailed == 0);
     // Both models were attached, so both are dumped -- the second one having nothing to write is
     // still a dump that happened, and is what makes "every hosted model" true at shutdown too.
@@ -361,13 +370,169 @@ void testAWireDetachOfTheConfigAttachedContextLeavesNothingForShutdownToDump() {
   testAssert(detached["sourcesDetached"].get<int64_t>() == 1);
   testAssert(!engine.attachments.isAttached(model, CONTEXT));
 
-  const AnalysisCacheShutdownDumpReport report =
-    analysisCacheShutdownDump(*engine.hosts, engine.attachments, engine.lifecycle);
+  const AnalysisCacheDumpReport report =
+    analysisCacheDumpAttachedContexts(
+      *engine.hosts, engine.attachments, engine.lifecycle, AnalysisCacheDumpOccasion::Shutdown, 0
+    );
   testAssert(report.modelsFailed == 0);
   // The OTHER model is still attached and is still dumped: skipping is per model, not per engine.
   testAssert(report.modelsDumped == 1);
   cout << "  a wire cache_detach takes the config-attached context, and shutdown skips exactly "
           "that model" << endl;
+}
+
+//-------------------------------------------------------------------------------------
+// The periodic dump
+//-------------------------------------------------------------------------------------
+
+// THE DEFAULT IS ON, AND OFF HAS ITS OWN SPELLING. The operator's ruling is that these engines
+// are normally ended by a kill, so a lifecycle whose only persistence was the shutdown dump would
+// be lossy in the documented-normal case (ledger row 1879). The number is read from its one home
+// rather than restated, for the same reason the admission default is.
+void testTheDumpIntervalIsOnByDefaultAndOffOnlyWhenSaidSo() {
+  const string base = "numSearchThreads = 1\nnnCacheDir = /tmp\nnnCacheAttachContext = somecard\n";
+
+  const AnalysisCacheLifecycle byDefault = lifecycleFrom(base);
+  testAssert(byDefault.dumpIntervalSeconds().has_value());
+  testAssert(
+    byDefault.dumpIntervalSeconds().value() ==
+    AnalysisCacheLifecycle::defaultDumpIntervalMinutes() * 60.0
+  );
+
+  const AnalysisCacheLifecycle off = lifecycleFrom(base + "nnCacheDumpIntervalMinutes = 0\n");
+  testAssert(off.isConfigured() && !off.dumpIntervalSeconds().has_value());
+
+  const AnalysisCacheLifecycle half = lifecycleFrom(base + "nnCacheDumpIntervalMinutes = 0.5\n");
+  testAssert(half.dumpIntervalSeconds().value() == 30.0);
+
+  // A positive interval too short to be a schedule is refused rather than honored: it would be a
+  // leaf that lives holding the context's exclusive lock.
+  const std::optional<string> tooShort = refusalOf([&]() {
+    (void)lifecycleFrom(base + "nnCacheDumpIntervalMinutes = 0.0001\n");
+  });
+  testAssert(tooShort.has_value());
+  testAssert(tooShort.value().find(AnalysisCacheLifecycle::KEY_DUMP_INTERVAL_MINUTES) != string::npos);
+
+  // And the interval, like the admission, is refused with no context to dump.
+  const std::optional<string> noContext = refusalOf([&]() {
+    (void)lifecycleFrom("numSearchThreads = 1\nnnCacheDumpIntervalMinutes = 5\n");
+  });
+  testAssert(noContext.has_value());
+  testAssert(noContext.value().find(AnalysisCacheLifecycle::KEY_DUMP_INTERVAL_MINUTES) != string::npos);
+  testAssert(noContext.value().find(AnalysisCacheLifecycle::KEY_ATTACH_CONTEXT) != string::npos);
+  cout << "  the dump interval defaults ON (" << AnalysisCacheLifecycle::defaultDumpIntervalMinutes()
+       << " min), is turned off only by an explicit 0, and refuses a schedule with nothing to dump"
+       << endl;
+}
+
+// A dumper over `engine`, with the mutex the engine would own. Held in one place so the two legs
+// below construct it the same way the analysis command does.
+struct DumperFixture {
+  explicit DumperFixture(Engine& engine)
+    : dumper(*engine.hosts, engine.attachments, mutex, engine.lifecycle,
+             []() { return (int64_t)0; },
+             [this](const string& line) {
+               std::lock_guard<std::mutex> lock(linesMutex);
+               lines.push_back(line);
+             })
+  {}
+  std::mutex mutex;
+  std::mutex linesMutex;
+  vector<string> lines;
+  AnalysisCachePeriodicDumper dumper;
+
+  [[nodiscard]] vector<string> linesSoFar() {
+    std::lock_guard<std::mutex> lock(linesMutex);
+    return lines;
+  }
+};
+
+// THE CLAIM THE WHOLE FEATURE RESTS ON: a leaf that is never asked for anything and never exits
+// cleanly still gets its work onto disk. So this leg never calls the shutdown dump at all -- it
+// starts the dumper, waits for a pass, stops it, and then reads the files with a SECOND set of
+// evaluators. A shutdown dump anywhere in this function would make it unable to tell the interval
+// dump from the exit dump.
+void testThePeriodicDumperWritesWithNobodyAskingAndNoCleanExit() {
+  TestCommon::ScopedTempDir cacheDir(TMP_DIR_PREFIX);
+  const string cfgLines = string("nnCacheAttachContext = ") + CONTEXT + "\n" +
+                          "nnCacheDumpMinObservations = 0\n" +
+                          "nnCacheDumpIntervalMinutes = 0.002\n";  // 120 ms
+  const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
+  int64_t writtenByInterval = 0;
+
+  {
+    Engine engine(cacheDir.path(), cfgLines);
+    (void)analysisCacheStartupAttach(*engine.hosts, engine.attachments, engine.lifecycle);
+    NNEvaluator& eval = *engine.hosts->searchableEval(model);
+    const NNCacheContextId contextId = engine.attachments.attachmentFor(model, CONTEXT).contextId;
+    const NNCacheAttribution attribution = NNCacheAttribution::toContext(contextId);
+    for(int serial = 1; serial <= 3; serial++) {
+      (void)eval.cacheTable().present(nthKey(serial), attribution);
+      eval.cacheTable().set(makeOutput(serial), attribution);
+    }
+
+    DumperFixture fixture(engine);
+    fixture.dumper.start();
+    // WAIT ON THE PROPERTY, WITH A DEADLINE -- never a fixed sleep sized to "probably enough".
+    // A fixed sleep is a leg that goes green on a fast machine and red on a loaded one, and says
+    // nothing either way (ADR-0021).
+    const double deadline = 60.0;
+    const ClockTimer timer;
+    while(fixture.dumper.entriesWritten() < 3 && timer.getSeconds() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Stopping is part of the claim: it must return, and it must not lose the pass in flight.
+    fixture.dumper.stop();
+
+    testAssert(fixture.dumper.passesPerformed() >= 1);
+    testAssert(fixture.dumper.passesWithAFailure() == 0);
+    writtenByInterval = fixture.dumper.entriesWritten();
+    testAssert(writtenByInterval == 3);
+    const vector<string> lines = fixture.linesSoFar();
+    testAssert(!lines.empty());
+    // The occasion is IN the line, so a log cannot be read as an exit dump when it was an
+    // interval one.
+    testAssert(lines[0].find("on the dump interval") != string::npos);
+    cout << "    " << lines[0].substr(0, 150) << "..." << endl;
+    // stop() is idempotent and safe to repeat -- the destructor calls it again.
+    fixture.dumper.stop();
+  }
+
+  // The witness, off the files, with new evaluators: the interval dump alone put them there.
+  {
+    Engine second(cacheDir.path(), cfgLines);
+    (void)analysisCacheStartupAttach(*second.hosts, second.attachments, second.lifecycle);
+    NNEvaluator& eval = *second.hosts->searchableEval(model);
+    for(int serial = 1; serial <= (int)writtenByInterval; serial++) {
+      shared_ptr<NNOutput> fromDisk;
+      testAssert(eval.cacheTable().get(nthKey(serial), fromDisk));
+    }
+    cout << "  the PERIODIC dump alone put " << writtenByInterval
+         << " entries on disk -- no wire verb, no clean exit, and a later engine reads them back"
+         << endl;
+  }
+}
+
+// An interval of 0 is not "a thread that wakes up and does nothing"; there is no thread.
+void testAnIntervalOfZeroRunsNoPassesAtAll() {
+  TestCommon::ScopedTempDir cacheDir(TMP_DIR_PREFIX);
+  Engine engine(
+    cacheDir.path(),
+    string("nnCacheAttachContext = ") + CONTEXT + "\nnnCacheDumpIntervalMinutes = 0\n"
+  );
+  (void)analysisCacheStartupAttach(*engine.hosts, engine.attachments, engine.lifecycle);
+  DumperFixture fixture(engine);
+  fixture.dumper.start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  fixture.dumper.stop();
+  testAssert(fixture.dumper.passesPerformed() == 0);
+  testAssert(fixture.linesSoFar().empty());
+  // And an unconfigured engine likewise starts nothing, without the caller having to ask.
+  Engine none(cacheDir.path(), "");
+  DumperFixture unconfigured(none);
+  unconfigured.dumper.start();
+  unconfigured.dumper.stop();
+  testAssert(unconfigured.dumper.passesPerformed() == 0);
+  cout << "  an interval of 0, and an unconfigured engine, start no dumping thread at all" << endl;
 }
 
 }  // namespace
@@ -385,5 +550,8 @@ void Tests::runAnalysisCacheLifecycleTests() {
   testAMissingCacheDirectoryRefusesBeforeAnythingAttaches();
   testWorkSurvivesAShutdownDumpAndIsReadBackByALaterStartupAttach();
   testAWireDetachOfTheConfigAttachedContextLeavesNothingForShutdownToDump();
+  testTheDumpIntervalIsOnByDefaultAndOffOnlyWhenSaidSo();
+  testThePeriodicDumperWritesWithNobodyAskingAndNoCleanExit();
+  testAnIntervalOfZeroRunsNoPassesAtAll();
   cout << "Done" << endl;
 }

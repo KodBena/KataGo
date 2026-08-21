@@ -499,6 +499,15 @@ int MainCmds::analysis(const vector<string>& args) {
   //loop below, which is a single thread, so it takes no lock; see AnalysisCacheAttachments.
   AnalysisCacheAttachments cacheAttachments(modelHosts.numSearchable());
 
+  //WHAT MAKES THE ABOVE TRUE ONCE A PERIODIC DUMPER EXISTS. cacheAttachments and a model's level-0
+  //resolution list used to be touched by the request loop alone; the config-driven periodic dump
+  //reads both, from its own thread, because a dump takes real time under an exclusive file lock and
+  //must not be run on the thread that reads stdin. This mutex is the whole of that design: the
+  //request loop holds it around every cache action, the dumper holds it around each pass, and
+  //nothing else touches those structures. It is NOT on any search's path -- an analysis thread's
+  //get/set goes nowhere near it -- so its cost to a query is exactly zero.
+  std::mutex cacheActionMutex;
+
   //THE STARTUP ATTACH, and its position is the point of it: after every model is loaded and the
   //registry exists, and BEFORE a single analysis thread is started, so no request can ever be
   //served by a leaf whose configured context is not yet on its cache. A refusal here propagates
@@ -507,6 +516,25 @@ int MainCmds::analysis(const vector<string>& args) {
   //failure this feature exists to notice.
   for(const string& line: analysisCacheStartupAttach(modelHosts, cacheAttachments, cacheLifecycle))
     logger.write(line);
+
+  //THE PERIODIC DUMP. Constructed here, beside the state it dumps and the mutex that guards it,
+  //and STARTED only after the startup attach above has succeeded -- there is nothing to dump
+  //before that, and a pass that ran while the attach was still building level 0 would be a pass
+  //racing the very structure it reads. It is stopped and joined before the shutdown dump at the
+  //bottom of this function, so exactly one of the two ever runs at a time.
+  //
+  //A DUMP IS BEST EFFORT AT SHUTDOWN AND PRIMARY ON THE INTERVAL, which is the reverse of how it
+  //reads: this engine is stopped by a kill or a machine shutdown far more often than by stdin
+  //closing, and a process that is killed never reaches its shutdown dump.
+  AnalysisCachePeriodicDumper periodicDumper(
+    modelHosts, cacheAttachments, cacheActionMutex, cacheLifecycle,
+    [&openRequestsMutex,&openRequests]() {
+      std::lock_guard<std::mutex> lock(openRequestsMutex);
+      return (int64_t)openRequests.size();
+    },
+    [&logger](const string& line) { logger.write(line); }
+  );
+  periodicDumper.start();
 
   auto reportError = [&pushToWrite,&logger,&logErrorsAndWarnings](const string& s) {
     json ret;
@@ -894,6 +922,15 @@ int MainCmds::analysis(const vector<string>& args) {
             openRequestCount = (int64_t)openRequests.size();
           }
           const AnalysisEngineCounters counters{openRequestCount};
+
+          //HELD ACROSS THE WHOLE OF THIS BLOCK, decodes included, because the alternative is a
+          //refusal computed under the lock and a mutation performed outside it. Every one of the
+          //four actions reads or writes cacheAttachments or a model's level-0 resolution list, and
+          //the periodic dumper reads both from its own thread; this is the mutex that makes those
+          //two the only writers and never simultaneous. A client's cache verb may therefore wait
+          //out a dump in progress -- seconds, at a session boundary -- and a search never waits at
+          //all, because no search touches this.
+          std::lock_guard<std::mutex> cacheActionLock(cacheActionMutex);
 
           //The decode's refusal is reported before the concurrency one deliberately: a client with a
           //typo'd field learns about the typo rather than being told to try again later and hitting
@@ -1710,8 +1747,26 @@ int MainCmds::analysis(const vector<string>& args) {
   //evaluations survive or not survive depending on a flag whose documentation says nothing about
   //the cache would be a silent data-loss trap, so the flag costs the queue and not the store.
   {
-    const AnalysisCacheShutdownDumpReport dumped =
-      analysisCacheShutdownDump(modelHosts, cacheAttachments, cacheLifecycle);
+    //STOPPED AND JOINED FIRST, so the interval dump and the shutdown dump can never be in flight
+    //together, and so nothing is still writing when the evaluators below are deleted. This waits
+    //out a pass already in progress, deliberately: abandoning a half-written append to save a
+    //second would leave a torn tail for the next reader to repair.
+    periodicDumper.stop();
+    if(periodicDumper.passesPerformed() > 0)
+      logger.write(
+        Global::strprintf(
+          "%s: %s periodic dump pass(es) over this session, %s of them with a failure, %s entries written",
+          AnalysisCacheLifecycle::KEY_ATTACH_CONTEXT,
+          Global::int64ToString(periodicDumper.passesPerformed()).c_str(),
+          Global::int64ToString(periodicDumper.passesWithAFailure()).c_str(),
+          Global::int64ToString(periodicDumper.entriesWritten()).c_str()
+        )
+      );
+    //No lock is taken for the shutdown dump and none is needed: the dumper thread is joined and
+    //the request loop has returned, so this is the only thread left that could touch any of it.
+    const AnalysisCacheDumpReport dumped = analysisCacheDumpAttachedContexts(
+      modelHosts, cacheAttachments, cacheLifecycle, AnalysisCacheDumpOccasion::Shutdown, 0
+    );
     for(const string& line: dumped.lines) {
       logger.write(line);
       //A dump that failed at shutdown is the operator's only notice that this session's work is

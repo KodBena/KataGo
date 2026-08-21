@@ -173,9 +173,9 @@ models' caches are separate structures - and it is deliberately the strict direc
 several models and drive them from independent client threads, expect attach and detach to need a moment
 when the *whole engine* is quiet, not just the model you are attaching to.
 
-`cache_dump` is the **only** action that writes, and nothing is written on a timer. If you drive the
-session yourself and do not dump, nothing you computed reaches disk. The one exception is the
-config-driven lifecycle in the next section, where the engine sends itself the attach and the dump.
+`cache_dump` is the only *action* that writes. If you drive the session yourself and do not dump, nothing
+you computed reaches disk. The exception is the config-driven lifecycle in the next section, where the
+engine attaches and dumps on its own - on a timer and at exit - without any action being sent.
 
 A context's name stays registered with a model for the life of the process once you have attached it, even
 after you detach. Re-attaching the same context later is fine and reuses that registration; attaching a
@@ -198,7 +198,8 @@ With `nnCacheAttachContext` set, the engine:
   * **attaches that context to every hosted model at startup**, after the models load and before it
     accepts a single request, with the same defaults a bare `cache_attach` gets - the whole of level 0,
     no level-1 fill;
-  * **dumps it back at shutdown**, `what: "both"`, when stdin closes - on both the ordinary exit and
+  * **dumps it back every 15 minutes** while it runs, `what: "both"`, on a thread of its own;
+  * **dumps it back at shutdown** too, when stdin closes - on both the ordinary exit and
     `-quit-without-waiting`, because by then every analysis thread has already been joined on either
     path and a session's earned evaluations should not survive or not survive depending on a flag about
     the queue.
@@ -206,25 +207,57 @@ With `nnCacheAttachContext` set, the engine:
 One context name covers every hosted model; each model still gets its own `<context>.<model>.nnevals`, so
 this is the same card evaluated by each net, not a collision. There is no per-model override.
 
-What the shutdown dump lets onto disk is the same default an `admission`-less `cache_dump` gets - entries
-observed at least twice - and one key changes it:
+#### The periodic dump, and why it is on by default
+
+**The shutdown dump is best effort; the periodic one is the real mechanism.** A leaf that is killed -
+because the machine went down, or because something wanted the memory back - runs no shutdown code at
+all, so an engine that only dumped at exit would lose its whole session in the way these processes
+usually end. Setting `nnCacheAttachContext` already says "this cache lives on disk", so honoring it only
+at a clean exit would be honoring half of it. The interval is the bound on what one kill costs:
 
 ```
-nnCacheShutdownDumpMinObservations = 0     # 0 means write everything; the default is 2
+nnCacheDumpIntervalMinutes = 15    # the default. 0 turns periodic dumping off entirely.
 ```
 
-Setting `nnCacheShutdownDumpMinObservations` without `nnCacheAttachContext` is refused at startup: it
-would be a policy for a write that never happens. So is `nnCacheAttachContext` without `nnCacheDir`,
-naming both keys, and so is an `nnCacheAttachContext` the filesystem cannot hold a context under - a
-name outside the legal alphabet, a directory that is unreadable or that cannot be locked, a store torn
-past repair. **The engine refuses to start in every one of those cases**, rather than coming up and
-serving from an empty cache while you believe it is attached.
+The default of 15 minutes is a trade: shorter bounds the loss more tightly but spends it on the one
+resource several leaves genuinely contend for - a context's exclusive file lock, which a dump holds while
+it appends and which a sibling's attach or dump waits behind. Measure your own dumps and pick a number.
 
-Both acts announce themselves in the engine's log, one line per model. The shutdown line carries the
-dump's own response object verbatim - the same thing a client that had sent `cache_dump` by hand would
-have read - so `entriesWritten`, `belowThreshold` and the rest are all there. A dump that FAILS at
-shutdown is reported as an error line naming the model and the cause, and the remaining models are still
-dumped; shutdown is never held up or aborted by it.
+Two things about the timing are worth knowing:
+
+  * The engine waits the full interval **after a pass finishes**, not on a fixed schedule. So dumps can
+    never overlap - there is one dumping thread, and it is either waiting or dumping. A pass slower than
+    the interval simply pushes the next start later; if you see that in the timestamps, the fix is a
+    longer interval, not more writers on one lock.
+  * The dump runs **off the request path**, so it never blocks a search and never stops the engine
+    reading stdin. It can make a client's own `cache_attach` / `cache_detach` / `cache_dump` /
+    `cache_stats` wait for a pass in flight, which is a session-boundary cost and never a query cost.
+
+#### What the engine's own dumps admit
+
+One key governs both the periodic dump and the shutdown dump - it is one policy ("what this leaf is
+willing to put on the shared disk"), and two keys would let a leaf persist different things depending on
+how it happened to stop:
+
+```
+nnCacheDumpMinObservations = 0     # 0 means write everything; the default is 2
+```
+
+The default is the same one an `admission`-less `cache_dump` gets: entries observed at least twice.
+
+Setting `nnCacheDumpMinObservations` or `nnCacheDumpIntervalMinutes` without `nnCacheAttachContext` is
+refused at startup: they would be a policy, or a schedule, for a write that never happens. So is
+`nnCacheAttachContext` without `nnCacheDir`, naming both keys, and so is an `nnCacheAttachContext` the
+filesystem cannot hold a context under - a name outside the legal alphabet, a directory that is
+unreadable or that cannot be locked, a store torn past repair. **The engine refuses to start in every one
+of those cases**, rather than coming up and serving from an empty cache while you believe it is attached.
+
+Every act announces itself in the engine's log, one line per model, and a dump line says which occasion
+it was (`on the dump interval` / `at shutdown`). The dump lines carry the dump's own response object
+verbatim - the same thing a client that had sent `cache_dump` by hand would have read - so
+`entriesWritten`, `belowThreshold` and the rest are all there. A dump that FAILS is reported as an error
+line naming the model and the cause, the remaining models are still dumped, and neither shutdown nor the
+next interval is held up or aborted by it.
 
 A config-attached context is an **ordinary attached context**, so the wire actions still compose with it:
 `cache_stats` reports it, `cache_dump` writes it early, and `cache_detach` takes it. Once a client has
@@ -232,11 +265,9 @@ detached it the shutdown dump has nothing to dump for that model and does not re
 is the client's decision and the lifecycle does not overrule it. Conversely, `cache_attach` on the
 name the config already attached is the ordinary already-attached error.
 
-Periodic dumping - every N minutes, or every N requests - is deliberately **not** implemented. A long-
-lived leaf that is killed rather than stopped loses its session; if that becomes the operator's real
-failure mode, the place to add it is beside the shutdown dump in `cpp/command/analysiscachelifecycle.cpp`
-(`analysisCacheShutdownDump`), driven from the request loop rather than from a timer thread, because the
-dump reads structures the request loop owns.
+Dumping every N *requests* rather than every N minutes is deliberately not implemented: it would put a
+counter and a branch on the request path to schedule something that is not about requests, and an idle
+leaf - the one with a full cache and nothing coming in - would never dump at all.
 
 ### Reading an error from a cache action
 

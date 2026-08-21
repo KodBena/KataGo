@@ -229,9 +229,20 @@ struct CacheAttachmentRecord {
 // THE ATTACHED CONTEXTS OF EVERY HOSTED MODEL, plus the two facts a detach and a dump have to
 // remember between actions.
 //
-// SINGLE-THREADED BY CONSTRUCTION, and it is worth saying which construction: every action in
-// this file is executed on the analysis engine's request loop, which is one thread reading one
-// input stream. Nothing here takes a lock, and nothing may be called from an analysis thread.
+// TAKES NO LOCK OF ITS OWN, AND HAS TWO CALLERS. It used to be single-threaded by construction --
+// every action in this file ran on the analysis engine's request loop, one thread reading one
+// input stream -- and that is no longer the whole truth: the config-driven periodic dump
+// (analysiscachelifecycle.h) reads this registry from its own thread, because a dump takes real
+// time under an exclusive file lock and cannot be run on the thread that reads stdin.
+//
+// SO THE RULE IS AN EXTERNAL ONE, AND IT IS THE ENGINE'S: a single mutex, owned by
+// MainCmds::analysis, is held by the request loop around every cache action and by the periodic
+// dumper around every pass. Those are the only two callers. NOTHING HERE MAY BE CALLED FROM AN
+// ANALYSIS THREAD, which is unchanged and is what keeps every search off this structure entirely.
+//
+// This class does not take that lock itself, and deliberately: a lock inside it would guard each
+// call and not the ACT, and an act here is several calls (isAttached, then attachmentFor, then a
+// dump that reads what they returned) whose consistency is exactly what has to hold.
 //
 // A CONTEXT'S NAME IS REGISTERED ONCE FOR THE LIFE OF THE PROCESS, its content is not. The
 // name space a request's "cacheContext" field resolves against (NNCacheContextSet) has no

@@ -1,8 +1,13 @@
 #ifndef COMMAND_ANALYSISCACHELIFECYCLE_H_
 #define COMMAND_ANALYSISCACHELIFECYCLE_H_
 
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../command/analysiscacheactions.h"
@@ -47,13 +52,13 @@
 //-------------------------------------------------------------------------------------
 
 // THE LIFECYCLE AN ENGINE WAS CONFIGURED WITH: either a context name TOGETHER WITH the admission
-// its shutdown dump will use, or nothing at all.
+// and the interval its engine-driven dumps will use, or nothing at all.
 //
-// The two are one value rather than two fields because "an admission with no context" is not a
+// They are one value rather than three fields because "an admission with no context" is not a
 // state an operator should be able to reach: it is a policy for a write that will never happen,
-// and an engine holding one would have to explain itself (ADR-0012 P11, ADR-0000). Setting the
-// admission key without the context key is therefore a startup REFUSAL, not a field left
-// dangling, and it is refused in fromCfg where both keys are in hand.
+// and an engine holding one would have to explain itself (ADR-0012 P11, ADR-0000). Setting either
+// dump key without the context key is therefore a startup REFUSAL, not a field left dangling, and
+// it is refused in fromCfg where all three keys are in hand.
 class AnalysisCacheLifecycle {
  public:
   // The cfg keys this Port reads. Named once here so the engine, the refusals and the tests
@@ -63,12 +68,37 @@ class AnalysisCacheLifecycle {
   // Becomes a path component, so it is validated to the closed alphabet by the count log and
   // the container -- the same validation a wire cache_attach gets, at startup instead.
   static const char* const KEY_ATTACH_CONTEXT;      // nnCacheAttachContext
-  // How many recorded observations an entry needs before the SHUTDOWN dump will write it.
+  // How many recorded observations an entry needs before an ENGINE-DRIVEN dump will write it --
+  // the periodic one and the shutdown one alike. ONE key rather than one per occasion: it is one
+  // policy ("what this leaf is willing to put on the shared disk"), and two keys would let an
+  // operator set a leaf that persists different things depending on how it happened to stop.
   // Defaults to the same number an "admission"-less cache_dump gets, which is the one home of
   // that policy (cacheDumpDefaultAdmissionObservations). Zero means "write everything", which
   // is exactly what NNCacheDiskAdmission::minObservations(0) is documented to be -- so the
   // accept-all case needs no second key and cannot disagree with this one.
-  static const char* const KEY_SHUTDOWN_MIN_OBSERVATIONS;  // nnCacheShutdownDumpMinObservations
+  static const char* const KEY_DUMP_MIN_OBSERVATIONS;  // nnCacheDumpMinObservations
+  // How long the engine waits between one engine-driven dump finishing and the next one
+  // starting. 0 turns periodic dumping off; ABSENT does NOT -- see defaultDumpIntervalMinutes()
+  // for why the default is on.
+  static const char* const KEY_DUMP_INTERVAL_MINUTES;  // nnCacheDumpIntervalMinutes
+
+  // WHY PERIODIC DUMPING IS ON BY DEFAULT once a context is configured, rather than off.
+  //
+  // The shutdown dump is BEST EFFORT and the deployment says so plainly: these leaves are
+  // long-lived and are stopped by machine shutdown or by an arbitrary kill when memory is wanted
+  // elsewhere (operator ruling, ledger row 1879). A process that is killed never reaches its
+  // shutdown dump, so an engine whose ONLY persistence was that dump would lose every hour of
+  // work it had done, silently, in the failure mode the operator says is normal. Defaulting the
+  // interval to off would make the documented-normal case the lossy one.
+  //
+  // The operator has already asked for persistence by setting nnCacheAttachContext -- that key
+  // means "this leaf's cache lives on disk" -- so honoring it only at a clean exit would be
+  // honoring half of it. Off remains reachable, explicitly, by setting the interval to 0.
+  //
+  // THE NUMBER is a bound on how much work one kill can cost, traded against how often several
+  // leaves contend for one context's EXCLUSIVE lock: a dump holds that lock, and while it does,
+  // a sibling leaf attaching or dumping the same context waits.
+  [[nodiscard]] static double defaultDumpIntervalMinutes();
 
   // An engine with no persisted-cache lifecycle: the behaviour every engine had before this
   // file existed.
@@ -76,8 +106,8 @@ class AnalysisCacheLifecycle {
 
   // THE ONE PLACE .cfg TEXT BECOMES A LIFECYCLE. Throws StringError, naming the key at fault
   // and what to do about it, for:
-  //   - KEY_SHUTDOWN_MIN_OBSERVATIONS set without KEY_ATTACH_CONTEXT (a write policy for a
-  //     write that will never happen);
+  //   - KEY_DUMP_MIN_OBSERVATIONS or KEY_DUMP_INTERVAL_MINUTES set without KEY_ATTACH_CONTEXT
+  //     (a write policy, or a schedule, for a write that will never happen);
   //   - KEY_ATTACH_CONTEXT set while the engine has no nnCacheDir (nowhere to attach FROM);
   //   - an empty KEY_ATTACH_CONTEXT.
   // It does NOT validate the context name's alphabet: that rule lives in the file types that
@@ -90,15 +120,21 @@ class AnalysisCacheLifecycle {
 
   // Present exactly when this engine attaches a context at startup and dumps it at shutdown.
   [[nodiscard]] bool isConfigured() const;
-  // Both throw StringError if !isConfigured(), rather than handing back a default that would
-  // read as a configured one.
+  // All three throw StringError if !isConfigured(), rather than handing back a default that
+  // would read as a configured one.
   [[nodiscard]] const std::string& context() const;
-  [[nodiscard]] const NNCacheDiskAdmission& shutdownAdmission() const;
+  // Governs the periodic dump and the shutdown dump alike.
+  [[nodiscard]] const NNCacheDiskAdmission& dumpAdmission() const;
+  // The gap between engine-driven dumps, or nothing when periodic dumping was turned off with
+  // an explicit 0. Seconds rather than the key's minutes, because seconds is what a wait takes
+  // and converting once here beats converting at every use (ADR-0012 P1).
+  [[nodiscard]] const std::optional<double>& dumpIntervalSeconds() const;
 
  private:
   struct Configured {
     std::string context;
-    NNCacheDiskAdmission shutdownAdmission;
+    NNCacheDiskAdmission dumpAdmission;
+    std::optional<double> dumpIntervalSeconds;
   };
   explicit AnalysisCacheLifecycle(std::optional<Configured> configured);
   std::optional<Configured> configured_;
@@ -139,9 +175,18 @@ class AnalysisCacheLifecycle {
   const AnalysisCacheLifecycle& lifecycle
 );
 
-// What one clean shutdown's dumping did, in the two figures an operator has to be able to read
-// off the log: whether anything went wrong, and how much was written.
-struct AnalysisCacheShutdownDumpReport {
+// WHY AN ENGINE-DRIVEN DUMP IS HAPPENING. It changes nothing about what the dump does; it changes
+// the words in the log line, and an operator reading "this leaf wrote 4,000 entries" needs to know
+// whether that was the interval or the exit (ADR-0008: the two are different events, so the record
+// distinguishes them rather than making the reader infer it from a timestamp).
+enum class AnalysisCacheDumpOccasion {
+  Interval,
+  Shutdown,
+};
+
+// What one engine-driven dumping pass did, in the figures an operator has to be able to read off
+// the log: whether anything went wrong, and how much was written.
+struct AnalysisCacheDumpReport {
   // One line per model dumped or failed, in hosting order.
   std::vector<std::string> lines;
   int64_t modelsDumped;
@@ -150,29 +195,125 @@ struct AnalysisCacheShutdownDumpReport {
   int64_t entriesWritten;
 };
 
-// SHUTDOWN. Dumps what=both, under the configured admission, for every hosted model that still
-// has the configured context attached. Does nothing when the lifecycle is not configured.
+// ONE ENGINE-DRIVEN DUMPING PASS. Dumps what=both, under the configured admission, for every
+// hosted model that has the configured context attached. Does nothing when the lifecycle is not
+// configured.
 //
-// SKIPS A MODEL WHOSE CONTEXT IS NO LONGER ATTACHED, silently and correctly: a client that sent
+// ONE FUNCTION FOR BOTH OCCASIONS, not two. The periodic dump and the shutdown dump are the same
+// act -- same verb, same admission, same skip rule -- and writing them twice would be two authors
+// of one behaviour, drifting the first time one of them gained a field (ADR-0012 P1).
+//
+// SKIPS A MODEL WHOSE CONTEXT IS NOT ATTACHED, silently and correctly: a client that sent
 // cache_detach by wire already decided what happened to that work, and cache_detach refuses to
 // discard undumped state unless the client said discardUndumped. Re-attaching it here to dump it
 // anyway would overrule that decision.
 //
-// NEVER THROWS. A shutdown is not a place to raise: the process is on its way out, the client is
-// gone, and an exception here would replace an orderly exit with an abort that says less. Every
-// failure is CAUGHT, COUNTED and put in `lines` for the caller to print to stderr, and the next
-// model is still dumped (ADR-0002: the loss is said, never silent). The observation-loss
-// disposition on a failed counts append is the one cacheDumpExecute already owns -- taken counts
-// are not re-armed, and its refusal text says how many rows and observations went with them --
-// so that text is carried into the line verbatim rather than restated here.
+// NEVER THROWS, and that is load-bearing at both call sites: at shutdown the process is on its way
+// out and an exception would replace an orderly exit with an abort that says less; on the interval
+// it runs on a bare thread, where an escaping exception is std::terminate and takes the whole
+// engine down over a failed write. Every failure is CAUGHT -- including the ones that are not
+// StringError -- COUNTED, and put in `lines` for the caller to log, and the next model is still
+// dumped (ADR-0002: the loss is said, never silent). The observation-loss disposition on a failed
+// counts append is the one cacheDumpExecute already owns -- taken counts are not re-armed, and its
+// refusal text says how many rows and observations went with them -- so that text is carried into
+// the line verbatim rather than restated here.
 //
-// CALLED WITH EVERY ANALYSIS THREAD ALREADY JOINED, which is why it passes an open-request count
-// of zero: at that point there is exactly one thread left in the process and no request can be
-// open. The count is reported in a dump's response; here it is a fact, not an estimate.
-[[nodiscard]] AnalysisCacheShutdownDumpReport analysisCacheShutdownDump(
+// THE CALLER MUST HOLD THE CACHE-ACTION MUTEX (see AnalysisCachePeriodicDumper). This function
+// reads `attachments`, which the request loop's cache verbs write.
+//
+// `openRequestCount` is reported in each dump's response, verbatim, as the engine's own record of
+// whether this dump was taken at rest. At shutdown it is zero and that is a fact rather than a
+// sample -- every analysis thread has been joined. On the interval it is whatever was open, which
+// is exactly what a client reading the log wants to know.
+[[nodiscard]] AnalysisCacheDumpReport analysisCacheDumpAttachedContexts(
   const AnalysisModelHosts& hosts,
   AnalysisCacheAttachments& attachments,
-  const AnalysisCacheLifecycle& lifecycle
+  const AnalysisCacheLifecycle& lifecycle,
+  AnalysisCacheDumpOccasion occasion,
+  int64_t openRequestCount
 );
+
+// THE PERIODIC DUMP, ON ITS OWN THREAD, because the engine it protects can be killed at any moment.
+//
+// WHY THIS EXISTS AT ALL. The shutdown dump only fires on a clean exit, and in the deployment this
+// is for a clean exit is not the normal way a leaf stops: leaves are long-lived and are ended by
+// machine shutdown or by an arbitrary kill when the box needs the memory (operator ruling, ledger
+// row 1879). So the shutdown dump is BEST EFFORT and this is the primary persistence mechanism.
+// The interval is the bound on how much one kill can cost.
+//
+// WHY A THREAD AND NOT THE REQUEST LOOP. A dump takes real time and holds the context's EXCLUSIVE
+// file lock while it does. Run on the request loop it would stop the engine reading stdin -- and,
+// worse, an idle leaf's request loop is blocked in a read that may not return for hours, so a
+// timer that only fired when the loop next woke would not fire at all on exactly the leaf that has
+// most to lose. It touches no structure an analysis thread touches on the get/set path, which is
+// what makes running it beside live searches legal (see cacheDumpExecute's own note).
+//
+// WHAT IT IS SERIALIZED AGAINST, and how. `cacheActionMutex` is supplied by the engine and is held
+// by the request loop around every cache_attach / cache_detach / cache_dump / cache_stats, and by
+// this thread around each dumping pass. That is the whole of the concurrency design: the shared
+// mutable state is AnalysisCacheAttachments and the level-0 resolution list, both of which the
+// wire verbs write, and one mutex around both writers and this reader is a rule that fits in a
+// sentence. Contention is nil in practice -- a client's cache verbs happen at session boundaries,
+// which is when this thread is asleep -- and where it is not nil the cost falls on the client's
+// verb, never on a search.
+//
+// OVERLAP IS NOT POSSIBLE, BY CONSTRUCTION RATHER THAN BY A GUARD. One thread does the dumps, and
+// it waits the full interval AFTER a pass finishes rather than on a fixed schedule. So a pass that
+// takes longer than the interval cannot be joined by a second one; it simply pushes the next start
+// later, and the effective period becomes interval + duration. An operator whose dumps take longer
+// than their interval sees that in the log's timestamps, and the honest fix is a longer interval,
+// not a queue of overlapping writers contending for one exclusive lock.
+class AnalysisCachePeriodicDumper {
+ public:
+  // `report` is called from the dumping thread, once per line, and must be safe to call from a
+  // thread other than the one that constructed this (Logger::write is).
+  AnalysisCachePeriodicDumper(
+    const AnalysisModelHosts& hosts,
+    AnalysisCacheAttachments& attachments,
+    std::mutex& cacheActionMutex,
+    const AnalysisCacheLifecycle& lifecycle,
+    std::function<int64_t()> openRequestCount,
+    std::function<void(const std::string&)> report
+  );
+  // Stops and joins, so the thread cannot outlive the evaluators it dumps from.
+  ~AnalysisCachePeriodicDumper();
+  AnalysisCachePeriodicDumper(const AnalysisCachePeriodicDumper&) = delete;
+  AnalysisCachePeriodicDumper& operator=(const AnalysisCachePeriodicDumper&) = delete;
+
+  // Starts the thread. A no-op when the lifecycle is unconfigured or its interval is off, so the
+  // caller does not have to ask -- an engine that was told not to dump periodically simply has no
+  // thread, rather than one that wakes up and decides to do nothing.
+  void start();
+  // Wakes the thread and joins it. Idempotent, and safe to call when start() never did anything.
+  // RETURNS ONLY ONCE ANY DUMP IN FLIGHT HAS FINISHED: a half-written append is not something to
+  // abandon to make a shutdown faster, and the append is the part that holds the file lock.
+  void stop();
+
+  // Read after stop() for the session's own accounting. Both are also visible while running.
+  [[nodiscard]] int64_t passesPerformed() const;
+  // Passes in which at least one model's dump failed. Nonzero means the log holds error lines.
+  [[nodiscard]] int64_t passesWithAFailure() const;
+  [[nodiscard]] int64_t entriesWritten() const;
+
+ private:
+  void loop();
+
+  const AnalysisModelHosts& hosts;
+  AnalysisCacheAttachments& attachments;
+  std::mutex& cacheActionMutex;
+  const AnalysisCacheLifecycle& lifecycle;
+  std::function<int64_t()> openRequestCount;
+  std::function<void(const std::string&)> report;
+
+  std::thread thread;
+  std::mutex wakeMutex;
+  std::condition_variable wake;
+  bool stopping = false;
+  bool started = false;
+
+  std::atomic<int64_t> passesPerformed_{0};
+  std::atomic<int64_t> passesWithAFailure_{0};
+  std::atomic<int64_t> entriesWritten_{0};
+};
 
 #endif  // COMMAND_ANALYSISCACHELIFECYCLE_H_
