@@ -390,6 +390,69 @@ void testCountLogTornTailIsRepairedByTruncationBeforeTheNextAppend() {
   testAssert(rowFor(contents, 4).observations == 40);
 }
 
+// The state truncation newly makes reachable, and the count log's twin of the evaluation
+// container's own test for it. A crash during the very first dump leaves a file that exists
+// and carries nothing this build can read; the repair shortens it to zero bytes, where the
+// rewrite it replaced would have left a fresh header behind. The next append must write that
+// header rather than append a block to a headerless log.
+//
+// IT HAS A TWIN FOR A REASON. The whole truncation change rests on the two formats keeping
+// ONE torn-tail contract, and a contract tested in one of its two implementations is a
+// contract in one of them.
+void testCountLogRepairsALogWhoseIntactPartIsEmpty() {
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
+  const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "emptyintact");
+
+  log.appendDump(deltaOf({{1, 10}}, 0));
+  // A crash before even the file header was whole.
+  truncateTo(log.path(), 12);
+
+  const NNCacheCountLogAppendResult appended = log.appendDump(deltaOf({{2, 20}}, 0));
+  testAssert(appended.tornTailBytesDiscarded == 12);
+  testAssert(appended.tailRepair == NNCacheFileTailRepair::Truncated);
+  // The header is part of what was appended, because the file had none left.
+  testAssert(sizeOf(log.path()) == appended.bytesAppended);
+
+  const NNCacheCountLogContents contents = log.load();
+  testAssert(contents.tail() == NNCacheCountLogTail::Intact);
+  testAssert(contents.blocksApplied() == 1);
+  testAssert(!hasRowFor(contents, 1));
+  testAssert(rowFor(contents, 2).observations == 20);
+}
+
+// compactIfNeeded's TORN-BUT-UNDER-THE-MULTIPLE arm, the count log's twin of the container's:
+// it shortens and rewrites nothing, and says which by name.
+void testCountLogCompactIfNeededTruncatesATornTailRatherThanCompacting() {
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
+  const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "torntrunc");
+
+  // Distinct keys per dump, so the physical record count equals the live set and the
+  // over-multiple trigger cannot fire.
+  log.appendDump(deltaOf({{1, 10}}, 0));
+  log.appendDump(deltaOf({{2, 20}}, 0));
+  const int64_t intactSize = sizeOf(log.path());
+  const vector<uint8_t> intactPrefix = readBytesAt(log.path(), 0, (size_t)intactSize);
+
+  log.appendDump(deltaOf({{3, 30}}, 0));
+  truncateTo(log.path(), sizeOf(log.path()) - 5);
+
+  testAssert(log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple()) ==
+             NNCacheFileMaintenance::TruncatedTornTail);
+  testAssert(sizeOf(log.path()) == intactSize);
+  testAssert(readBytesAt(log.path(), 0, (size_t)intactSize) == intactPrefix);
+
+  const NNCacheCountLogContents contents = log.load();
+  testAssert(contents.tail() == NNCacheCountLogTail::Intact);
+  // TWO blocks, not one: a compaction would have collapsed them, and this did not compact.
+  testAssert(contents.blocksApplied() == 2);
+  testAssert(rowFor(contents, 1).observations == 10);
+  testAssert(rowFor(contents, 2).observations == 20);
+  testAssert(!hasRowFor(contents, 3));
+
+  testAssert(log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple()) ==
+             NNCacheFileMaintenance::Nothing);
+}
+
 // Compaction preserves every total and shrinks the file; a crash mid-compaction leaves the
 // original intact.
 void testCountLogCompactionPreservesTotalsAndSurvivesACrash() {
@@ -579,6 +642,8 @@ void Tests::runNNCacheCountLogTests() {
   testCountLogAWholeButCorruptBlockIsRejectedByItsChecksum();
   testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved();
   testCountLogTornTailIsRepairedByTruncationBeforeTheNextAppend();
+  testCountLogRepairsALogWhoseIntactPartIsEmpty();
+  testCountLogCompactIfNeededTruncatesATornTailRatherThanCompacting();
   testCountLogCompactionPreservesTotalsAndSurvivesACrash();
   testCountLogOrdersByLookupsAndNotBySessions();
   testCountLogRefusesWhatItCannotHonor();

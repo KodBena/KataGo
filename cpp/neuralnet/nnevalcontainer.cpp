@@ -590,16 +590,19 @@ const int64_t DROP_BEHIND_CHUNK_BYTES = 8 << 20;
 // the other is a disk that could not be read, and treating the second as the first would
 // have the write path truncate a perfectly good card down to wherever the read happened to
 // fail (ADR-0002).
+// `buf` is the caller's scratch, reused across blocks: a fresh allocation per block would be
+// a heap round trip inside the loop this whole function exists to keep cheap.
 bool checksumRegion(
   NNCacheFileHandle& f,
   int64_t regionStartOffset,
   int64_t regionBytes,
   uint64_t seed,
+  std::vector<uint8_t>& buf,
   uint64_t& ret,
   bool& readFailed
 ) {
   NNCacheFileChecksum sum(seed);
-  std::vector<uint8_t> buf(STREAM_BUFFER_BYTES);
+  buf.resize(STREAM_BUFFER_BYTES);
   int64_t left = regionBytes;
   int64_t consumedFrom = regionStartOffset;
   int64_t consumedTo = regionStartOffset;
@@ -706,6 +709,8 @@ ScanResult scanContainer(
   result.intactEndOffset = offset;
 
   std::vector<uint8_t> headerArray;
+  // The checksum stream's scratch, owned by the scan and reused across every block.
+  std::vector<uint8_t> streamBuffer;
 
   while(true) {
     const int64_t remaining = fileSize - offset;
@@ -758,7 +763,7 @@ ScanResult scanContainer(
     const int64_t regionStart = offset + (int64_t)BLOCK_HEADER_BYTES;
     uint64_t actualChecksum = 0;
     bool readFailed = false;
-    if(!checksumRegion(f, regionStart, regionBytes, contextHash, actualChecksum, readFailed)) {
+    if(!checksumRegion(f, regionStart, regionBytes, contextHash, streamBuffer, actualChecksum, readFailed)) {
       if(readFailed)
         throw StringError(
           "NNEvalContainer: could not read the entries of a block of " + path + " at offset " +

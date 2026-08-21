@@ -282,7 +282,7 @@ void NNCacheFileSync::directoryOf(const std::string& path) {
 #ifndef _WIN32
   const size_t slash = path.find_last_of('/');
   const std::string dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
-  const int fd = ::open(dir.c_str(), O_RDONLY);
+  const int fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC);
   if(fd < 0)
     return;
   (void)::fsync(fd);
@@ -300,7 +300,7 @@ void NNCacheFileTruncate::toLength(const std::string& path, int64_t bytes) {
     );
 
 #ifdef _WIN32
-  const int fd = ::_open(path.c_str(), _O_WRONLY | _O_BINARY);
+  const int fd = ::_open(path.c_str(), _O_WRONLY | _O_BINARY | _O_NOINHERIT);
   if(fd < 0)
     throw StringError(
       "NNCacheFileTruncate: could not open " + path + " to shorten it to " +
@@ -328,8 +328,17 @@ void NNCacheFileTruncate::toLength(const std::string& path, int64_t bytes) {
   }
   const bool synced = ::_commit(fd) == 0;
   ::_close(fd);
+  if(!synced)
+    throw StringError(
+      "NNCacheFileTruncate: shortened " + path + " to " + Global::int64ToString(bytes) +
+      " bytes but could not commit the new length."
+    );
 #else
-  const int fd = ::open(path.c_str(), O_WRONLY);
+  // O_CLOEXEC because this descriptor exists for two syscalls and has no business surviving
+  // into a child: an engine host forks, and a leaked write descriptor onto a cache file is
+  // exactly the kind of handle that keeps an unlinked inode alive or lets a child write where
+  // nothing intended it to.
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
   if(fd < 0)
     throw StringError(
       "NNCacheFileTruncate: could not open " + path + " to shorten it to " +
@@ -360,19 +369,23 @@ void NNCacheFileTruncate::toLength(const std::string& path, int64_t bytes) {
   // crash, and a block appended past it would be stranded at an offset no loader reaches --
   // exactly the failure the repair exists to prevent.
   const bool synced = ::fsync(fd) == 0;
-  const int syncErr = errno;
-  ::close(fd);
+  const int syncErr = synced ? 0 : errno;
+  // The close's own result is checked too. After an explicit fsync there is normally nothing
+  // left for it to report, but on a filesystem that defers errors to close (NFS) it is the
+  // last place a write error can surface, and this file's posture everywhere else is to say
+  // so rather than discard it (ADR-0002).
+  const bool closed = ::close(fd) == 0;
+  const int closeErr = closed ? 0 : errno;
   if(!synced)
     throw StringError(
       "NNCacheFileTruncate: shortened " + path + " to " + Global::int64ToString(bytes) +
       " bytes but could not fsync the new length: " + std::strerror(syncErr) + "."
     );
-#endif
-#ifdef _WIN32
-  if(!synced)
+  if(!closed)
     throw StringError(
-      "NNCacheFileTruncate: shortened " + path + " to " + Global::int64ToString(bytes) +
-      " bytes but could not commit the new length."
+      "NNCacheFileTruncate: shortened and synced " + path + " to " +
+      Global::int64ToString(bytes) + " bytes but closing it reported: " +
+      std::strerror(closeErr) + "."
     );
 #endif
   // The length lives in the inode, not the directory entry, so no directory fsync is needed

@@ -842,6 +842,80 @@ void testEvalContainerRepairsAContainerWhoseIntactPartIsEmpty() {
   assertSameEvaluation(*b, entryFor(contents, 2));
 }
 
+// The OTHER empty-intact-part arm: the fixed part of the file header is whole and says a
+// model name follows, and the name does not. The scan reaches that through a different
+// branch than the too-short-for-the-fixed-header one above, and it reports the same intact
+// end of zero -- so the same header-writing duty applies and is checked separately rather
+// than assumed to follow from its sibling.
+void testEvalContainerRepairsAContainerTornInsideItsOwnHeader() {
+  ScopedTempDir dir;
+  const NNEvalContainer container = containerIn(dir, "hdrtorn");
+
+  const shared_ptr<NNOutput> a = makeOutput(1, 1, 19, 19, true);
+  container.appendBlock({asStored(a)});
+  // Past the 48 fixed bytes and short of the declared header: the name is half there.
+  const int64_t insideTheName = (int64_t)NNEvalContainer::fixedFileHeaderBytes() + 4;
+  testAssert(insideTheName < NNEvalContainer::fileHeaderBytesFor(MODEL));
+  truncateTo(container.path(), insideTheName);
+
+  const shared_ptr<NNOutput> b = makeOutput(2, 1, 9, 9, false);
+  const NNEvalContainerAppendResult appended = container.appendBlock({asStored(b)});
+  testAssert(appended.tornTailBytesDiscarded == insideTheName);
+  testAssert(appended.tailRepair == NNCacheFileTailRepair::Truncated);
+  testAssert(sizeOf(container.path()) == appended.bytesAppended);
+
+  const NNEvalContainerContents contents = container.load();
+  testAssert(contents.tail() == NNEvalContainerTail::Intact);
+  testAssert(contents.blocksApplied() == 1);
+  testAssert(!hasEntryFor(contents, 1));
+  assertSameEvaluation(*b, entryFor(contents, 2));
+}
+
+// compactIfNeeded's TORN-BUT-UNDER-THE-MULTIPLE arm: it shortens the file and rewrites
+// nothing, and says so by name. The distinction is the whole reason the return is typed --
+// at 10-20 GB per card, reporting this as a compaction describes a rewrite that did not
+// happen -- so it is asserted on the file too: the surviving prefix is untouched and the
+// inode is the same one, which a rewrite-through-rename could not manage.
+void testEvalContainerCompactIfNeededTruncatesATornTailRatherThanCompacting() {
+  ScopedTempDir dir;
+  const NNEvalContainer container = containerIn(dir, "torntrunc");
+
+  // Two dumps of DISTINCT keys, so the live set equals the physical entry count and the
+  // over-multiple trigger cannot fire whatever the multiple is.
+  const shared_ptr<NNOutput> a = makeOutput(1, 1, 19, 19, true);
+  const shared_ptr<NNOutput> b = makeOutput(2, 1, 9, 9, false);
+  container.appendBlock({asStored(a)});
+  container.appendBlock({asStored(b)});
+  const int64_t intactSize = sizeOf(container.path());
+  const vector<uint8_t> intactPrefix = readBytesAt(container.path(), 0, (size_t)intactSize);
+
+  // Now a torn tail, with no size trigger behind it.
+  const shared_ptr<NNOutput> c = makeOutput(3, 1, 19, 19, false);
+  {
+    const NNEvalContainer other = containerIn(dir, "torntrunc");
+    other.appendBlock({asStored(c)});
+  }
+  truncateTo(container.path(), sizeOf(container.path()) - 5);
+
+  testAssert(container.compactIfNeeded(NNEvalContainer::defaultCompactionMultiple()) ==
+             NNCacheFileMaintenance::TruncatedTornTail);
+  // Shortened back to exactly the intact prefix, byte for byte, and nothing appended.
+  testAssert(sizeOf(container.path()) == intactSize);
+  testAssert(readBytesAt(container.path(), 0, (size_t)intactSize) == intactPrefix);
+
+  const NNEvalContainerContents contents = container.load();
+  testAssert(contents.tail() == NNEvalContainerTail::Intact);
+  // TWO blocks, not one: a compaction would have collapsed them, and this did not compact.
+  testAssert(contents.blocksApplied() == 2);
+  assertSameEvaluation(*a, entryFor(contents, 1));
+  assertSameEvaluation(*b, entryFor(contents, 2));
+  testAssert(!hasEntryFor(contents, 3));
+
+  // And with the tail now intact and the multiple still unmet, it does nothing at all.
+  testAssert(container.compactIfNeeded(NNEvalContainer::defaultCompactionMultiple()) ==
+             NNCacheFileMaintenance::Nothing);
+}
+
 // Compaction preserves the merged live set -- including the never-lose-an-ownermap rule --
 // shrinks the file, and a crash mid-compaction leaves the original intact.
 void testEvalContainerCompactionPreservesTheLiveSetAndSurvivesAStaleTemp() {
@@ -1087,6 +1161,8 @@ void Tests::runNNEvalContainerTests() {
   testEvalContainerACorruptBlockHeaderDoesNotProduceAPartialApplication();
   testEvalContainerTornTailIsRepairedByTruncationBeforeTheNextAppend();
   testEvalContainerRepairsAContainerWhoseIntactPartIsEmpty();
+  testEvalContainerRepairsAContainerTornInsideItsOwnHeader();
+  testEvalContainerCompactIfNeededTruncatesATornTailRatherThanCompacting();
   testEvalContainerCompactionPreservesTheLiveSetAndSurvivesAStaleTemp();
   testEvalContainerRefusesWhatItCannotHonor();
 
