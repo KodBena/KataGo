@@ -688,6 +688,16 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheObservation
     row.sessions = 1;  // one dump, one session credited per key present in it
     rows.push_back(row);
   }
+  // NOTHING TO SAY: no key this dump would report on, and no unattributed observation
+  // either. Mirrors the sibling rule NNEvalContainer's dump states for itself
+  // (nncachedump.h: "An empty plan appends NOTHING AT ALL -- not a zero-entry block") --
+  // an empty block here would still be 32 bytes of pure framing and one more block for
+  // every future load to walk, growing the file forever on an idle context while recording
+  // no fact at all. The torn-tail repair above is unaffected: it is a fact about the file as
+  // found, not about this dump's own (empty) content.
+  if(rows.empty() && ledger.unrecordedObservations() == 0)
+    return result;
+
   const std::vector<uint8_t> block = encodeBlock(rows, ledger.unrecordedObservations(), contextHash_, path_);
 
   const bool fileExists = FileUtils::exists(path_);

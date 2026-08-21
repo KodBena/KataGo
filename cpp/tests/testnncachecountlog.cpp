@@ -177,6 +177,44 @@ void testCountLogAccumulatesAcrossDumps() {
   testAssert(contents.unattributedObservations() == 5);
 }
 
+// A dump with nothing to say -- no key, no unattributed observation -- appends NOTHING, not
+// a zero-record block: mirrors the sibling rule NNEvalContainer's dump states for itself
+// (nncachedump.h). A no-traffic interval/shutdown dumper must not grow this file forever.
+void testCountLogEmptyDumpAppendsNothing() {
+  TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
+  const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "empty");
+
+  // The very first dump of a context is empty: the file must not even be created.
+  const NNCacheCountLogAppendResult firstAppend = log.appendDump(deltaOf({}, 0));
+  testAssert(firstAppend.bytesAppended == 0);
+  testAssert(firstAppend.tornTailBytesDiscarded == 0);
+  testAssert(firstAppend.rewroteTheFile == false);
+  testAssert(!FileUtils::exists(log.path()));
+
+  // A real dump creates the file and writes one block ...
+  log.appendDump(deltaOf({{1, 7}}, 0));
+  const int64_t sizeAfterOneDump = sizeOf(log.path());
+
+  // ... and a second, empty dump leaves it byte-identical.
+  const NNCacheCountLogAppendResult secondAppend = log.appendDump(deltaOf({}, 0));
+  testAssert(secondAppend.bytesAppended == 0);
+  testAssert(secondAppend.tornTailBytesDiscarded == 0);
+  testAssert(secondAppend.rewroteTheFile == false);
+  testAssert(sizeOf(log.path()) == sizeAfterOneDump);
+
+  const NNCacheCountLogContents contents = log.load();
+  testAssert(contents.blocksApplied() == 1);
+  testAssert(rowFor(contents, 1).observations == 7);
+
+  // An empty delta that carries an unattributed-observation count IS something to say, and
+  // is not suppressed: the block is written even though it has no per-key record.
+  const NNCacheCountLogAppendResult unattributedOnly = log.appendDump(deltaOf({}, 4));
+  testAssert(unattributedOnly.bytesAppended > 0);
+  const NNCacheCountLogContents contents2 = log.load();
+  testAssert(contents2.blocksApplied() == 2);
+  testAssert(contents2.unattributedObservations() == 4);
+}
+
 // THE LOAD-BEARING TEST. A crash mid-dump leaves a partial block. Exactly the dumps that
 // completed must survive, and the partial one must not.
 void testCountLogTornTailIsDiscardedAndThePrefixSurvives() {
@@ -515,6 +553,7 @@ void Tests::runNNCacheCountLogTests() {
 
   testCountLogRoundTripsCountsExactly();
   testCountLogAccumulatesAcrossDumps();
+  testCountLogEmptyDumpAppendsNothing();
   testCountLogTornTailIsDiscardedAndThePrefixSurvives();
   testCountLogAWholeButCorruptBlockIsRejectedByItsChecksum();
   testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved();

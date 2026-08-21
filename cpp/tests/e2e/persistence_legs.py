@@ -9,7 +9,7 @@ import json
 import os
 
 from e2e_harness import (
-  COUNT_LOG_BLOCK_HEADER_BYTES, POSITION, context_of, digest_dir, disposition,
+  POSITION, context_of, digest_dir, disposition,
   expected_files_for_context, fingerprint, observation_profile, search_shape,
 )
 
@@ -255,17 +255,14 @@ def run_persistence(w, h, name_a):
   blocks_b4 = context_of(out3["s1"], "card-5455").get("countLogBlocks")
   blocks_af = context_of(out3["s2"], "card-5455").get("countLogBlocks")
   w.check(
-    "P3e the count log is NOT byte-identical: each no-op dump appended an EMPTY BLOCK",
-    ok_seq and grew == 2 * COUNT_LOG_BLOCK_HEADER_BYTES and blocks_af == blocks_b4 + 2
-    and rows_b4 == rows_af,
+    "P3e the count log IS byte-identical across the two no-op dumps",
+    ok_seq and grew == 0 and blocks_af == blocks_b4 and rows_b4 == rows_af,
     "%s grew %d bytes over two no-op dumps; countLogBlocks %s -> %s; countLogRows %s -> %s"
     % (counts, grew, blocks_b4, blocks_af, rows_b4, rows_af),
-    "grew by exactly 2 x %d (one block header each, zero records) and by no content. "
-    "nncachedump.h states the byte-identity rule for the SIBLING container ('An empty plan "
-    "appends NOTHING AT ALL -- not a zero-entry block') and NNCacheCountLog::appendDump does "
-    "not apply it. FILED, not fixed in this increment -- see "
-    "audit-reports/impl-persistence-e2e.md. This leg goes RED if the growth ever becomes "
-    "proportional to content, which is what a lost persisted mark looks like."
-    % COUNT_LOG_BLOCK_HEADER_BYTES,
+    "zero growth and zero new blocks -- a no-op dump appends NOTHING AT ALL, not an empty "
+    "block, mirroring the sibling rule nncachedump.h states for the evaluation container "
+    "('An empty plan appends NOTHING AT ALL -- not a zero-entry block'). This leg goes RED "
+    "if the growth ever becomes proportional to content, which is what a lost persisted "
+    "mark looks like -- or nonzero on a true no-op, which is what this fix closed.",
   )
   print()

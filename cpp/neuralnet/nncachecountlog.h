@@ -36,8 +36,12 @@
 // 128-bit hashes, so there is no clustering to exploit and no ordering worth preserving,
 // and a random-key update against any indexed store rewrites far more than the changed
 // data. An append-only log writes exactly the changed set: 24 bytes per key that this dump
-// has something to say about, plus 32 bytes of framing for the whole dump. At the working
-// figure of ~40,000 entries per context that is ~960 KB.
+// has something to say about, plus 32 bytes of framing for a dump that has anything to say
+// at all. At the working figure of ~40,000 entries per context that is ~960 KB. A dump with
+// NO key to report and no unattributed observation either appends NOTHING -- not even the
+// framing: see appendDump's own statement of this. A context an idle leaf keeps re-dumping
+// on an interval therefore leaves this file byte-identical, rather than growing by one
+// empty block forever.
 //
 // CRASH SAFETY IS APPEND-PLUS-FSYNC AND NOTHING MORE, so the framing has to make a torn
 // tail detectable. See the format description above NNCacheCountLog.
@@ -320,6 +324,12 @@ class NNCacheCountLogDetailedContents {
 };
 
 // What one appendDump did.
+//
+// AN EMPTY DELTA APPENDS NOTHING AT ALL -- not a zero-record block. Mirrors the sibling rule
+// nncachedump.h states for the evaluation container ("An empty plan appends NOTHING AT ALL
+// -- not a zero-entry block"): a delta with no key to report and no unattributed observation
+// is nothing owed, and a block written for it would be pure framing bytes recording no fact.
+// A second dump with no intervening observation therefore leaves the file byte-identical.
 struct NNCacheCountLogAppendResult {
   // Bytes this call added to the file, framing included.
   int64_t bytesAppended;
