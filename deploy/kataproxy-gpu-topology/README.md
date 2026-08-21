@@ -46,8 +46,10 @@ connect gives clean logs.
 3. **Stop the currently running proxy on .68:1235**, then **selector**:
    `set -a; source selector.env; set +a; python ./proxy_server.py`
 
-## Verification (wire examples UNWITNESSED — no websockets client was
-## available from the authoring host; witness them here at first bring-up)
+## Verification (all four probes WITNESSED 2026-08-21 against a loopback
+## deployment of these exact configs — SELECTOR :1245 / RELAY :1246 stood in
+## for :1235/:1236, leaves were the real 1301/1302/1401; re-witness on .68
+## after the switch)
 
 Against `ws://192.168.122.68:1235`, e.g. with `websocat`:
 
@@ -69,6 +71,17 @@ Against `ws://192.168.122.68:1235`, e.g. with `websocat`:
    watch both 1301's and 1302's logs receive dispatches; identical repeat
    queries deterministically prefer one leaf (consistent hashing) — that is
    correct, not a stuck balancer.
+
+Witnessed outputs from the 2026-08-21 loopback run (leaves live, engines
+built at `4e6fd3bd`):
+
+```
+query_version → {"id":"pv","action":"query_version","git_hash":"4e6fd3bd…","version":"1.17.2"}
+query_models  → {"id":"pm","models":[{"label":"main","healthy":true},{"label":"alt","healthy":true}]}
+analyze, no model → {"id":"pa","error":"missing 'model' field for SELECTOR routing","field":"model"}
+analyze model=main / model=alt → moveInfos from the respective branch
+12 distinct analyzes under "main" → relay dispatch events 10× :1301, 6× :1302, 0 fallbacks
+```
 
 ## NN disk cache pairing (the point of the exercise)
 
