@@ -174,6 +174,9 @@ namespace Tests {
   //testnncachecontext.cpp
   void runNNCacheContextTests();
 
+  //testnncacheobservations.cpp
+  void runNNCacheObservationTests();
+
   //testnncachedump.cpp
   void runNNCacheDumpTests();
 

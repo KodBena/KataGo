@@ -563,11 +563,6 @@ int MainCmds::analysis(const vector<string>& args) {
         //The cache context was resolved when the request was parsed, against this very model; this
         //is where that resolution is spent.
         bot->setCacheAttribution(request->cacheAttribution);
-        //Closes the previous analyze request's admission-signal-measurement window and opens
-        //this one's, substituting one per-analyze-request boundary for the one-per-search
-        //boundary NNCacheTable::beginAdmissionSignalMeasurementWindow's own comment names as
-        //the harder-to-reach ideal. A no-op unless nnCacheAdmissionSignalMeasurement is on.
-        modelHosts.searchableEval(request->modelIdx)->cacheTable().beginAdmissionSignalMeasurementWindow();
         bot->setAvoidMoveUntilByLoc(request->avoidMoveUntilByLocBlack,request->avoidMoveUntilByLocWhite);
 
         Player pla = request->nextPla;

@@ -104,12 +104,6 @@ class NNCacheFrozenIndex {
   // line. This class never dereferences it and does not own it.
   NNOutput* payloadAt(uint32_t i) const { return records_[i].payload; }
 
-  // Entry i's PERSISTED MARK: how much of its counter has already been written to the count
-  // log. It lives in the 4 bytes this record has always reserved beside the state word, so
-  // the delta surface costs the structure not one byte and not one extra cache line -- the
-  // mark is in the same 32-byte record the lookup already touched. See
-  // NNCacheFrozen::takeUnpersistedHits.
-  std::atomic<uint32_t>& persistedCountAt(uint32_t i) const { return records_[i].persistedCount; }
   void setPayloadAt(uint32_t i, NNOutput* payload) { records_[i].payload = payload; }
 
   // Every byte this index holds resident, including the key array -- not just the
@@ -132,21 +126,24 @@ class NNCacheFrozenIndex {
  private:
   NNCacheFrozenIndex();
 
-  // One record per entry, in entry order: 16 bytes of key, a 4-byte caller state word, a
-  // 4-byte persisted mark, and an 8-byte caller payload pointer. 32 bytes, two to a cache
-  // line, so a resolved lookup gets the key it must compare, the counter it must bump and
-  // the payload it must hand back in ONE access rather than three. That layout is the whole
-  // difference between meeting and missing SPEC.md 8's floor; see stateAt and payloadAt.
+  // One record per entry, in entry order: 16 bytes of key, a 4-byte caller state word, 4
+  // bytes of alignment padding, and an 8-byte caller payload pointer. 32 bytes, two to a
+  // cache line, so a resolved lookup gets the key it must compare, the counter it must bump
+  // and the payload it must hand back in ONE access rather than three. That layout is the
+  // whole difference between meeting and missing SPEC.md 8's floor; see stateAt and
+  // payloadAt.
   //
-  // The persisted mark occupies the 4 bytes this record reserved from the start. It is not a
-  // new cost and it does not change the record's size, which testnncachedump.cpp asserts
-  // against sizeof rather than trusting from here.
+  // The 4 padding bytes carried a PERSISTED MARK while the count log recorded retrievals and
+  // a dump appended a per-entry delta. Under observation currency nothing appends a level-0
+  // counter to any file -- what a dump writes comes from the base table's observation ledger
+  // (nncacheobservations.h) -- so the mark had no reader left and is gone. The record's size
+  // is unchanged either way, which testnncachedump.cpp asserts against sizeof rather than
+  // trusting from here.
   struct Record {
     Hash128 key;
     mutable std::atomic<uint32_t> state;
-    mutable std::atomic<uint32_t> persistedCount;
     NNOutput* payload;
-    Record() : key(), state(0), persistedCount(0), payload(nullptr) {}
+    Record() : key(), state(0), payload(nullptr) {}
   };
 
   std::vector<Record> records_;    // entry order: records_[i] is entry i
@@ -278,16 +275,16 @@ class NNCacheFrozen {
   [[nodiscard]] bool contains(Hash128 key) const;
 
   // Transfers ownership of `key` to level 1: the entry stops resolving, and the hits it
-  // accrued AND HAS NOT YET PERSISTED are returned so the caller can fold them into the
-  // counter that takes over. Returns nullopt if this index never held the key, or if it was
-  // already shadowed -- in which case nothing is transferred, so a racing second caller
-  // cannot duplicate a count. Idempotent and thread-safe.
+  // accrued are returned so the caller can fold them into the counter that takes over.
+  // Returns nullopt if this index never held the key, or if it was already shadowed -- in
+  // which case nothing is transferred, so a racing second caller cannot duplicate a count.
+  // Idempotent and thread-safe.
   //
-  // UNPERSISTED, not total, and the difference is load-bearing. A count that has already
-  // been written to the count log belongs to the log now; handing it to level 1 as though it
-  // were new would put it in the next dump too, and appendDump adds. The two figures are the
-  // same number until a take has happened, which is why nothing observed this distinction
-  // before the delta surface existed.
+  // THE WHOLE COUNTER MOVES. It used to be the counter minus a persisted mark, because a dump
+  // appended these very retrievals to the count log and a count already written belonged to
+  // the log. Nothing appends retrievals anywhere now (see the Record comment above), so there
+  // is no mark to subtract and no second reading to get wrong: this counter's only consumer
+  // is the whole-table retrieval report, which wants every retrieval it can still account for.
   [[nodiscard]] std::optional<uint32_t> shadow(Hash128 key);
 
   // Adds `amount` to a key's counter without retrieving its evaluation, for folding in
@@ -309,31 +306,6 @@ class NNCacheFrozen {
   // omitted: they are level 1's keys now and their counts are in level 1's ledger, so
   // including them here would put one key on the surface twice.
   [[nodiscard]] std::vector<NNCacheHitCount> harvest() const;
-
-  // THE HITS THAT HAVE NOT REACHED THE COUNT LOG YET, taking them as it reports them.
-  //
-  // Per unshadowed entry: the counter minus this entry's persisted mark, with the mark then
-  // advanced to the counter. An entry whose delta is zero yields NO ROW -- see
-  // NNCacheTable::takeUnpersistedHitCounts for why a dump must not write a row for a key
-  // with nothing to say, and harvest() above for the surface that deliberately does.
-  //
-  // Not const, and not a reporting call: it MOVES the mark. Take it once per dump, from the
-  // dump path, at rest.
-  [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHits();
-
-  // WOULD takeUnpersistedHits() YIELD ANYTHING? Asked without taking, and without moving one
-  // mark.
-  //
-  // It exists because a REFUSAL has to ask this question and cannot use the call above: taking
-  // the delta is what makes the delta safe to append, so a refusal built on it would consume the
-  // very work it refused to lose. The two are held to agree by construction -- this returns true
-  // exactly when that would emit at least one row, reading the same counter against the same
-  // mark under the same shadow test -- rather than by two readings of one rule
-  // (ADR-0012 P1).
-  //
-  // O(entries) worst case and O(1) when the first entry has something to say: it stops at the
-  // first, because "is there any" is answered by one.
-  [[nodiscard]] bool anyUnpersistedHits() const;
 
   // Resident bytes: the index, the counters, the evaluation handles. Not the evaluations
   // themselves -- those are the two payload figures below.

@@ -25,7 +25,6 @@ const char* const NNCacheConfig::KEY_MAX_BYTES = "nnCacheMaxBytes";
 const char* const NNCacheConfig::KEY_REPLACEMENT = "nnCacheReplacement";
 const char* const NNCacheConfig::KEY_SIGHTING_GHOST_POW = "nnCacheSightingGhostPowerOfTwo";
 const char* const NNCacheConfig::KEY_DIR = "nnCacheDir";
-const char* const NNCacheConfig::KEY_ADMISSION_SIGNAL_MEASUREMENT = "nnCacheAdmissionSignalMeasurement";
 
 static const string COLLISION_DIRECT = "direct";
 static const string COLLISION_LINEAR = "linearprobe";
@@ -324,13 +323,6 @@ NNCacheConfig NNCacheConfig::fromCfg(ConfigParser& cfg, int sizePowerOfTwo, int 
       );
     config.cacheDirectory = dir;
   }
-
-  // GATED OFF BY DEFAULT (ledger rows 1652/1655/1660): measures three candidate admission
-  // currencies side by side without changing any admission decision. See
-  // NNCachePresentationLedger's own comment for what it counts and why picking a currency
-  // is deliberately left open.
-  if(cfg.contains(KEY_ADMISSION_SIGNAL_MEASUREMENT))
-    config.admissionSignalMeasurement = cfg.getBool(KEY_ADMISSION_SIGNAL_MEASUREMENT);
 
   // getString(key,possibles) already refuses an unrecognized value naming the whole
   // vocabulary; reuse it rather than re-authoring a second such check (ADR-0012 P1).
@@ -667,7 +659,7 @@ NNCacheStats NNCacheTableDirect::stats() const {
 // The seam
 //-------------------------------------------------------------------------------------
 
-NNCacheTable::NNCacheTable() : attribution_(nullptr), contexts_() {}
+NNCacheTable::NNCacheTable() : attribution_(nullptr), observations_(nullptr), contexts_() {}
 NNCacheTable::~NNCacheTable() {}
 
 //-------------------------------------------------------------------------------------
@@ -684,8 +676,97 @@ NNCacheContextId NNCacheTable::attachCacheContext(const string& name) {
     // chosen twice.
     const int mutexPow = pow < 10 ? pow : 10;
     attribution_.reset(new NNCacheAttributionRecorder(pow, mutexPow));
+    // IN THE SAME STATEMENT, so "attribution ledger exists" and "observation ledger exists"
+    // cannot come apart. Both are allocated by the FIRST attach and by nothing else: a table
+    // with no attached context holds neither, which is what keeps plain play at one
+    // predictable branch and zero bytes. The observation recorder's own mutex pool follows
+    // the same rule from its own constants.
+    const int obsPow = NNCacheObservationRecorder::defaultPowerOfTwo();
+    const int obsMutexPow = obsPow < 10 ? obsPow : 10;
+    observations_.reset(new NNCacheObservationRecorder(obsPow, obsMutexPow));
   }
   return id;
+}
+
+//-------------------------------------------------------------------------------------
+// Observation counting
+//-------------------------------------------------------------------------------------
+
+// Reached only when observations_ is non-null; observe()'s inline body is the null test, and
+// it is the whole of what the no-context configuration pays. See nncacheobservations.h for
+// what an observation is and why this is the only door that counts one.
+void NNCacheTable::recordObservation(Hash128 nnHash, const NNCacheAttribution& attribution) {
+  // NOT A CONTEXT'S OBSERVATION MEANS NOT ANYBODY'S. An observation is written into exactly
+  // one card's file, and a presentation the request could not attribute has no file to go in
+  // -- so it is not counted here rather than being filed under whichever context happened to
+  // be attached first. The population is not silent: an entry earned that way is exactly what
+  // NNCacheAttributionLedger::noAttributableContextEntries reports, and cache_dump surfaces
+  // that figure in every response.
+  if(!attribution.isToContext())
+    return;
+  const NNCacheContextId context = attribution.contextId();
+  if(!contexts_.owns(context))
+    throw StringError(
+      "NNCacheTable::observe: this attribution names a context attached to a different cache. "
+      "Spending it here would count the presentation under whichever context sits at the same "
+      "position in this table's own name space, which is a different card."
+    );
+  observations_->observe(nnHash, (uint32_t)context.index());
+}
+
+// The ownership refusal every per-context surface makes, from one home, so asking against the
+// wrong cache's context is refused rather than answered with a disposition a caller would read
+// as an ordinary "nothing here".
+void NNCacheTable::refuseForeignContext(const NNCacheContextId& context) const {
+  if(!contexts_.owns(context))
+    throw StringError(
+      "NNCacheTable: this context is not attached to this cache, so it has observed nothing "
+      "here. Asking against the wrong cache's context is refused rather than answered with an "
+      "empty row list a caller would read as 'this context was never asked for anything'."
+    );
+}
+
+NNCacheObservationLedger NNCacheTable::takeUnpersistedObservationCountsFor(const NNCacheContextId& context) {
+  refuseForeignContext(context);
+  if(observations_ == nullptr)
+    return NNCacheObservationLedger::notObserved();
+  // The residue is reported WHOLE rather than divided, exactly as every other honesty counter
+  // on a per-context surface is: an unrecorded observation is one whose ROW was refused, so
+  // there is nothing left to say which context it belonged to, and smearing it across contexts
+  // would make every card appear to carry all of it.
+  return NNCacheObservationLedger::observed(
+    observations_->takeUnpersistedFor((uint32_t)context.index()),
+    observations_->unrecordedObservations()
+  );
+}
+
+NNCacheObservationLedger NNCacheTable::harvestObservationCountsFor(const NNCacheContextId& context) const {
+  refuseForeignContext(context);
+  if(observations_ == nullptr)
+    return NNCacheObservationLedger::notObserved();
+  return NNCacheObservationLedger::observed(
+    observations_->harvestFor((uint32_t)context.index()),
+    observations_->unrecordedObservations()
+  );
+}
+
+bool NNCacheTable::hasUnpersistedObservationCountsFor(const NNCacheContextId& context) const {
+  refuseForeignContext(context);
+  if(observations_ == nullptr)
+    return false;
+  return observations_->anyUnpersistedFor((uint32_t)context.index());
+}
+
+NNCacheObservationLedger NNCacheTable::harvestObservationCounts() const {
+  if(observations_ == nullptr)
+    return NNCacheObservationLedger::notObserved();
+  return NNCacheObservationLedger::observed(
+    observations_->harvestAll(), observations_->unrecordedObservations()
+  );
+}
+
+int64_t NNCacheTable::observationStructureBytes() const {
+  return observations_ == nullptr ? 0 : (int64_t)observations_->structureBytes();
 }
 
 const NNCacheContextSet& NNCacheTable::cacheContexts() const {
@@ -773,34 +854,6 @@ vector<Hash128> NNCacheTable::attributedKeysFor(const NNCacheContextId& context)
   return attribution_->keysFor(context);
 }
 
-// Every table that keeps no per-key hit counts answers the per-context question the same way
-// it answers the whole-table one, and for the same reason: there are no counts to partition.
-// The context is still checked, so asking against the wrong cache is refused rather than
-// answered with a disposition that reads as an ordinary "this table does not count".
-NNCacheHitLedger NNCacheTable::harvestHitCountsFor(const NNCacheContextId& context) const {
-  const vector<Hash128> keys = attributedKeysFor(context);
-  (void)keys;
-  return NNCacheHitLedger::notCounted();
-}
-
-// The delta twin's default, through the same ownership check and for the same reason: a table
-// with no counters has no unpersisted counts to divide, and "counted, zero rows" would be a
-// claim it cannot make.
-NNCacheHitLedger NNCacheTable::takeUnpersistedHitCountsFor(const NNCacheContextId& context) {
-  const vector<Hash128> keys = attributedKeysFor(context);
-  (void)keys;
-  return NNCacheHitLedger::notCounted();
-}
-
-// And the non-consuming question's default. FALSE IS THE HONEST ANSWER HERE rather than a hedge:
-// a table that keeps no per-key hit counts has none that are unpersisted, so a detach refusal
-// reading this is told the truth about this table and not "probably nothing".
-bool NNCacheTable::hasUnpersistedHitCountsFor(const NNCacheContextId& context) const {
-  const vector<Hash128> keys = attributedKeysFor(context);
-  (void)keys;
-  return false;
-}
-
 //-------------------------------------------------------------------------------------
 // The unified hit-count surface
 //-------------------------------------------------------------------------------------
@@ -846,82 +899,6 @@ int64_t NNCacheHitLedger::unrecordedHits() const {
 // field, no branch and no allocation from this surface existing.
 NNCacheHitLedger NNCacheTable::harvestHitCounts() const {
   return NNCacheHitLedger::notCounted();
-}
-
-// And the same for the delta surface, for the same reason: a table with no counters has no
-// unpersisted counts either, and saying "counted, zero rows" would be a claim it cannot make.
-NNCacheHitLedger NNCacheTable::takeUnpersistedHitCounts() {
-  return NNCacheHitLedger::notCounted();
-}
-
-//-------------------------------------------------------------------------------------
-// The admission-signal-candidate measurement's base defaults
-//-------------------------------------------------------------------------------------
-//
-// Every table's inherited answer unless NNCacheTableTwoLevel overrides it: gated off is
-// the byte-identical-default this whole axis promises, and a shape that has never heard of
-// this measurement is exactly as "gated off" as one that has but was configured false.
-
-NNCachePresentationLedger NNCacheTable::harvestPresentationCounts() const {
-  return NNCachePresentationLedger::notCounted();
-}
-
-NNCachePresentationLedger NNCacheTable::harvestPresentationCountsFor(const NNCacheContextId& context) const {
-  const vector<Hash128> keys = attributedKeysFor(context);
-  (void)keys;
-  return NNCachePresentationLedger::notCounted();
-}
-
-void NNCacheTable::beginAdmissionSignalMeasurementWindow() {
-  // Deliberately empty. See the declaration: this must be a single predictable no-op for
-  // every table not measuring, which is every table shape except the two-level one, and
-  // that one only when NNCacheConfig::admissionSignalMeasurement was set.
-}
-
-NNCachePresentationLedger::NNCachePresentationLedger(
-  NNCachePresentationLedgerDisposition disposition,
-  vector<NNCachePresentationCount> entries,
-  int64_t unrecordedRaw,
-  int64_t unrecordedDeduped
-)
-  :disposition_(disposition),
-   entries_(std::move(entries)),
-   unrecordedRaw_(unrecordedRaw),
-   unrecordedDeduped_(unrecordedDeduped)
-{}
-
-NNCachePresentationLedger NNCachePresentationLedger::notCounted() {
-  return NNCachePresentationLedger(NNCachePresentationLedgerDisposition::NotCounted, vector<NNCachePresentationCount>(), 0, 0);
-}
-
-NNCachePresentationLedger NNCachePresentationLedger::counted(
-  vector<NNCachePresentationCount> entries, int64_t unrecordedRaw, int64_t unrecordedDeduped
-) {
-  return NNCachePresentationLedger(
-    NNCachePresentationLedgerDisposition::Counted, std::move(entries), unrecordedRaw, unrecordedDeduped
-  );
-}
-
-const vector<NNCachePresentationCount>& NNCachePresentationLedger::entries() const {
-  if(disposition_ != NNCachePresentationLedgerDisposition::Counted)
-    throw StringError(
-      "NNCachePresentationLedger: this table is not measuring the admission-signal candidates "
-      "(NNCacheConfig::admissionSignalMeasurement is false, or this shape never carries the "
-      "axis), so it has no rows to hand out. Check disposition() before asking."
-    );
-  return entries_;
-}
-
-int64_t NNCachePresentationLedger::unrecordedRaw() const {
-  if(disposition_ != NNCachePresentationLedgerDisposition::Counted)
-    throw StringError("NNCachePresentationLedger: not measuring, so no unrecorded-raw count either.");
-  return unrecordedRaw_;
-}
-
-int64_t NNCachePresentationLedger::unrecordedDeduped() const {
-  if(disposition_ != NNCachePresentationLedgerDisposition::Counted)
-    throw StringError("NNCachePresentationLedger: not measuring, so no unrecorded-deduped count either.");
-  return unrecordedDeduped_;
 }
 
 // Builds the collision-resolution layer the shape asks for, then wraps it in the
@@ -1018,8 +995,7 @@ unique_ptr<NNCacheTwoLevelTable> NNCacheTable::createWithLevelZeroList(const NNC
   unique_ptr<NNCacheTwoLevelTable> table = makeTwoLevelNNCacheTable(
     NNCacheFrozen::build(vector<unique_ptr<NNOutput>>()),
     NNCacheTable::create(config),
-    NNCacheAttributionRecorder::defaultPowerOfTwo(),
-    config.admissionSignalMeasurement
+    NNCacheAttributionRecorder::defaultPowerOfTwo()
   );
   const vector<NNCacheLevelZeroSourceId> order = table->levelZeroResolutionOrder();
   testAssert(order.size() == 1);

@@ -1041,6 +1041,7 @@ add_executable(katago
   neuralnet/nncachefrozen.cpp
   neuralnet/nncachetwolevel.cpp
   neuralnet/nncachecontext.cpp
+  neuralnet/nncacheobservations.cpp
   neuralnet/nncachecountlog.cpp
   neuralnet/nncachefileformat.cpp
   neuralnet/nnevalcontainer.cpp
@@ -1096,6 +1097,7 @@ add_executable(katago
   tests/testnncachetwolevelbench.cpp
   tests/testnncachecountlog.cpp
   tests/testnncachecontext.cpp
+  tests/testnncacheobservations.cpp
   tests/testnnevalcontainer.cpp
   tests/testnncachelevelzero.cpp
   tests/testnncachedump.cpp

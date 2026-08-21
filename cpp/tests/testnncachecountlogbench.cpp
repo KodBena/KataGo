@@ -55,25 +55,25 @@ int64_t writeBytesSoFar() {
   return (int64_t)strtoll(p + strlen("write_bytes:"), NULL, 10);
 }
 
-NNCacheHitCountDelta deltaOfSize(int64_t numRows, int64_t serialBase) {
-  vector<NNCacheHitCount> rows;
+NNCacheObservationDelta deltaOfSize(int64_t numRows, int64_t serialBase) {
+  vector<NNCacheObservationCount> rows;
   rows.reserve((size_t)numRows);
   for(int64_t i = 0; i < numRows; i++) {
-    NNCacheHitCount row;
+    NNCacheObservationCount row;
     row.key = nthKey(serialBase + i);
     // A plausible spread rather than a constant, so nothing about the measurement depends
     // on the values compressing -- the format does not compress, and this makes that
     // visible rather than accidental.
-    row.hits = (uint32_t)(1 + (i % 97));
+    row.observations = (uint32_t)(1 + (i % 97));
     rows.push_back(row);
   }
-  return NNCacheHitCountDelta::ofDeltaRows(std::move(rows), 0);
+  return NNCacheObservationDelta::ofDeltaRows(std::move(rows), 0);
 }
 
 void measureOneDumpSize(const string& dir, int64_t numRows, int serial) {
   const string context = "bench" + Global::intToString(serial);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir, context);
-  const NNCacheHitCountDelta ledger = deltaOfSize(numRows, 1);
+  const NNCacheObservationDelta ledger = deltaOfSize(numRows, 1);
 
   const int64_t before = writeBytesSoFar();
   const NNCacheCountLogAppendResult appended = log.appendDump(ledger);
@@ -99,7 +99,7 @@ void measureSecondDumpOntoAnExistingLog(const string& dir, int64_t numRows) {
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir, "benchsecond");
   log.appendDump(deltaOfSize(numRows, 1));
 
-  const NNCacheHitCountDelta ledger = deltaOfSize(numRows, 1);
+  const NNCacheObservationDelta ledger = deltaOfSize(numRows, 1);
   const int64_t before = writeBytesSoFar();
   const NNCacheCountLogAppendResult appended = log.appendDump(ledger);
   const int64_t after = writeBytesSoFar();

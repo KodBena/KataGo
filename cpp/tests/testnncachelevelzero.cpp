@@ -123,9 +123,9 @@ void writeContainerBlock(const string& dir, const vector<shared_ptr<const NNOutp
   testAssert(r.bytesAppended > 0);
 }
 
-void writeCountDump(const string& dir, const vector<NNCacheHitCount>& rows) {
+void writeCountDump(const string& dir, const vector<NNCacheObservationCount>& rows) {
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir, CONTEXT);
-  const NNCacheCountLogAppendResult r = log.appendDump(NNCacheHitCountDelta::ofDeltaRows(rows, 0));
+  const NNCacheCountLogAppendResult r = log.appendDump(NNCacheObservationDelta::ofDeltaRows(rows, 0));
   testAssert(r.bytesAppended > 0);
 }
 
@@ -134,10 +134,10 @@ NNCacheLevelZeroLoadRequest requestFor(const string& dir, NNCacheLevelZeroBound 
   return request;
 }
 
-NNCacheHitCount countRow(int serial, uint32_t hits) {
-  NNCacheHitCount row;
+NNCacheObservationCount countRow(int serial, uint32_t observations) {
+  NNCacheObservationCount row;
   row.key = nthKey(serial);
-  row.hits = hits;
+  row.observations = observations;
   return row;
 }
 
@@ -213,7 +213,7 @@ void testLevelZeroLoadsEveryKeyTheContainerHolds() {
   }
   writeContainerBlock(tmp.path(), written);
 
-  vector<NNCacheHitCount> rows;
+  vector<NNCacheObservationCount> rows;
   for(int i = 0; i < 24; i++)
     rows.push_back(countRow(i, (uint32_t)(100 - i)));
   writeCountDump(tmp.path(), rows);
@@ -299,7 +299,7 @@ void testTheBuildOrderIsDescendingLookupsThenTheUncountedByKey() {
   testAssert(load.report.entriesUncounted == 3);
 
   // The exact order, asserted position by position, because the order IS the deliverable:
-  // key 1 (9 lookups), key 3 (2 lookups), key 4 (COUNTED AT ZERO -- which still outranks a
+  // key 1 (9 observations), key 3 (2 observations), key 4 (COUNTED AT ZERO -- which still outranks a
   // key the log never saw), then the three the log never mentioned, among themselves in key
   // order. The fixture's keys are hashes and are not monotone in their serial, so the last
   // three are stated as a sorted key set rather than as a serial order.
@@ -365,7 +365,7 @@ void testTheSelectionBoundsTakeAPrefixInTheirOwnCurrency() {
     written.push_back(makeOutput(i, 1, 9, 9, false));
   writeContainerBlock(tmp.path(), written);
   // Descending counts by serial: key 0 is the most looked-up. Keys 6 and 7 are uncounted.
-  vector<NNCacheHitCount> rows;
+  vector<NNCacheObservationCount> rows;
   for(int i = 0; i < 6; i++)
     rows.push_back(countRow(i, (uint32_t)(60 - 10 * i)));
   writeCountDump(tmp.path(), rows);
@@ -384,10 +384,10 @@ void testTheSelectionBoundsTakeAPrefixInTheirOwnCurrency() {
     (void)nnCacheReleaseLevelZero(std::move(load.levelZero));
   }
   {
-    // At least 30 lookups: keys 0, 1, 2, 3 (60, 50, 40, 30). An UNCOUNTED key is never
+    // At least 30 observations: keys 0, 1, 2, 3 (60, 50, 40, 30). An UNCOUNTED key is never
     // admitted by a threshold above zero: its count is not zero, it is unknown.
     NNCacheLevelZeroLoad load =
-      nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::minLookups(30)));
+      nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::minObservations(30)));
     testAssert(load.report.entriesInLevelZero == 4);
     for(uint32_t i = 0; i < 4; i++)
       testAssert(load.levelZero->index().keyAt(i) == nthKey((int)i));
@@ -406,10 +406,10 @@ void testTheSelectionBoundsTakeAPrefixInTheirOwnCurrency() {
   }
   {
     // AN UNCOUNTED KEY IS NOT ADMITTED BY A THRESHOLD ABOVE ZERO. Keys 6 and 7 are not in the
-    // count log; every key that is has at least 10 lookups, so a threshold of 10 would admit
+    // count log; every key that is has at least 10 observations, so a threshold of 10 would admit
     // all six counted keys and then meet the two uncounted ones. It stops.
     NNCacheLevelZeroLoad load =
-      nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::minLookups(10)));
+      nnCacheLoadLevelZero(requestFor(tmp.path(), NNCacheLevelZeroBound::minObservations(10)));
     testAssert(load.report.entriesInLevelZero == 6);
     testAssert(load.report.entriesCounted == 6);
     testAssert(load.report.entriesUncounted == 2);

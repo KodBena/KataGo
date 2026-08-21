@@ -140,10 +140,10 @@ void encodeBlockHeader(uint8_t* out, uint32_t recordCount, uint64_t unattributed
   put64(out + 24, checksumOf(out, BLOCK_HEADER_CHECKED_BYTES, contextHash));
 }
 
-void encodeRecord(uint8_t* out, Hash128 key, uint32_t lookups, uint32_t sessions) {
+void encodeRecord(uint8_t* out, Hash128 key, uint32_t observations, uint32_t sessions) {
   put64(out + 0, key.hash0);
   put64(out + 8, key.hash1);
-  put32(out + 16, lookups);
+  put32(out + 16, observations);
   put32(out + 20, sessions);
 }
 
@@ -155,7 +155,7 @@ void encodeRecord(uint8_t* out, Hash128 key, uint32_t lookups, uint32_t sessions
 // exactly one implementation of "where does the intact part of this file end" (ADR-0012 P1).
 struct ScanResult {
   std::vector<NNCacheCountRow> rows;
-  int64_t unattributedLookups = 0;
+  int64_t unattributedObservations = 0;
   int64_t blocksApplied = 0;
   int64_t recordsApplied = 0;
   // Byte offset one past the last intact block. Equal to the file size when the tail is
@@ -251,7 +251,7 @@ ScanResult scanLog(
     for(uint32_t i = 0; i < recordCount; i++) {
       const uint8_t* r = payload.data() + (size_t)i * RECORD_BYTES;
       const Hash128 key(get64(r + 0), get64(r + 8));
-      const uint32_t lookups = get32(r + 16);
+      const uint32_t observations = get32(r + 16);
       const uint32_t sessions = get32(r + 20);
       const std::pair<uint64_t,uint64_t> mapKey(key.hash0, key.hash1);
       const std::map<std::pair<uint64_t,uint64_t>, size_t>::iterator it = indexOfKey.find(mapKey);
@@ -259,22 +259,22 @@ ScanResult scanLog(
         indexOfKey[mapKey] = result.rows.size();
         NNCacheCountRow row;
         row.key = key;
-        row.lookups = (uint64_t)lookups;
+        row.observations = (uint64_t)observations;
         row.sessions = (uint64_t)sessions;
         result.rows.push_back(row);
       }
       else {
-        result.rows[it->second].lookups += (uint64_t)lookups;
+        result.rows[it->second].observations += (uint64_t)observations;
         result.rows[it->second].sessions += (uint64_t)sessions;
       }
       // As-recorded, never accumulated -- this block's own delta row, kept beside (not
       // instead of) the running merge above.
       if(collectBlocks)
-        thisBlock.rows.push_back(NNCacheCountLogBlockRow{key, (uint64_t)lookups, (uint64_t)sessions});
+        thisBlock.rows.push_back(NNCacheCountLogBlockRow{key, (uint64_t)observations, (uint64_t)sessions});
     }
-    result.unattributedLookups += (int64_t)get64(blockHeader + 8);
+    result.unattributedObservations += (int64_t)get64(blockHeader + 8);
     if(collectBlocks) {
-      thisBlock.unattributedLookups = (int64_t)get64(blockHeader + 8);
+      thisBlock.unattributedObservations = (int64_t)get64(blockHeader + 8);
       result.blocks.push_back(std::move(thisBlock));
     }
     result.blocksApplied += 1;
@@ -307,14 +307,14 @@ std::vector<uint8_t> encodeBlock(
     // name rather than wrapped or clamped. The largest lifetime reference count in the
     // operator's own corpus is 11,997, so this refuses an unreachable state -- which is
     // exactly why it can afford to be a refusal rather than a policy.
-    if(rows[i].lookups > 0xFFFFFFFFull || rows[i].sessions > 0xFFFFFFFFull)
+    if(rows[i].observations > 0xFFFFFFFFull || rows[i].sessions > 0xFFFFFFFFull)
       throw StringError(
         "NNCacheCountLog: " + path + ": key " + rows[i].key.toString() +
-        " has accumulated totals (" + Global::uint64ToString(rows[i].lookups) + " lookups, " +
+        " has accumulated totals (" + Global::uint64ToString(rows[i].observations) + " observations, " +
         Global::uint64ToString(rows[i].sessions) + " sessions) that do not fit a 32-bit record field."
       );
     encodeRecord(out.data() + BLOCK_HEADER_BYTES + i * RECORD_BYTES, rows[i].key,
-                 (uint32_t)rows[i].lookups, (uint32_t)rows[i].sessions);
+                 (uint32_t)rows[i].observations, (uint32_t)rows[i].sessions);
   }
   const uint64_t payloadChecksum = checksumOf(out.data() + BLOCK_HEADER_BYTES, rows.size() * RECORD_BYTES, contextHash);
   encodeBlockHeader(out.data(), (uint32_t)rows.size(), (uint64_t)unattributed, payloadChecksum, contextHash);
@@ -381,29 +381,29 @@ void verifyContextName(const std::string& context) {
 
 NNCacheCountLogContents::NNCacheCountLogContents(
   std::vector<NNCacheCountRow> rows,
-  int64_t unattributedLookups,
+  int64_t unattributedObservations,
   NNCacheCountLogTail tail,
   int64_t discardedTailBytes,
   int64_t blocksApplied,
   int64_t recordsApplied
 )
   :rows_(std::move(rows)),
-   unattributedLookups_(unattributedLookups),
+   unattributedObservations_(unattributedObservations),
    tail_(tail),
    discardedTailBytes_(discardedTailBytes),
    blocksApplied_(blocksApplied),
    recordsApplied_(recordsApplied)
 {}
 
-std::string NNCacheLookupThreshold::describe() const {
-  if(lookups_ == 0)
+std::string NNCacheObservationThreshold::describe() const {
+  if(observations_ == 0)
     return "every key, counted or not";
-  return "keys with at least " + Global::uint64ToString(lookups_) + " recorded lookups";
+  return "keys with at least " + Global::uint64ToString(observations_) + " recorded observations";
 }
 
 NNCacheCountLogContents NNCacheCountLogContents::of(
   std::vector<NNCacheCountRow> rows,
-  int64_t unattributedLookups,
+  int64_t unattributedObservations,
   NNCacheCountLogTail tail,
   int64_t discardedTailBytes,
   int64_t blocksApplied,
@@ -419,10 +419,10 @@ NNCacheCountLogContents NNCacheCountLogContents::of(
       std::string(truncated ? "Truncated" : "Intact") + " with " +
       Global::int64ToString(discardedTailBytes) + " discarded bytes."
     );
-  if(discardedTailBytes < 0 || blocksApplied < 0 || recordsApplied < 0 || unattributedLookups < 0)
+  if(discardedTailBytes < 0 || blocksApplied < 0 || recordsApplied < 0 || unattributedObservations < 0)
     throw StringError("NNCacheCountLogContents: a count was negative.");
   return NNCacheCountLogContents(
-    std::move(rows), unattributedLookups, tail, discardedTailBytes, blocksApplied, recordsApplied);
+    std::move(rows), unattributedObservations, tail, discardedTailBytes, blocksApplied, recordsApplied);
 }
 
 NNCacheCountLogDetailedContents::NNCacheCountLogDetailedContents(
@@ -438,13 +438,13 @@ NNCacheCountLogDetailedContents NNCacheCountLogDetailedContents::of(
   return NNCacheCountLogDetailedContents(std::move(aggregate), std::move(blocks));
 }
 
-std::vector<NNCacheCountRow> NNCacheCountLogContents::byDescendingLookups() const {
+std::vector<NNCacheCountRow> NNCacheCountLogContents::byDescendingObservations() const {
   std::vector<NNCacheCountRow> sorted = rows_;
   std::sort(sorted.begin(), sorted.end(), [](const NNCacheCountRow& a, const NNCacheCountRow& b) {
-    if(a.lookups != b.lookups)
-      return a.lookups > b.lookups;
+    if(a.observations != b.observations)
+      return a.observations > b.observations;
     // Ties broken by the key so the order is total and a test can assert it. Nothing here
-    // consults sessions: ordering is by lookups, which is the operator's ruling.
+    // consults sessions: ordering is by observations, which is the operator's ruling.
     if(a.key.hash0 != b.key.hash0)
       return a.key.hash0 < b.key.hash0;
     return a.key.hash1 < b.key.hash1;
@@ -485,9 +485,10 @@ int64_t NNCacheCountLog::bytesForDumpOf(int64_t numRows) {
 
 const std::string& NNCacheCountLog::countsCurrencyDescription() {
   static const std::string desc =
-    "RECORDED RETRIEVALS -- cache hits for a key some earlier dump had already stored -- "
-    "not would-be forward passes. A key evaluated once and never looked up again earns no "
-    "row here at all.";
+    "RECORDED OBSERVATIONS -- how many times this position was presented to the cache under "
+    "this context, hit or miss, which is the count of would-have-been-computed forward "
+    "passes. Not cache hits: a position evaluated once and never asked for again still earns "
+    "a row here, carrying 1.";
   return desc;
 }
 
@@ -501,7 +502,7 @@ NNCacheCountLogContents NNCacheCountLog::load() const {
   const ScanResult scan = scanLog(path_, context_, contextHash_);
   return NNCacheCountLogContents::of(
     scan.rows,
-    scan.unattributedLookups,
+    scan.unattributedObservations,
     scan.tornTailBytes > 0 ? NNCacheCountLogTail::Truncated : NNCacheCountLogTail::Intact,
     scan.tornTailBytes,
     scan.blocksApplied,
@@ -517,7 +518,7 @@ NNCacheCountLogDetailedContents NNCacheCountLog::loadDetailedUnlocked() const {
   ScanResult scan = scanLog(path_, context_, contextHash_, /*collectBlocks=*/true);
   NNCacheCountLogContents aggregate = NNCacheCountLogContents::of(
     scan.rows,
-    scan.unattributedLookups,
+    scan.unattributedObservations,
     scan.tornTailBytes > 0 ? NNCacheCountLogTail::Truncated : NNCacheCountLogTail::Intact,
     scan.tornTailBytes,
     scan.blocksApplied,
@@ -538,10 +539,10 @@ NNCacheCountLogContents NNCacheCountLog::compact() const {
 
 NNCacheCountLogContents NNCacheCountLog::compactUnlocked() const {
   const ScanResult scan = scanLog(path_, context_, contextHash_);
-  rewriteAsOneBlock(path_, scan.rows, scan.unattributedLookups, contextHash_);
+  rewriteAsOneBlock(path_, scan.rows, scan.unattributedObservations, contextHash_);
   return NNCacheCountLogContents::of(
     scan.rows,
-    scan.unattributedLookups,
+    scan.unattributedObservations,
     NNCacheCountLogTail::Intact,
     0,
     1,
@@ -580,41 +581,37 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   return true;
 }
 
-NNCacheHitCountDelta::NNCacheHitCountDelta(NNCacheHitLedger ledger)
+NNCacheObservationDelta::NNCacheObservationDelta(NNCacheObservationLedger ledger)
   :ledger_(std::move(ledger))
 {}
 
-NNCacheHitCountDelta NNCacheHitCountDelta::take(NNCacheTable& table) {
-  return NNCacheHitCountDelta(table.takeUnpersistedHitCounts());
+// The one production door: a per-context take, through the one surface that can perform it.
+// There is no whole-table twin, and see the header for why -- a count log file belongs to one
+// context, and no caller could divide a whole-table delta into per-context files.
+NNCacheObservationDelta NNCacheObservationDelta::takeFor(NNCacheTable& table, const NNCacheContextId& context) {
+  return NNCacheObservationDelta(table.takeUnpersistedObservationCountsFor(context));
 }
 
-// The same act restricted to one context, through the one door that can perform it. It is a
-// second FACTORY and not a second KIND: what it produces is the same delta type, so a
-// per-context dump reaches appendDump by the same barrier a whole-table one does and there is
-// still no expression that converts an absolute harvest into either.
-NNCacheHitCountDelta NNCacheHitCountDelta::takeFor(NNCacheTable& table, const NNCacheContextId& context) {
-  return NNCacheHitCountDelta(table.takeUnpersistedHitCountsFor(context));
+NNCacheObservationDelta NNCacheObservationDelta::ofDeltaRows(
+  std::vector<NNCacheObservationCount> rows, int64_t unrecordedObservations
+) {
+  return NNCacheObservationDelta(NNCacheObservationLedger::observed(std::move(rows), unrecordedObservations));
 }
 
-NNCacheHitCountDelta NNCacheHitCountDelta::ofDeltaRows(std::vector<NNCacheHitCount> rows, int64_t unrecordedHits) {
-  return NNCacheHitCountDelta(NNCacheHitLedger::counted(std::move(rows), unrecordedHits));
+NNCacheObservationDelta NNCacheObservationDelta::notObserved() {
+  return NNCacheObservationDelta(NNCacheObservationLedger::notObserved());
 }
 
-NNCacheHitCountDelta NNCacheHitCountDelta::notCounted() {
-  return NNCacheHitCountDelta(NNCacheHitLedger::notCounted());
-}
-
-NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheHitCountDelta& delta) const {
-  const NNCacheHitLedger& ledger = delta.ledger();
-  // A NotCounted delta is refused here rather than written as a dump of zero rows. That is
-  // the entire reason the disposition is typed: "this table keeps no counts" and "this
-  // session hit nothing" are different facts, and persisting the first as the second would
-  // quietly record that a whole session found nothing worth caching (ADR-0002).
-  if(!ledger.isCounted())
+NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheObservationDelta& delta) const {
+  const NNCacheObservationLedger& ledger = delta.ledger();
+  // A NotObserved delta is refused here rather than written as a dump of zero rows. That is
+  // the entire reason the disposition is typed: "no context is attached to this table" and
+  // "this session was asked for nothing" are different facts, and persisting the first as the
+  // second would quietly record that a whole session found nothing worth caching (ADR-0002).
+  if(!ledger.isObserved())
     throw StringError(
-      "NNCacheCountLog: " + path_ + ": the table reported NotCounted, so there are no per-key "
-      "counts to persist. A single-level table keeps none; counting is a property of the "
-      "two-level strategy."
+      "NNCacheCountLog: " + path_ + ": the table reported NotObserved, so there are no per-key "
+      "observation counts to persist. A table with no attached context observes nothing."
     );
 
   // EXCLUSIVE, taken after the NotCounted refusal so a caller's own malformed dump is refused
@@ -636,26 +633,28 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheHitCountDel
   // silently lost while every call reported success.
   const ScanResult scan = scanLog(path_, context_, contextHash_);
   if(scan.tornTailBytes > 0) {
-    rewriteAsOneBlock(path_, scan.rows, scan.unattributedLookups, contextHash_);
+    rewriteAsOneBlock(path_, scan.rows, scan.unattributedObservations, contextHash_);
     result.tornTailBytesDiscarded = scan.tornTailBytes;
     result.rewroteTheFile = true;
   }
 
-  // Every row the delta carries, including a row whose hits are zero. The delta surface
-  // already omits a key with nothing to say, so a zero row here is a key the caller
-  // deliberately has something to say about, and dropping it would make "never asked for"
-  // indistinguishable from "not present".
-  const std::vector<NNCacheHitCount>& entries = ledger.entries();
+  // EVERY ROW THE DELTA CARRIES, including a key observed exactly once, and including a row
+  // whose observations are zero. The delta surface already omits a key with nothing to say, so
+  // a zero row here is a key the caller deliberately has something to say about, and dropping
+  // it would make "never asked for" indistinguishable from "not present". The once-observed
+  // key is the one that matters most: its count is what the NEXT session adds to, so a dump
+  // that filtered it out would make a seen-twice admission policy permanently unreachable.
+  const std::vector<NNCacheObservationCount>& entries = ledger.entries();
   std::vector<NNCacheCountRow> rows;
   rows.reserve(entries.size());
   for(size_t i = 0; i < entries.size(); i++) {
     NNCacheCountRow row;
     row.key = entries[i].key;
-    row.lookups = (uint64_t)entries[i].hits;
+    row.observations = (uint64_t)entries[i].observations;
     row.sessions = 1;  // one dump, one session credited per key present in it
     rows.push_back(row);
   }
-  const std::vector<uint8_t> block = encodeBlock(rows, ledger.unrecordedHits(), contextHash_, path_);
+  const std::vector<uint8_t> block = encodeBlock(rows, ledger.unrecordedObservations(), contextHash_, path_);
 
   const bool fileExists = FileUtils::exists(path_);
   ScopedFile f(path_, fileExists ? "ab" : "wb");

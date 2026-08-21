@@ -114,16 +114,16 @@ vector<shared_ptr<const NNOutput>> makeBlock(int firstSerial, int count) {
 // The count log's half of a dump, over the same disjoint serial range. A dump writes BOTH of
 // a context's files, so a witness that only looked at the container would leave the file the
 // operator's admission policy actually reads out of the claim.
-NNCacheHitCountDelta makeCountDelta(int firstSerial, int count) {
-  vector<NNCacheHitCount> rows;
+NNCacheObservationDelta makeCountDelta(int firstSerial, int count) {
+  vector<NNCacheObservationCount> rows;
   rows.reserve((size_t)count);
   for(int i = 0; i < count; i++) {
-    NNCacheHitCount row;
+    NNCacheObservationCount row;
     row.key = nthKey(firstSerial + i);
-    row.hits = (uint32_t)(i + 1);
+    row.observations = (uint32_t)(i + 1);
     rows.push_back(row);
   }
-  return NNCacheHitCountDelta::ofDeltaRows(rows, 0);
+  return NNCacheObservationDelta::ofDeltaRows(rows, 0);
 }
 
 // True if this refusal names both the context and the lock file, which is the whole point of
@@ -467,7 +467,7 @@ void testTwoProcessesDumpingOneContextBothLand() {
         NNEvalContainer::forContextAndModel(directory, CONTEXT, MODEL, MODEL_VERSION);
       const NNCacheCountLog log = NNCacheCountLog::forContext(directory, CONTEXT);
       const vector<shared_ptr<const NNOutput>> entries = makeBlock(firstSerial, perDump);
-      const NNCacheHitCountDelta delta = makeCountDelta(firstSerial, perDump);
+      const NNCacheObservationDelta delta = makeCountDelta(firstSerial, perDump);
       awaitStartSignal(signal);
       const int64_t began = nowMicros();
       // A real dump writes both files, so the race is over both.

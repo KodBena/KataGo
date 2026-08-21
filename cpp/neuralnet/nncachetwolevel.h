@@ -46,7 +46,7 @@
 // level-0 source AND carry a level-1 ledger row -- a ledger row outlives the entry a capacity
 // sweep dropped, and a source attached afterwards is not reconciled against it, since attach
 // asks what level 1 HOLDS. Concatenating the two would put that key on the surface twice, and
-// appendDump would then raise its sessions twice for one dump.
+// a reader summing the whole-table retrieval report would count it twice.
 //
 // THE MISS COST IS ONE CHD PROBE PER ATTACHED SOURCE, ~40-110 ns at real sizes, against
 // the 2.4-2.8 ms an avoided evaluation costs. Three orders of magnitude of headroom is not
@@ -333,82 +333,30 @@ class NNCacheLevelZeroSources {
   // nothing: a get increments exactly one source's counter, every counter starts at zero when
   // its source is built or loaded, and a set takes the key out of level 0 entirely
   // (shadowAllHolders), so two holders' counts for one key are disjoint sets of real
-  // retrievals. It is the same rule takeUnpersistedHits below folds by, through the same
-  // function, and the same rule shadowAllHolders already uses at this seam.
+  // retrievals. It is the same rule shadowAllHolders already uses at this seam, through the
+  // one function that owns it.
   //
-  // WHY A LEVEL SUMS HERE, since a level is normally read off the one entry that owns it, and
-  // this call reports one (this session's running total for a key, where takeUnpersistedHits
-  // reports the flow not yet written). The level is a per-KEY quantity, and its ACCRUAL is
-  // spread across entries the moment the resolution order moves: attach A, let it serve the
-  // key twice, attach B which also holds it, detach A, let B serve it once, re-attach A --
-  // attach appends, so A returns at the BACK holding two real retrievals of a key it no
-  // longer resolves. Read off the resolving entry alone, the level answers 1 for a key that
-  // was retrieved 3 times. An entry is where part of a level is KEPT, not what the level is
-  // ABOUT, so the level is the sum over the entries that kept part of it. Levels de-duplicate
-  // only when they live in one place; this one does not.
+  // WHY A LEVEL SUMS HERE, since a level is normally read off the one entry that owns it. The
+  // level is a per-KEY quantity, and its ACCRUAL is spread across entries the moment the
+  // resolution order moves: attach A, let it serve the key twice, attach B which also holds
+  // it, detach A, let B serve it once, re-attach A -- attach appends, so A returns at the BACK
+  // holding two real retrievals of a key it no longer resolves. Read off the resolving entry
+  // alone, the level answers 1 for a key that was retrieved 3 times. An entry is where part of
+  // a level is KEPT, not what the level is ABOUT, so the level is the sum over the entries
+  // that kept part of it. Levels de-duplicate only when they live in one place; this one does
+  // not.
   //
-  // RESOLVED 2026-08-19, closing the KNOWN DIVERGENCE this call carried against
-  // takeUnpersistedHits. It previously emitted the earliest holder's row alone and THREW if a
-  // suppressed row carried a count, on the argument that an unreachable entry can accrue
-  // nothing. The sequence above reaches that state through this class's own public surface
-  // with no poke, so the refusal fired on a legitimate history; the two surfaces now fold by
-  // one rule and the one-owner argument is retired rather than left standing beside a
-  // counter-example.
+  // WHAT THIS IS FOR, now that it is the only counting surface the list has: the whole-table
+  // RETRIEVAL report (cache_stats). No dump reads it -- what a dump writes is observations,
+  // which the base table counts per (key, context) and this list never sees. There is
+  // deliberately no delta twin of this call any more: a delta exists to be appended, and there
+  // is nothing left that would append retrievals to anything.
   //
-  // THE ONE REFUSAL LEFT is a sum that will not fit the 32-bit row a count log record carries.
-  // That is a limit of the OUTPUT TYPE -- no state of this list is legitimate and also
-  // unrepresentable in the row it must be written to -- so it cannot fire on a good state the
-  // way the one-owner tripwire could, and it is refused rather than wrapped (ADR-0002).
+  // THE ONE REFUSAL is a sum that will not fit the 32-bit row the count surface carries. That
+  // is a limit of the OUTPUT TYPE -- no state of this list is legitimate and also
+  // unrepresentable in it -- so it cannot fire on a good state, and it is refused rather than
+  // wrapped (ADR-0002).
   [[nodiscard]] std::vector<NNCacheHitCount> harvest() const;
-
-  // THE HITS THAT HAVE NOT REACHED THE COUNT LOG YET, across every attached source, taking
-  // them as it reports them. The delta twin of harvest() above.
-  //
-  // IT FOLDS BY THE SAME RULE, through the same function: a key held by several sources yields
-  // ONE row whose hits are the SUM of every holder's unpersisted delta. What differs is the
-  // QUANTITY, not the folding -- this reports a FLOW (the retrievals not yet written to the
-  // count log) where harvest reports a LEVEL (the session's running total), and a flow is
-  // CONSERVED: appendDump ADDS each row's lookups to the key's running total, so a delta
-  // dropped here is retrievals gone from the record forever with no honesty counter to show
-  // it. (Recorded 2026-08-19: harvest used to suppress-and-refuse instead, and the divergence
-  // noted here is closed -- see harvest's own comment for the sequence that closed it.)
-  //
-  // THE TWO REAL DIFFERENCES, both about what this call DOES rather than how it folds:
-  //
-  //   EVERY SOURCE IS TAKEN FROM, including one whose rows merge into an earlier source's.
-  //   This call is CONSUMING -- it advances each entry's persisted mark -- so a source skipped
-  //   for being "already covered" would keep its mark behind and re-report the same delta on
-  //   the next take. There is no early exit anywhere in it, and the single-source fast path
-  //   harvest() has is deliberately absent here.
-  //
-  //   A KEY WITH NOTHING TO SAY YIELDS NO ROW, where harvest() deliberately reports a
-  //   pre-warmed entry that earned nothing as a zero. See NNCacheTable::takeUnpersistedHitCounts.
-  //
-  // Not const, and not a reporting call: it MOVES the marks. Take it once per dump, at rest.
-  [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHits();
-
-  // THE SAME TAKE, RESTRICTED TO THE SOURCES ATTACHED ON BEHALF OF `context`, folding by the
-  // same rule through the same function.
-  //
-  // A source serves exactly one context or none, so the restriction is a property of the LIST
-  // and not a filter over rows: a row carries a key, and a key names a position, never a card --
-  // two cards really do share about 3.7% of their keys, so no key-shaped predicate could
-  // divide these rows and any that tried would file one card's retrievals under another.
-  //
-  // Consuming, exactly as the whole-table take is, and only for the sources it visited: a source
-  // of another context keeps its mark, so that context's own dump still finds its delta whole.
-  [[nodiscard]] std::vector<NNCacheHitCount> takeUnpersistedHitsFor(const NNCacheContextId& context);
-
-  // Would takeUnpersistedHitsFor(context) yield anything? Asked without taking and without
-  // moving a mark -- see NNCacheFrozen::anyUnpersistedHits, which this is the list's composition
-  // of, and NNCacheTable::hasUnpersistedHitCountsFor for what needs it.
-  [[nodiscard]] bool anyUnpersistedHitsFor(const NNCacheContextId& context) const;
-
-  // The absolute per-context surface's level-0 half: every unshadowed entry of the sources
-  // attached for `context`, with its running count, in resolution order. The twin of
-  // takeUnpersistedHitsFor, and it reports a pre-warmed entry that earned nothing as a zero
-  // exactly as harvest() does.
-  [[nodiscard]] std::vector<NNCacheHitCount> harvestFor(const NNCacheContextId& context) const;
 
   //---- What the list holds, for stats() -------------------------------------------
 
@@ -581,16 +529,10 @@ class NNCacheTwoLevelTable : public NNCacheTable {
 // holding the full 128-bit key beside each count so a count is never attributed to the
 // wrong key. Throws if either argument cannot be honored.
 //
-// `admissionSignalMeasurement` gates the admission-signal-candidate side counters (see
-// NNCachePresentationLedger). Defaulted to false so every pre-existing caller -- every test
-// in cpp/tests/ that built a two-level table before this axis existed -- keeps building
-// exactly the table it always built, unchanged (ADR-0012 P11: an added parameter must not
-// silently change what an untouched call site gets).
 std::unique_ptr<NNCacheTwoLevelTable> makeTwoLevelNNCacheTable(
   std::unique_ptr<NNCacheFrozen> levelZero,
   std::unique_ptr<NNCacheTable> levelOne,
-  int hitLedgerPowerOfTwo,
-  bool admissionSignalMeasurement = false
+  int hitLedgerPowerOfTwo
 );
 
 // The exact resident cost of the level-1 hit ledger that factory allocates. Named here so

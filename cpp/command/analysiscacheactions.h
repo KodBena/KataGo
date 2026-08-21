@@ -112,7 +112,7 @@ struct CacheAttachRequest {
   // alphabet by the count log and the container before it reaches a path.
   std::string context;
   // What the client lets into the frozen level-0 structure, out of the container's key set
-  // ordered by recorded lookups. Defaults to every key.
+  // ordered by recorded observations. Defaults to every key.
   NNCacheLevelZeroBound levelZeroBound;
   // A byte budget for admitting the level-0 remainder into level 1, or nothing for no fill,
   // which is the default. Denominated in resident bytes, the resource that actually exhausts.

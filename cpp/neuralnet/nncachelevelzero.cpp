@@ -141,9 +141,9 @@ std::vector<NNCacheLevelZeroCandidate> nnCacheLevelZeroOrder(
   const std::vector<NNEvalContainerEntryLocation>& containerEntries,
   const std::vector<NNCacheCountRow>& countRows
 ) {
-  std::map<std::pair<uint64_t,uint64_t>, uint64_t> lookupsOf;
+  std::map<std::pair<uint64_t,uint64_t>, uint64_t> observationsOf;
   for(size_t i = 0; i < countRows.size(); i++)
-    lookupsOf[std::make_pair(countRows[i].key.hash0, countRows[i].key.hash1)] = countRows[i].lookups;
+    observationsOf[std::make_pair(countRows[i].key.hash0, countRows[i].key.hash1)] = countRows[i].observations;
 
   std::vector<NNCacheLevelZeroCandidate> out;
   out.reserve(containerEntries.size());
@@ -153,9 +153,9 @@ std::vector<NNCacheLevelZeroCandidate> nnCacheLevelZeroOrder(
     c.key = loc.key;
     c.containerIndex = i;
     const std::map<std::pair<uint64_t,uint64_t>, uint64_t>::const_iterator it =
-      lookupsOf.find(std::make_pair(loc.key.hash0, loc.key.hash1));
-    c.counted = it != lookupsOf.end();
-    c.lookups = c.counted ? it->second : 0;
+      observationsOf.find(std::make_pair(loc.key.hash0, loc.key.hash1));
+    c.counted = it != observationsOf.end();
+    c.observations = c.counted ? it->second : 0;
     // The RESIDENT cost, which is what the byte bound and the arena reservation are both
     // denominated in: the NNOutput itself plus its ownership map. It is deliberately not the
     // entry's size on disk, which omits the policy slots past the board and the struct
@@ -168,12 +168,12 @@ std::vector<NNCacheLevelZeroCandidate> nnCacheLevelZeroOrder(
 
   std::stable_sort(out.begin(), out.end(),
     [](const NNCacheLevelZeroCandidate& x, const NNCacheLevelZeroCandidate& y) {
-      // Descending lookups first.
-      if(x.lookups != y.lookups)
-        return x.lookups > y.lookups;
+      // Descending observations first.
+      if(x.observations != y.observations)
+        return x.observations > y.observations;
       // Then a key the log mentioned before a key it did not. This is the whole content of
-      // "a container key absent from the count log orders as zero lookups, AFTER every
-      // counted key": at equal lookups -- which for an uncounted key is always zero -- the
+      // "a container key absent from the count log orders as zero observations, AFTER every
+      // counted key": at equal observations -- which for an uncounted key is always zero -- the
       // counted one wins, so a key counted at zero still outranks a key never seen.
       if(x.counted != y.counted)
         return x.counted;
@@ -189,16 +189,16 @@ std::vector<NNCacheLevelZeroCandidate> nnCacheLevelZeroOrder(
 // The bound
 //-------------------------------------------------------------------------------------
 
-NNCacheLevelZeroBound::NNCacheLevelZeroBound(Kind kind, uint64_t lookups, int64_t amount)
-  :kind_(kind), lookups_(lookups), amount_(amount)
+NNCacheLevelZeroBound::NNCacheLevelZeroBound(Kind kind, uint64_t observations, int64_t amount)
+  :kind_(kind), observations_(observations), amount_(amount)
 {}
 
 NNCacheLevelZeroBound NNCacheLevelZeroBound::all() {
   return NNCacheLevelZeroBound(Kind::All, 0, 0);
 }
 
-NNCacheLevelZeroBound NNCacheLevelZeroBound::minLookups(uint64_t lookups) {
-  return NNCacheLevelZeroBound(Kind::MinLookups, lookups, 0);
+NNCacheLevelZeroBound NNCacheLevelZeroBound::minObservations(uint64_t observations) {
+  return NNCacheLevelZeroBound(Kind::MinObservations, observations, 0);
 }
 
 NNCacheLevelZeroBound NNCacheLevelZeroBound::maxEntries(int64_t entries) {
@@ -223,25 +223,25 @@ size_t NNCacheLevelZeroBound::select(const std::vector<NNCacheLevelZeroCandidate
     return ordered.size();
   case Kind::MaxEntries:
     return std::min((size_t)amount_, ordered.size());
-  case Kind::MinLookups: {
-    // A prefix, because the order is descending lookups: the first candidate below the
+  case Kind::MinObservations: {
+    // A prefix, because the order is descending observations: the first candidate below the
     // threshold is followed only by candidates at or below it.
     //
     // AN UNCOUNTED KEY IS ADMITTED ONLY BY A THRESHOLD OF ZERO, and there is NO SEPARATE
     // CHECK FOR IT because there is nothing for one to catch: an uncounted candidate carries
-    // a lookups of 0, so any threshold above zero already excludes it by the comparison
+    // a observations of 0, so any threshold above zero already excludes it by the comparison
     // below. A guard here would read as though it decided something and would in fact be
     // unreachable -- which is worse than its absence, because a later reader would trust it
     // (ADR-0013 Rule 4: the honest disposition of a check that catches nothing is to remove
     // it and say why, not to keep it as reassurance).
     //
-    // THE COMPARISON ITSELF IS NOT WRITTEN HERE. It is NNCacheLookupThreshold::admits, the
+    // THE COMPARISON ITSELF IS NOT WRITTEN HERE. It is NNCacheObservationThreshold::admits, the
     // one home of "this key has been seen often enough", shared with the write side's
     // NNCacheDiskAdmission so the two cannot drift on exactly the boundary case the
     // paragraph above turns on (ADR-0012 P1).
-    const NNCacheLookupThreshold threshold = NNCacheLookupThreshold::of(lookups_);
+    const NNCacheObservationThreshold threshold = NNCacheObservationThreshold::of(observations_);
     size_t taken = 0;
-    while(taken < ordered.size() && threshold.admits(ordered[taken].lookups))
+    while(taken < ordered.size() && threshold.admits(ordered[taken].observations))
       taken += 1;
     return taken;
   }
@@ -268,7 +268,7 @@ size_t NNCacheLevelZeroBound::select(const std::vector<NNCacheLevelZeroCandidate
 std::string NNCacheLevelZeroBound::describe() const {
   switch(kind_) {
   case Kind::All: return "every persisted key";
-  case Kind::MinLookups: return NNCacheLookupThreshold::of(lookups_).describe();
+  case Kind::MinObservations: return NNCacheObservationThreshold::of(observations_).describe();
   case Kind::MaxEntries: return "at most " + Global::int64ToString(amount_) + " entries";
   case Kind::MaxBytes: return "at most " + Global::int64ToString(amount_) + " resident payload bytes";
   default:

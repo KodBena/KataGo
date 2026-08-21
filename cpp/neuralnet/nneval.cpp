@@ -415,13 +415,13 @@ NNCacheAttributionLedger NNEvaluator::harvestCacheAttribution() const {
   return nnCacheTable->harvestAttribution();
 }
 
-NNCacheHitLedger NNEvaluator::harvestCacheHitCountsFor(const NNCacheContextId& context) const {
+NNCacheObservationLedger NNEvaluator::harvestCacheObservationCountsFor(const NNCacheContextId& context) const {
   if(nnCacheTable == nullptr)
     throw StringError(
       "NNEvaluator: model '" + modelName + "' has no NN cache configured, so no context is "
-      "attached to it and none has earned anything here."
+      "attached to it and none has presented anything here."
     );
-  return nnCacheTable->harvestHitCountsFor(context);
+  return nnCacheTable->harvestObservationCountsFor(context);
 }
 
 const std::optional<std::string>& NNEvaluator::getCacheDirectory() const {
@@ -1240,6 +1240,26 @@ void NNEvaluator::evaluate(
       Global::fatalError("SGFMetadata is required for " + modelName + " but was not initialized. Did you specify humanSLProfile=... in katago's config or via overrides?");
     nnHash ^= sgfMeta->getHash(nextPlayer);
   }
+
+  // THE OBSERVATION, COUNTED HERE AND NOWHERE ELSE, and this is the exact point because this
+  // is the moment the position has been named and nothing has been decided about it yet.
+  //
+  // ONE evaluate() IS ONE PRESENTATION, whatever it goes on to do: a hit that returns below, a
+  // miss that runs the net and sets, a skipCache caller that consults no level at all, or the
+  // ownership-map fall-through that does a get, rejects the hit and sets a fuller result. All
+  // four are one request for one position, and the currency the count log records is exactly
+  // "how often does this position come up" -- a would-have-been-computed forward pass. Counted
+  // inside get() and set() instead, the fall-through and the ordinary miss would each read as
+  // two, which would put a freshly evaluated key over a seen-twice threshold in the session
+  // that evaluated it and destroy the cross-session bootstrap the currency exists for. See
+  // nncacheobservations.h.
+  //
+  // BEFORE THE EARLY RETURN, deliberately: a hit is a presentation. This is the whole defect
+  // the old retrieval currency had in the other direction, where a MISS was not one.
+  //
+  // COST WHEN NOTHING IS ATTACHED: one predictable branch, inlined. See NNCacheTable::observe.
+  if(nnCacheTable != nullptr)
+    nnCacheTable->observe(nnHash, cacheAttribution);
 
   bool hadResultWithoutOwnerMap = false;
   shared_ptr<NNOutput> resultWithoutOwnerMap;

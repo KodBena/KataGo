@@ -136,6 +136,44 @@ std::string cacheSwapConcurrencyRefusal(const std::string& action, int64_t openR
     "is exactly when nothing is open.";
 }
 
+// THE RETIRED WIRE KEY, AND WHY IT IS A REFUSAL AND NOT AN ALIAS.
+//
+// "minLookups" named a threshold in RETRIEVALS -- cache hits for a key some earlier dump had
+// already stored. The ratified currency is OBSERVATIONS: every presentation of the position,
+// hit or miss (ledger rows 1717/1722; nncacheobservations.h). The two are different numbers
+// for the same key, and the observation count is the LARGER of them for every key that was
+// ever evaluated fresh -- so "minObservations": 2 admits a strictly wider set than
+// "minLookups": 2 ever did.
+//
+// An accepted alias would therefore silently give a client a different policy than the one it
+// wrote down, in the direction of writing MORE to the operator's disks, with no field in any
+// response saying so. A key whose MEANING changed is not a key that can be renamed
+// compatibly; the honest move is the one ADR-0002 rung 1 and ADR-0012's interpreter-boundary
+// amendment both name -- refuse what cannot be honored, and say what to send instead
+// (ADR-0012 P11: the absence carries a typed reason, never a value standing in for one).
+//
+// The refusal names the new key and states the change, so a client reading it can act without
+// consulting anything else. It is a boundary teaching surface, not a deprecation shim.
+const char* const RETIRED_LOOKUPS_KEY = "minLookups";
+
+// WHAT AN ABSENT cache_dump "admission" MEANS, as one number with one home so the decoder,
+// the refusal texts and the tests cannot state three different defaults (ADR-0012 P1). Two:
+// the operator's own standing policy, "store only what has been seen at least twice", which
+// under observation currency is reachable across sessions -- a position observed once in one
+// session and once in the next clears it (ledger rows 1717/1722).
+const uint64_t DEFAULT_ADMISSION_OBSERVATIONS = 2;
+
+string retiredLookupsKeyRefusal(const string& where) {
+  return
+    "\"minLookups\" is no longer accepted in " + where + "; send \"minObservations\" instead. This is a "
+    "refusal rather than a rename because the QUANTITY changed, not just the word: a count is now "
+    "an OBSERVATION -- every time this engine was asked for the position, hit or miss, which is "
+    "the number of forward passes carrying it would have avoided -- where it used to be a "
+    "RETRIEVAL, a hit on a key an earlier dump had already stored. Every key that was ever "
+    "evaluated fresh now counts higher, so accepting this key as an alias would admit strictly "
+    "more to disk than you asked for and no response field would say so.";
+}
+
 CacheActionDecode<CacheAttachRequest> decodeCacheAttach(const json& request) {
   const std::optional<string> unexpected = firstUnexpectedKey(request, cacheAttachRequestKeys());
   if(unexpected.has_value())
@@ -149,7 +187,7 @@ CacheActionDecode<CacheAttachRequest> decodeCacheAttach(const json& request) {
     return CacheActionDecode<CacheAttachRequest>::refused("context", refusalMessage);
 
   // "level0": exactly one of three bounds, or absent for every key. EXACTLY ONE, because the
-  // bound type is a closed set of kinds with one per attach: "minLookups and maxBytes
+  // bound type is a closed set of kinds with one per attach: "minObservations and maxBytes
   // together" is not a request this engine can honor, so it is refused here rather than
   // silently interpreted as whichever one the decoder happened to read last.
   NNCacheLevelZeroBound bound = NNCacheLevelZeroBound::all();
@@ -158,10 +196,16 @@ CacheActionDecode<CacheAttachRequest> decodeCacheAttach(const json& request) {
     if(!level0.is_object())
       return CacheActionDecode<CacheAttachRequest>::refused(
         "level0",
-        "Must be an object holding exactly one of \"minLookups\", \"maxEntries\" or \"maxBytes\", or be "
-        "omitted for every persisted key."
+        "Must be an object holding exactly one of \"minObservations\", \"maxEntries\" or \"maxBytes\", "
+        "or be omitted for every persisted key."
       );
-    const std::set<std::string> level0Keys = {"minLookups", "maxEntries", "maxBytes"};
+    // The retired key is caught BEFORE the unexpected-key sweep, so a client that sends it is
+    // told what replaced it rather than being told it is unrecognized.
+    if(level0.find(RETIRED_LOOKUPS_KEY) != level0.end())
+      return CacheActionDecode<CacheAttachRequest>::refused(
+        "level0", retiredLookupsKeyRefusal("cache_attach \"level0\"")
+      );
+    const std::set<std::string> level0Keys = {"minObservations", "maxEntries", "maxBytes"};
     const std::optional<string> unexpectedInner = firstUnexpectedKey(level0, level0Keys);
     if(unexpectedInner.has_value())
       return CacheActionDecode<CacheAttachRequest>::refused(
@@ -170,17 +214,17 @@ CacheActionDecode<CacheAttachRequest> decodeCacheAttach(const json& request) {
     if(level0.size() != 1)
       return CacheActionDecode<CacheAttachRequest>::refused(
         "level0",
-        "Must hold exactly one of \"minLookups\", \"maxEntries\" or \"maxBytes\", and holds " +
+        "Must hold exactly one of \"minObservations\", \"maxEntries\" or \"maxBytes\", and holds " +
         Global::int64ToString((int64_t)level0.size()) +
         ". A level-0 selection is one bound applied to one ranked order; two bounds would be two "
         "different prefixes and the engine will not choose between them. A client wanting both "
         "composes two attaches."
       );
     int64_t amount = 0;
-    if(level0.find("minLookups") != level0.end()) {
-      if(!decodeInt64(level0, "minLookups", 0, (int64_t)1 << 40, amount, refusalMessage))
+    if(level0.find("minObservations") != level0.end()) {
+      if(!decodeInt64(level0, "minObservations", 0, (int64_t)1 << 40, amount, refusalMessage))
         return CacheActionDecode<CacheAttachRequest>::refused("level0", refusalMessage);
-      bound = NNCacheLevelZeroBound::minLookups((uint64_t)amount);
+      bound = NNCacheLevelZeroBound::minObservations((uint64_t)amount);
     }
     else if(level0.find("maxEntries") != level0.end()) {
       if(!decodeInt64(level0, "maxEntries", 0, (int64_t)1 << 40, amount, refusalMessage))
@@ -324,47 +368,69 @@ CacheActionDecode<CacheDumpRequest> decodeCacheDump(const json& request) {
       "what", "Must be one of \"counts\", \"evaluations\" or \"both\", got \"" + whatStr + "\"."
     );
 
-  // "admission" is REQUIRED, and has no default. Writing every earned entry to disk regardless
-  // of how many times it was retrieved is a real, sanctioned choice -- but it is a choice about
-  // SSD wear on hardware the client is not the only user of, and an absent field is not where
-  // that choice belongs. The counting currency admission ought to gate on (retrievals, raw
-  // presentations, or deduplicated-per-search presentations) is an open empirical question this
-  // decoder deliberately does not prejudge by picking a currency as "the default" -- it only
-  // ever reads the currency the request names, today "minLookups" (retrievals).
-  if(request.find("admission") == request.end() || !request["admission"].is_object())
-    return CacheActionDecode<CacheDumpRequest>::refused(
-      "admission",
-      "Required, and must be an object holding exactly one of \"minLookups\" (an integer: the "
-      "recorded retrievals an entry needs to reach disk) or \"all\" (must be true: write every "
-      "entry this context earned and does not already have on disk). There is no default: a dump "
-      "writes to disk, and which entries it admits is not something to infer from an absent field."
-    );
-  const json& admissionJson = request["admission"];
-  const std::set<std::string> admissionKeys = {"minLookups", "all"};
-  const std::optional<string> unexpectedInner = firstUnexpectedKey(admissionJson, admissionKeys);
-  if(unexpectedInner.has_value())
-    return CacheActionDecode<CacheDumpRequest>::refused(
-      "admission", unexpectedKeyMessage(unexpectedInner.value(), "cache_dump \"admission\"", admissionKeys)
-    );
-  const bool hasMinLookups = admissionJson.find("minLookups") != admissionJson.end();
-  const bool hasAll = admissionJson.find("all") != admissionJson.end();
-  if(hasMinLookups == hasAll)  // both absent, or both present
-    return CacheActionDecode<CacheDumpRequest>::refused(
-      "admission",
-      "Must hold exactly one of \"minLookups\" or \"all\", naming which entries this dump admits."
-    );
-  NNCacheDiskAdmission admission = NNCacheDiskAdmission::all();
-  if(hasAll) {
-    if(!admissionJson["all"].is_boolean() || !admissionJson["all"].get<bool>())
+  // "admission" IS OPTIONAL, AND ITS ABSENCE MEANS SEEN AT LEAST TWICE.
+  //
+  // IT USED TO BE REQUIRED WITH NO DEFAULT (cd200625), and that refusal is retired here rather
+  // than argued down. Its reason was honest and is now spent: the currency an admission
+  // decision ought to gate on was an open empirical question, so the decoder declined to
+  // prejudge it by picking one as "the default" and read only the currency a request named.
+  // The question is settled -- observations, every presentation of the position, hit or miss
+  // (ledger rows 1717/1722) -- so there is a currency to default IN, and the operator's own
+  // standing policy is the default: minObservations(2), store only what has come up more than
+  // once. The residual concern the refusal also carried, that writing every earned entry is a
+  // choice about somebody else's SSD, is served better by this default than by the refusal
+  // was: the default is the CONSERVATIVE arm, and "all" remains an explicit opt-in a client
+  // has to write down.
+  //
+  // Both explicit forms stay exactly as they were, so a client that names its policy still
+  // gets precisely what it named.
+  NNCacheDiskAdmission admission = NNCacheDiskAdmission::minObservations(DEFAULT_ADMISSION_OBSERVATIONS);
+  if(request.find("admission") != request.end()) {
+    if(!request["admission"].is_object())
       return CacheActionDecode<CacheDumpRequest>::refused(
-        "admission", "\"all\" must be true. There is no false form; omit it and send \"minLookups\" instead."
+        "admission",
+        "Must be an object holding exactly one of \"minObservations\" (an integer: the recorded "
+        "observations an entry needs to reach disk) or \"all\" (must be true: write every entry "
+        "this context earned and does not already have on disk). Omit the field entirely for the "
+        "default, which is \"minObservations\": 2."
       );
-    admission = NNCacheDiskAdmission::all();
-  } else {
-    int64_t minLookups = 0;
-    if(!decodeInt64(admissionJson, "minLookups", 0, (int64_t)1 << 40, minLookups, refusalMessage))
-      return CacheActionDecode<CacheDumpRequest>::refused("admission", refusalMessage);
-    admission = NNCacheDiskAdmission::minLookups((uint64_t)minLookups);
+    const json& admissionJson = request["admission"];
+    // The retired key is caught BEFORE the unexpected-key sweep, so a client that sends it is
+    // told what replaced it and why rather than being told it is unrecognized.
+    if(admissionJson.find(RETIRED_LOOKUPS_KEY) != admissionJson.end())
+      return CacheActionDecode<CacheDumpRequest>::refused(
+        "admission", retiredLookupsKeyRefusal("cache_dump \"admission\"")
+      );
+    const std::set<std::string> admissionKeys = {"minObservations", "all"};
+    const std::optional<string> unexpectedInner = firstUnexpectedKey(admissionJson, admissionKeys);
+    if(unexpectedInner.has_value())
+      return CacheActionDecode<CacheDumpRequest>::refused(
+        "admission", unexpectedKeyMessage(unexpectedInner.value(), "cache_dump \"admission\"", admissionKeys)
+      );
+    const bool hasMinObservations = admissionJson.find("minObservations") != admissionJson.end();
+    const bool hasAll = admissionJson.find("all") != admissionJson.end();
+    // An EMPTY object is refused rather than read as the default. Omitting the field says "I
+    // have no policy, give me yours"; sending {} says "here is my policy" and then names none,
+    // which is a client bug and is worth telling it about (ADR-0002).
+    if(hasMinObservations == hasAll)  // both absent, or both present
+      return CacheActionDecode<CacheDumpRequest>::refused(
+        "admission",
+        "Must hold exactly one of \"minObservations\" or \"all\", naming which entries this dump "
+        "admits. Omit the field entirely for the default, which is \"minObservations\": 2."
+      );
+    if(hasAll) {
+      if(!admissionJson["all"].is_boolean() || !admissionJson["all"].get<bool>())
+        return CacheActionDecode<CacheDumpRequest>::refused(
+          "admission",
+          "\"all\" must be true. There is no false form; omit it and send \"minObservations\" instead."
+        );
+      admission = NNCacheDiskAdmission::all();
+    } else {
+      int64_t minObservations = 0;
+      if(!decodeInt64(admissionJson, "minObservations", 0, (int64_t)1 << 40, minObservations, refusalMessage))
+        return CacheActionDecode<CacheDumpRequest>::refused("admission", refusalMessage);
+      admission = NNCacheDiskAdmission::minObservations((uint64_t)minObservations);
+    }
   }
 
   return CacheActionDecode<CacheDumpRequest>::decoded(CacheDumpRequest{context, what, admission});
@@ -754,20 +820,38 @@ json cacheDetachExecute(
   // set(), so it earns no key for the first check, and a request already accepted before the last
   // dump raises no new acceptance for the second -- which is exactly the mature, fully pre-warmed
   // card this feature exists for. It is replaced, not re-argued, by the non-consuming query
-  // NNCacheTable::hasUnpersistedHitCountsFor, which reads the same counters against the same marks
-  // the per-context take reads and moves none of them.
+  // NNCacheTable::hasUnpersistedObservationCountsFor, which reads the same counters against the
+  // same marks the per-context take reads and moves none of them.
   const int64_t undumpedEntries = (int64_t)eval.cacheTable().unpersistedKeysFor(record.contextId).size();
-  const bool undumpedCounts = eval.cacheTable().hasUnpersistedHitCountsFor(record.contextId);
+  const bool undumpedCounts = eval.cacheTable().hasUnpersistedObservationCountsFor(record.contextId);
   if(!request.discardUndumped && (undumpedEntries > 0 || undumpedCounts))
     throw StringError(
       "Refusing to detach context \"" + request.context + "\" from model \"" + eval.getInternalModelName() +
       "\": it holds " + Global::int64ToString(undumpedEntries) + " earned entries that are not on disk" +
       (undumpedCounts
-         ? ", and it holds retrieval counts that have not been dumped either"
+         ? ", and it holds observation counts that have not been dumped either"
          : "") +
       ". Send cache_dump first, or send this detach again with \"discardUndumped\":true to throw that "
       "work away deliberately."
     );
+
+  // DISCARDING IS AN ACT, NOT A WORD. `discardUndumped` says this session's undumped work may
+  // be thrown away, so it is thrown away: the context's observation delta is TAKEN and dropped
+  // on the floor here, which advances its marks and is exactly what makes the claim true. Left
+  // standing, those observations would simply be written by the next dump after the next
+  // attach -- so a client that asked to discard a session would find it in the file anyway, and
+  // no response field would say so. The number discarded is reported rather than swallowed
+  // (ADR-0002).
+  //
+  // It runs only under discardUndumped: the refusal above has already stopped every other path
+  // that could reach here with unwritten work.
+  int64_t discardedObservationRows = 0;
+  if(request.discardUndumped && undumpedCounts) {
+    const NNCacheObservationLedger discarded =
+      eval.cacheTable().takeUnpersistedObservationCountsFor(record.contextId);
+    if(discarded.isObserved())
+      discardedObservationRows = (int64_t)discarded.entries().size();
+  }
 
   // Detached in reverse attach order, so the resolution list shrinks from the end and no
   // surviving source's position moves under a concurrent reader. (There is no concurrent
@@ -796,6 +880,7 @@ json cacheDetachExecute(
   out["storageReleased"] = sourcesWhoseStorageWentBack == sourcesDetached;
   out["heapReclaim"] = reclaimToJson(reclaim);
   out["discardedUndumpedEntries"] = request.discardUndumped ? undumpedEntries : (int64_t)0;
+  out["discardedUndumpedObservationRows"] = discardedObservationRows;
   attachments.recordDetach(modelIdx, request.context);
   return out;
 }
@@ -829,12 +914,17 @@ json cacheDumpExecute(
     // other card's retrievals under it and no response field would say so.
     //
     // The division is not made here and could not be: a delta row carries a key, and a key names
-    // a position, never a card. It is made where the two facts live -- which level-0 source
-    // serves which context, and which context earned which level-1 key -- which is inside the
-    // table (NNCacheTable::takeUnpersistedHitCountsFor). This call spends the result, and the
+    // a position, never a card. It is made where the fact lives -- the observation ledger is
+    // keyed on (key, context), so every row already belongs to exactly one card
+    // (NNCacheTable::takeUnpersistedObservationCountsFor). This call spends the result, and the
     // marks that advance are exactly those of the rows it is about to write.
+    //
+    // A ROW FOR EVERY KEY THIS CONTEXT WAS ASKED FOR, including keys observed exactly once
+    // whose evaluations the admission predicate below will not write. That is deliberate and
+    // it is what makes a seen-twice policy reachable at all: the count written now is what the
+    // NEXT session adds to.
     const NNCacheCountLogAppendResult appended =
-      log.appendDump(NNCacheHitCountDelta::takeFor(eval.cacheTable(), record.contextId));
+      log.appendDump(NNCacheObservationDelta::takeFor(eval.cacheTable(), record.contextId));
     const bool compacted = log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple());
     json counts;
     counts["bytesAppended"] = appended.bytesAppended;
@@ -843,7 +933,7 @@ json cacheDumpExecute(
     counts["compacted"] = compacted;
     const NNCacheCountLogContents contents = log.load();
     counts["rowsInLog"] = (int64_t)contents.rows().size();
-    counts["unattributedLookups"] = contents.unattributedLookups();
+    counts["unattributedObservations"] = contents.unattributedObservations();
     counts["tail"] = tailToJson(contents.tail());
     out["counts"] = counts;
   }
@@ -929,26 +1019,20 @@ json cacheStatsExecute(
     out["unrecordedAttributions"] = attribution.unrecordedAttributions();
   }
 
-  // GATED, READ-ONLY, and present ONLY when NNCacheConfig::admissionSignalMeasurement is on
-  // (ledger rows 1652/1655/1660). This changes no admission decision anywhere; it exists so
-  // the operator can compare three candidate currencies -- retrievals (retrievalsThisSession
-  // above), raw presentations, and presentations deduplicated per measurement window --
-  // against real traffic before choosing one for cache_dump's "admission" field.
-  const NNCachePresentationLedger presentations = eval.cacheTable().harvestPresentationCounts();
-  if(presentations.isCounted()) {
-    json signal;
-    int64_t totalRaw = 0;
-    int64_t totalDeduped = 0;
-    for(size_t i = 0; i < presentations.entries().size(); i++) {
-      totalRaw += (int64_t)presentations.entries()[i].rawPresentations;
-      totalDeduped += (int64_t)presentations.entries()[i].dedupedPresentations;
-    }
-    signal["countedKeys"] = (int64_t)presentations.entries().size();
-    signal["totalRawPresentations"] = totalRaw;
-    signal["totalDedupedPresentations"] = totalDeduped;
-    signal["unrecordedRawPresentations"] = presentations.unrecordedRaw();
-    signal["unrecordedDedupedPresentations"] = presentations.unrecordedDeduped();
-    out["admissionSignalMeasurement"] = signal;
+  // WHAT THE COUNT LOG WOULD RECORD: this session's observations, whole-table, as a running
+  // total rather than the delta a dump appends. Present exactly when a context is attached,
+  // because that is exactly when this table observes anything.
+  const NNCacheObservationLedger observations = eval.cacheTable().harvestObservationCounts();
+  if(observations.isObserved()) {
+    int64_t totalObservations = 0;
+    for(size_t i = 0; i < observations.entries().size(); i++)
+      totalObservations += (int64_t)observations.entries()[i].observations;
+    out["observedKeys"] = (int64_t)observations.entries().size();
+    out["observationsThisSession"] = totalObservations;
+    out["unrecordedObservations"] = observations.unrecordedObservations();
+    // The memory this feature costs, named rather than buried in fixedStructureBytes: it is
+    // tens of megabytes and the operator's whole complaint is about resident size (ADR-0002).
+    out["observationLedgerBytes"] = eval.cacheTable().observationStructureBytes();
   }
 
   json contexts = json::array();
@@ -960,24 +1044,20 @@ json cacheStatsExecute(
     context["levelOneFilled"] = record.levelOneFilled;
     context["levelOneFilledBytes"] = record.levelOneFilledBytes;
     context["unpersistedEntries"] = (int64_t)eval.cacheTable().unpersistedKeysFor(record.contextId).size();
-    // Same gate as the whole-table block above, and the same scope note: this is EARNED
-    // keys only (attributedKeysFor's own population), so a card served entirely out of a
-    // pre-warmed level 0 with nothing set() this session reports zero rows here while
-    // still contributing to the whole-table admissionSignalMeasurement above.
-    const NNCachePresentationLedger contextPresentations =
-      eval.cacheTable().harvestPresentationCountsFor(record.contextId);
-    if(contextPresentations.isCounted()) {
-      json contextSignal;
-      int64_t contextRaw = 0;
-      int64_t contextDeduped = 0;
-      for(size_t j = 0; j < contextPresentations.entries().size(); j++) {
-        contextRaw += (int64_t)contextPresentations.entries()[j].rawPresentations;
-        contextDeduped += (int64_t)contextPresentations.entries()[j].dedupedPresentations;
-      }
-      contextSignal["earnedKeys"] = (int64_t)contextPresentations.entries().size();
-      contextSignal["totalRawPresentations"] = contextRaw;
-      contextSignal["totalDedupedPresentations"] = contextDeduped;
-      context["admissionSignalMeasurement"] = contextSignal;
+    // THIS CONTEXT'S OWN OBSERVATIONS, running total. Unlike the retired presentation
+    // measurement this replaces, the population is NOT "earned keys": the observation ledger
+    // is keyed on (key, context) directly, so a card served entirely out of a pre-warmed level
+    // 0 -- which sets nothing and earns nothing -- reports its real counts here.
+    const NNCacheObservationLedger contextObservations =
+      eval.cacheTable().harvestObservationCountsFor(record.contextId);
+    if(contextObservations.isObserved()) {
+      int64_t contextTotal = 0;
+      for(size_t j = 0; j < contextObservations.entries().size(); j++)
+        contextTotal += (int64_t)contextObservations.entries()[j].observations;
+      context["observedKeys"] = (int64_t)contextObservations.entries().size();
+      context["observationsThisSession"] = contextTotal;
+      context["unpersistedObservations"] =
+        eval.cacheTable().hasUnpersistedObservationCountsFor(record.contextId);
     }
     json sources = json::array();
     for(size_t s = 0; s < record.sources.size(); s++)

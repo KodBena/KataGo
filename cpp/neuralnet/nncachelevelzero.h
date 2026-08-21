@@ -158,9 +158,10 @@ struct NNCacheLevelZeroCandidate {
   // Where this key sits in the container's own key set, so the caller can recover its
   // location without a second lookup.
   size_t containerIndex;
-  // Retrievals the count log has recorded for this key across every dump it holds. Zero for
-  // a key the log does not mention -- see `counted`.
-  uint64_t lookups;
+  // Observations the count log has recorded for this key across every dump it holds -- how
+  // many times this position has come up under this context, across sessions. Zero for a key
+  // the log does not mention -- see `counted`.
+  uint64_t observations;
   // WHETHER THE COUNT LOG MENTIONED THIS KEY AT ALL. It is a separate fact from a count of
   // zero and is kept separate rather than both reading as "0" (ADR-0012 P11: an absence
   // carries a typed reason, never a value standing in for one). A container can legitimately
@@ -176,19 +177,19 @@ struct NNCacheLevelZeroCandidate {
 
 // THE BUILD ORDER: the container's key set, ordered by the count log.
 //
-// DESCENDING LOOKUPS, and then every key the count log does not mention, ties broken by key
+// DESCENDING OBSERVATIONS, and then every key the count log does not mention, ties broken by key
 // throughout so the order is total and a test can assert it exactly.
 //
 // The absent-from-the-log case is the one worth stating precisely, because it is the one a
 // loader could plausibly get wrong in three different ways -- drop the key, guess a count
 // for it, or let it sort among the counted keys. It does none of them: an unmentioned key is
-// KEPT, is ordered as zero lookups, and sorts AFTER every key the log did mention, including
+// KEPT, is ordered as zero observations, and sorts AFTER every key the log did mention, including
 // a key the log mentioned with a count of zero. A key the log has counted at zero is a key
 // the log has something to say about; a key it has never seen is not, and the second is the
 // weaker claim on level 0.
 //
-// Ordering by lookups rather than by anything else is the operator's own ruling, and
-// byDescendingLookups is the count log's only ordering helper for that reason.
+// Ordering by observations rather than by anything else is the operator's own ruling, and
+// byDescendingObservations is the count log's only ordering helper for that reason.
 [[nodiscard]] std::vector<NNCacheLevelZeroCandidate> nnCacheLevelZeroOrder(
   const std::vector<NNEvalContainerEntryLocation>& containerEntries,
   const std::vector<NNCacheCountRow>& countRows
@@ -198,18 +199,18 @@ struct NNCacheLevelZeroCandidate {
 //
 // The knobs are mechanism and not policy: the client decides what belongs in a frozen level
 // 0 and what should be left for level 1, and says so as a bound. There is one bound per
-// attach and it is a closed set of four kinds, so "minLookups and maxBytes together" is not
+// attach and it is a closed set of four kinds, so "minObservations and maxBytes together" is not
 // a request that can be made and then interpreted -- a caller wanting both composes two
 // attaches or picks the one that expresses its intent.
 class NNCacheLevelZeroBound {
  public:
   // Every candidate.
   static NNCacheLevelZeroBound all();
-  // Every candidate the count log recorded at least `lookups` retrievals for. A key the log
-  // does not mention is never admitted by this bound at any threshold above zero, because
-  // its count is not zero -- it is unknown, and admitting it would be the guess
+  // Every candidate the count log recorded at least `observations` observations for. A key
+  // the log does not mention is never admitted by this bound at any threshold above zero,
+  // because its count is not zero -- it is unknown, and admitting it would be the guess
   // NNCacheLevelZeroCandidate::counted exists to prevent.
-  static NNCacheLevelZeroBound minLookups(uint64_t lookups);
+  static NNCacheLevelZeroBound minObservations(uint64_t observations);
   // The first `entries` candidates in order.
   static NNCacheLevelZeroBound maxEntries(int64_t entries);
   // The longest prefix whose RESIDENT bytes do not exceed `bytes`. The bound is denominated
@@ -230,11 +231,11 @@ class NNCacheLevelZeroBound {
   [[nodiscard]] std::string describe() const;
 
  private:
-  enum class Kind { All, MinLookups, MaxEntries, MaxBytes };
-  NNCacheLevelZeroBound(Kind kind, uint64_t lookups, int64_t amount);
+  enum class Kind { All, MinObservations, MaxEntries, MaxBytes };
+  NNCacheLevelZeroBound(Kind kind, uint64_t observations, int64_t amount);
 
   Kind kind_;
-  uint64_t lookups_;
+  uint64_t observations_;
   int64_t amount_;
 };
 

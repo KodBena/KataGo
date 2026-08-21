@@ -43,15 +43,15 @@ Hash128 nthKey(int serial) {
 
 // The rows of one DUMP, as the delta type appendDump takes. These are hand-built deltas --
 // what a session accrued since its last dump -- which is what ofDeltaRows is named for.
-NNCacheHitCountDelta deltaOf(const vector<pair<int,uint32_t>>& serialAndHits, int64_t unrecorded) {
-  vector<NNCacheHitCount> rows;
-  for(size_t i = 0; i < serialAndHits.size(); i++) {
-    NNCacheHitCount row;
-    row.key = nthKey(serialAndHits[i].first);
-    row.hits = serialAndHits[i].second;
+NNCacheObservationDelta deltaOf(const vector<pair<int,uint32_t>>& serialAndObservations, int64_t unrecorded) {
+  vector<NNCacheObservationCount> rows;
+  for(size_t i = 0; i < serialAndObservations.size(); i++) {
+    NNCacheObservationCount row;
+    row.key = nthKey(serialAndObservations[i].first);
+    row.observations = serialAndObservations[i].second;
     rows.push_back(row);
   }
-  return NNCacheHitCountDelta::ofDeltaRows(std::move(rows), unrecorded);
+  return NNCacheObservationDelta::ofDeltaRows(std::move(rows), unrecorded);
 }
 
 // The one row for `serial`. Asserts there is exactly one -- so "one row per key" is
@@ -142,16 +142,16 @@ void testCountLogRoundTripsCountsExactly() {
   testAssert(contents.blocksApplied() == 1);
   testAssert(contents.recordsApplied() == 3);
   testAssert(contents.rows().size() == 3);
-  testAssert(contents.unattributedLookups() == 0);
+  testAssert(contents.unattributedObservations() == 0);
 
-  testAssert(rowFor(contents, 1).lookups == 7);
+  testAssert(rowFor(contents, 1).observations == 7);
   // A pre-warmed entry that earned nothing is stored, not dropped: "level 0 held this and
   // nobody asked for it" is the signal to stop carrying it, and it is not the same fact as
   // "this key is not in the log".
-  testAssert(rowFor(contents, 2).lookups == 0);
+  testAssert(rowFor(contents, 2).observations == 0);
   // The top of the 32-bit range round-trips, so the record's field width is exercised
   // rather than assumed.
-  testAssert(rowFor(contents, 3).lookups == 4000000000ull);
+  testAssert(rowFor(contents, 3).observations == 4000000000ull);
   for(size_t i = 0; i < contents.rows().size(); i++)
     testAssert(contents.rows()[i].sessions == 1);
 }
@@ -169,12 +169,12 @@ void testCountLogAccumulatesAcrossDumps() {
   testAssert(contents.blocksApplied() == 3);
   testAssert(contents.recordsApplied() == 5);
   testAssert(contents.rows().size() == 3);
-  testAssert(rowFor(contents, 1).lookups == 8 && rowFor(contents, 1).sessions == 3);
-  testAssert(rowFor(contents, 2).lookups == 5 && rowFor(contents, 2).sessions == 1);
-  testAssert(rowFor(contents, 3).lookups == 9 && rowFor(contents, 3).sessions == 1);
+  testAssert(rowFor(contents, 1).observations == 8 && rowFor(contents, 1).sessions == 3);
+  testAssert(rowFor(contents, 2).observations == 5 && rowFor(contents, 2).sessions == 1);
+  testAssert(rowFor(contents, 3).observations == 9 && rowFor(contents, 3).sessions == 1);
   // Hits the cache could not attribute to any key are carried through the log rather than
   // dropped at the door, and they sum across dumps like everything else.
-  testAssert(contents.unattributedLookups() == 5);
+  testAssert(contents.unattributedObservations() == 5);
 }
 
 // THE LOAD-BEARING TEST. A crash mid-dump leaves a partial block. Exactly the dumps that
@@ -216,9 +216,9 @@ void testCountLogTornTailIsDiscardedAndThePrefixSurvives() {
   //
   // Exactly the two completed dumps survive, with exact totals. Key 1's 100 hits from the
   // torn block are not in its total: a partial block is not applied in part.
-  testAssert(rowFor(contents, 1).lookups == 15 && rowFor(contents, 1).sessions == 2);
-  testAssert(rowFor(contents, 2).lookups == 20 && rowFor(contents, 2).sessions == 1);
-  testAssert(rowFor(contents, 3).lookups == 30 && rowFor(contents, 3).sessions == 1);
+  testAssert(rowFor(contents, 1).observations == 15 && rowFor(contents, 1).sessions == 2);
+  testAssert(rowFor(contents, 2).observations == 20 && rowFor(contents, 2).sessions == 1);
+  testAssert(rowFor(contents, 3).observations == 30 && rowFor(contents, 3).sessions == 1);
 
   // AND THE PARTIAL DUMP DID NOT SURVIVE, observed positively: keys 4 and 5 were named ONLY
   // by the torn block, so their absence is a direct membership fact about the rows the load
@@ -228,7 +228,7 @@ void testCountLogTornTailIsDiscardedAndThePrefixSurvives() {
   testAssert(!hasRowFor(contents, 5));
   testAssert(contents.rows().size() == 3);
   // The torn block's unattributed count went with it.
-  testAssert(contents.unattributedLookups() == 0);
+  testAssert(contents.unattributedObservations() == 0);
 
   // Then the accounting: the disposition is Truncated and names exactly how many bytes it
   // will not use.
@@ -257,7 +257,7 @@ void testCountLogAWholeButCorruptBlockIsRejectedByItsChecksum() {
   testAssert(contents.tail() == NNCacheCountLogTail::Truncated);
   testAssert(contents.discardedTailBytes() == sizeOf(log.path()) - sizeAfterOneDump);
   testAssert(contents.blocksApplied() == 1);
-  testAssert(rowFor(contents, 1).lookups == 11);
+  testAssert(rowFor(contents, 1).observations == 11);
   testAssert(!hasRowFor(contents, 2));
 }
 
@@ -284,7 +284,7 @@ void testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved() {
   // SECOND LEG, and it is the one that makes the header's own checksum NECESSARY rather
   // than merely present. The leg above is caught twice over -- an absurd record count also
   // fails the bound against the bytes remaining -- so it does not isolate the checksum.
-  // This one corrupts the header's unattributed-lookups field instead: the length is still
+  // This one corrupts the header's unattributed-observations field instead: the length is still
   // right, the magic is still right, the payload still checksums, and the ONLY thing that
   // can see the damage is the header checksum. Without it the log would silently report a
   // fabricated unattributed count.
@@ -299,7 +299,7 @@ void testCountLogACorruptBlockHeaderIsRejectedBeforeItsLengthIsBelieved() {
     testAssert(contents2.tail() == NNCacheCountLogTail::Truncated);
     testAssert(contents2.blocksApplied() == 1);
     testAssert(!hasRowFor(contents2, 2));
-    testAssert(contents2.unattributedLookups() == 0);
+    testAssert(contents2.unattributedObservations() == 0);
   }
 }
 
@@ -323,12 +323,12 @@ void testCountLogTornTailIsRepairedBeforeTheNextAppend() {
   testAssert(contents.tail() == NNCacheCountLogTail::Intact);
   // The repair collapsed the surviving prefix into one block; the new dump is the second.
   testAssert(contents.blocksApplied() == 2);
-  testAssert(rowFor(contents, 1).lookups == 10);
-  testAssert(rowFor(contents, 2).lookups == 20);
+  testAssert(rowFor(contents, 1).observations == 10);
+  testAssert(rowFor(contents, 2).observations == 20);
   testAssert(!hasRowFor(contents, 3));
   // THE POINT OF THE TEST: the dump written after the torn tail is readable. Without the
   // repair this row is what goes missing, silently.
-  testAssert(rowFor(contents, 4).lookups == 40);
+  testAssert(rowFor(contents, 4).observations == 40);
 }
 
 // Compaction preserves every total and shrinks the file; a crash mid-compaction leaves the
@@ -369,9 +369,9 @@ void testCountLogCompactionPreservesTotalsAndSurvivesACrash() {
   testAssert(after.recordsApplied() == 2);
   testAssert(after.rows().size() == 2);
   // Observationally identical to the log it replaced: same totals, same unattributed sum.
-  testAssert(rowFor(after, 1).lookups == 20 && rowFor(after, 1).sessions == 10);
-  testAssert(rowFor(after, 2).lookups == 30 && rowFor(after, 2).sessions == 10);
-  testAssert(after.unattributedLookups() == before.unattributedLookups());
+  testAssert(rowFor(after, 1).observations == 20 && rowFor(after, 1).sessions == 10);
+  testAssert(rowFor(after, 2).observations == 30 && rowFor(after, 2).sessions == 10);
+  testAssert(after.unattributedObservations() == before.unattributedObservations());
   testAssert(sizeOf(log.path()) ==
              (int64_t)NNCacheCountLog::fileHeaderBytes() + NNCacheCountLog::bytesForDumpOf(2));
   testAssert(sizeOf(log.path()) < sizeBefore);
@@ -382,24 +382,24 @@ void testCountLogCompactionPreservesTotalsAndSurvivesACrash() {
   testAssert(log.compactIfNeeded(NNCacheCountLog::defaultCompactionMultiple()) == false);
 }
 
-// Ordering is by lookups. Nothing here ranks by sessions.
+// Ordering is by observations. Nothing here ranks by sessions.
 void testCountLogOrdersByLookupsAndNotBySessions() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "ordering");
 
-  // Key 1: one dump, many lookups. Key 2: many dumps, few lookups each. The two orderings
+  // Key 1: one dump, many observations. Key 2: many dumps, few observations each. The two orderings
   // disagree, which is the whole point of the fixture.
   log.appendDump(deltaOf({{1, 100}, {2, 1}}, 0));
   for(int i = 0; i < 5; i++)
     log.appendDump(deltaOf({{2, 1}}, 0));
 
   const NNCacheCountLogContents contents = log.load();
-  testAssert(rowFor(contents, 1).lookups == 100 && rowFor(contents, 1).sessions == 1);
-  testAssert(rowFor(contents, 2).lookups == 6 && rowFor(contents, 2).sessions == 6);
+  testAssert(rowFor(contents, 1).observations == 100 && rowFor(contents, 1).sessions == 1);
+  testAssert(rowFor(contents, 2).observations == 6 && rowFor(contents, 2).sessions == 6);
 
-  const vector<NNCacheCountRow> ordered = contents.byDescendingLookups();
+  const vector<NNCacheCountRow> ordered = contents.byDescendingObservations();
   testAssert(ordered.size() == 2);
-  testAssert(ordered[0].key == nthKey(1));  // more lookups, fewer sessions -- and it is first
+  testAssert(ordered[0].key == nthKey(1));  // more observations, fewer sessions -- and it is first
   testAssert(ordered[1].key == nthKey(2));
 }
 
@@ -426,26 +426,27 @@ void testCountLogRefusesWhatItCannotHonor() {
     testAssert(refused);
   }
 
-  // A NotCounted ledger is refused rather than written as a dump of zero rows, which a
+  // A NotObserved ledger is refused rather than written as a dump of zero rows, which a
   // later reader would take for "this session hit nothing".
   {
     const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "notcounted");
     string message;
     bool refused = false;
-    try { log.appendDump(NNCacheHitCountDelta::notCounted()); }
+    try { log.appendDump(NNCacheObservationDelta::notObserved()); }
     catch(const StringError& e) { refused = true; message = e.what(); }
     testAssert(refused);
     testAssert(!FileUtils::exists(log.path()));
     // ASSERTED ON THE MESSAGE, and the reason is worth stating because a bare "did it
     // throw" here was a proxy witness that a seen-red leg caught. Removing appendDump's own
-    // isCounted() guard leaves the call throwing anyway, because NNCacheHitLedger::entries()
-    // already refuses under NotCounted -- so "it threw" is true under both the presence and
+    // isObserved() guard leaves the call throwing anyway, because
+    // NNCacheObservationLedger::entries() already refuses under NotObserved -- so "it threw"
+    // is true under both the presence and
     // the absence of the thing being tested. What the guard actually buys is the DIAGNOSIS:
     // an operator gets told the count log declined to persist a session's counts, not that
     // some accessor refused. That message is operator-facing and load-bearing, which is what
     // makes it a legitimate anchor rather than adjacent prose (ADR-0021 Rule 3).
     testAssert(message.find("NNCacheCountLog") != string::npos);
-    testAssert(message.find("NotCounted") != string::npos);
+    testAssert(message.find("NotObserved") != string::npos);
   }
 
   // A missing file is not an error: it reads as an empty, intact log.

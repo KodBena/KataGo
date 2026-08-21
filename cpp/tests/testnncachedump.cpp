@@ -56,15 +56,6 @@ namespace {
 
 const char* const TMP_DIR_PREFIX = "tmpnncachedump";
 
-// An ABSOLUTE hit surface, forced into the delta type appendDump takes.
-//
-// Used by exactly one test below, which exists to show what the record looks like when an
-// absolute reaches an additive reader. It is named for what it does because that is the whole
-// point: after this increment a caller cannot reach that defect by writing the obvious
-// expression -- the types refuse it -- and has to write this instead.
-NNCacheHitCountDelta launderAsDelta(const NNCacheHitLedger& runningTotals) {
-  return NNCacheHitCountDelta::ofDeltaRows(runningTotals.entries(), runningTotals.unrecordedHits());
-}
 const char* const MODEL = "kata1-b18c384nbt-s9732312320-d4245566942";
 const int MODEL_VERSION = 14;
 const int XLEN = 9;
@@ -178,7 +169,7 @@ NNCacheCountRow logRowFor(const NNCacheCountLogContents& contents, Hash128 key) 
   }
   NNCacheCountRow absent;
   absent.key = key;
-  absent.lookups = 0;
+  absent.observations = 0;
   absent.sessions = 0;
   return absent;
 }
@@ -191,12 +182,12 @@ bool logHasKey(const NNCacheCountLogContents& contents, Hash128 key) {
   return false;
 }
 
-vector<NNCacheCountRow> observations(const vector<pair<int, uint64_t> >& serialAndLookups) {
+vector<NNCacheCountRow> observations(const vector<pair<int, uint64_t> >& serialAndObservations) {
   vector<NNCacheCountRow> out;
-  for(size_t i = 0; i < serialAndLookups.size(); i++) {
+  for(size_t i = 0; i < serialAndObservations.size(); i++) {
     NNCacheCountRow row;
-    row.key = nthKey(serialAndLookups[i].first);
-    row.lookups = serialAndLookups[i].second;
+    row.key = nthKey(serialAndObservations[i].first);
+    row.observations = serialAndObservations[i].second;
     row.sessions = 1;
     out.push_back(row);
   }
@@ -223,10 +214,10 @@ bool refused(const std::function<void()>& f, const string& mustMention) {
 // case that makes the rule non-obvious, a key the count log has never mentioned -- so a
 // future edit to one that does not reach the other fails here rather than in a card that
 // quietly stops being loadable at the size it is dumped at.
-void testTheReadAndWriteSidesShareOneLookupThresholdRule() {
+void testTheReadAndWriteSidesShareOneObservationThresholdRule() {
   for(uint64_t threshold = 0; threshold <= 4; threshold++) {
-    const NNCacheLookupThreshold shared = NNCacheLookupThreshold::of(threshold);
-    const NNCacheDiskAdmission write = NNCacheDiskAdmission::minLookups(threshold);
+    const NNCacheObservationThreshold shared = NNCacheObservationThreshold::of(threshold);
+    const NNCacheDiskAdmission write = NNCacheDiskAdmission::minObservations(threshold);
     for(uint64_t recorded = 0; recorded <= 6; recorded++)
       testAssert(write.admits(recorded) == shared.admits(recorded));
 
@@ -236,18 +227,18 @@ void testTheReadAndWriteSidesShareOneLookupThresholdRule() {
     const uint64_t uncounted = 0;
     testAssert(shared.admits(uncounted) == (threshold == 0));
   }
-  // all() is not minLookups(0) wearing a different name, but it must agree with it, because
+  // all() is not minObservations(0) wearing a different name, but it must agree with it, because
   // a client writing either means the same thing.
   for(uint64_t recorded = 0; recorded <= 3; recorded++)
     testAssert(NNCacheDiskAdmission::all().admits(recorded));
-  testAssert(NNCacheDiskAdmission::minLookups(2).describe().find("2") != string::npos);
+  testAssert(NNCacheDiskAdmission::minObservations(2).describe().find("2") != string::npos);
 }
 
 //-------------------------------------------------------------------------------------
 // Claim 1: the admission threshold, witnessed against the file
 //-------------------------------------------------------------------------------------
 
-// Three keys, recorded at 0, 1 and 2 lookups. Under minLookups(2) exactly one of them may
+// Three keys, recorded at 0, 1 and 2 observations. Under minObservations(2) exactly one of them may
 // reach the file, and the observation point is the file -- loaded back off the filesystem
 // after the dump returned, not the plan the dump produced.
 void testAnEntryBelowTheAdmissionThresholdIsAbsentFromTheWrittenContainer() {
@@ -270,7 +261,7 @@ void testAnEntryBelowTheAdmissionThresholdIsAbsentFromTheWrittenContainer() {
   const NNEvalContainer container =
     NNEvalContainer::forContextAndModel(dir.path(), "card-5455", MODEL, MODEL_VERSION);
   const NNCacheEvaluationDumpResult result = nnCacheDumpEvaluations(
-    container, *table, card, NNCacheDiskAdmission::minLookups(2), observations(counts)
+    container, *table, card, NNCacheDiskAdmission::minObservations(2), observations(counts)
   );
   // THE WITNESS COMES FIRST, deliberately: the claim is about the file, so the file is what
   // fails when the claim fails. Asserting the planner's own report before it would let a
@@ -286,7 +277,7 @@ void testAnEntryBelowTheAdmissionThresholdIsAbsentFromTheWrittenContainer() {
   testAssert(result.plan.belowThreshold == 2);
   testAssert(result.plan.alreadyPersisted == 0);
   testAssert(result.plan.notResident == 0);
-  cout << "  admission minLookups(2): 3 earned, " << onDisk.entries().size()
+  cout << "  admission minObservations(2): 3 earned, " << onDisk.entries().size()
        << " on disk; seen-twice present=" << containerHasKey(onDisk, nthKey(seenTwice))
        << " seen-once present=" << containerHasKey(onDisk, nthKey(seenOnce))
        << " uncounted present=" << containerHasKey(onDisk, nthKey(neverCounted)) << endl;
@@ -512,57 +503,22 @@ void testALiveOverwriteClearsTheMarkSoAnOwnermapUpgradeReachesDisk() {
 //-------------------------------------------------------------------------------------
 // Claim 3: the count delta
 //-------------------------------------------------------------------------------------
-
-// A take is a DELTA and a second take with nothing in between is empty, at both levels: the
-// frozen level 0's per-entry counters and level 1's hit ledger.
-void testASecondCountTakeWithNoInterveningLookupsYieldsNothing() {
-  unique_ptr<NNCacheTable> table = twoLevelTableOver(vector<int>(1, 100));
-  const NNCacheContextId card = table->attachCacheContext("card-5455");
-  table->set(makeOutput(1, 1, false), NNCacheAttribution::toContext(card));
-
-  shared_ptr<NNOutput> got;
-  testAssert(table->get(nthKey(100), got));  // a level-0 hit
-  testAssert(table->get(nthKey(100), got));  // and another
-  testAssert(table->get(nthKey(1), got));    // a level-1 hit
-
-  const NNCacheHitLedger firstTake = table->takeUnpersistedHitCounts();
-  testAssert(firstTake.isCounted());
-  testAssert(firstTake.entries().size() == 2);
-  for(size_t i = 0; i < firstTake.entries().size(); i++) {
-    if(firstTake.entries()[i].key == nthKey(100))
-      testAssert(firstTake.entries()[i].hits == 2);
-    else {
-      testAssert(firstTake.entries()[i].key == nthKey(1));
-      testAssert(firstTake.entries()[i].hits == 1);
-    }
-  }
-
-  // Nothing in between.
-  const NNCacheHitLedger secondTake = table->takeUnpersistedHitCounts();
-  testAssert(secondTake.isCounted());
-  testAssert(secondTake.entries().empty());
-
-  // And the delta resumes from the mark rather than from zero or from the total.
-  testAssert(table->get(nthKey(100), got));
-  const NNCacheHitLedger thirdTake = table->takeUnpersistedHitCounts();
-  testAssert(thirdTake.entries().size() == 1);
-  testAssert(thirdTake.entries()[0].key == nthKey(100));
-  testAssert(thirdTake.entries()[0].hits == 1);
-
-  // The pure-read surface is untouched by any of it: it still reports the session totals,
-  // which is what stats and a between-searches report want. Two surfaces, two meanings.
-  cout << "  count take: first=" << firstTake.entries().size()
-       << " rows, second (nothing in between)=" << secondTake.entries().size()
-       << " rows, third after one more lookup=" << thirdTake.entries().size()
-       << " rows of " << thirdTake.entries()[0].hits << " hit" << endl;
-
-  const NNCacheHitLedger reported = table->harvestHitCounts();
-  testAssert(reported.isCounted());
-  for(size_t i = 0; i < reported.entries().size(); i++) {
-    if(reported.entries()[i].key == nthKey(100))
-      testAssert(reported.entries()[i].hits == 3);
-  }
-}
+//
+// THE DELTA LEGS THAT STOOD HERE ARE GONE WITH THE MACHINERY THEY TESTED. They witnessed the
+// RETRIEVAL delta -- the frozen index's per-entry persisted mark, the two-level hit ledger's
+// mark, and NNCacheHitCountDelta::take over both -- which existed for exactly one consumer, a
+// count log denominated in retrievals. The count log's currency is observations now, its rows
+// come from the base table's observation ledger, and nothing appends a retrieval counter to
+// any file; the marks had no reader left and were removed rather than kept as state nothing
+// reads (ADR-0012's cancer E).
+//
+// What those legs claimed is claimed still, in the currency that now carries it, in
+// testnncacheobservations.cpp: a second take with nothing in between is empty, a take resumes
+// from the mark, the absolute surface is unmoved by taking the delta, and an
+// attach/dump/detach/re-attach cycle with no traffic leaves the count log unchanged.
+//
+// TWO LEGS ARE KEPT HERE, because they are about the DUMP and not about the delta: an earned
+// key the table no longer holds, and a dump not counting itself into what it dumps.
 
 // AN EARNED KEY THAT IS NO LONGER IN THE TABLE IS COUNTED, NOT WRITTEN AS A HOLE. The
 // attribution ledger records what a session EARNED, which is a superset of what the table
@@ -599,8 +555,8 @@ void testAnEarnedKeyTheTableNoLongerHoldsIsCountedAndNotWritten() {
 // A DUMP MUST NOT APPEAR IN THE COUNTS IT IS DUMPING. Reading the entries to be written
 // through get() would count each one as a retrieval, so every dump would raise the popularity
 // of exactly the keys it wrote -- a self-fulfilling ranking that the next attach's build order
-// then believes. The witness is a take AFTER a dump: the dump read three entries, and the take
-// must still be empty.
+// then believes. Under observation currency the hazard is the same and the surface is the
+// per-context observation delta: the witness is a take AFTER a dump, and it must be empty.
 void testADumpDoesNotCountItselfIntoTheCountsItIsDumping() {
   ScopedTempDir dir(TMP_DIR_PREFIX);
   const NNEvalContainer container =
@@ -611,160 +567,66 @@ void testADumpDoesNotCountItselfIntoTheCountsItIsDumping() {
     table->set(makeOutput(serial, 1, false), NNCacheAttribution::toContext(card));
 
   // Start from a clean slate so anything the dump adds is the only thing there is.
-  (void)table->takeUnpersistedHitCounts();
+  (void)table->takeUnpersistedObservationCountsFor(card);
 
   const NNCacheEvaluationDumpResult result = nnCacheDumpEvaluations(
     container, *table, card, NNCacheDiskAdmission::all(), vector<NNCacheCountRow>()
   );
   testAssert(result.plan.entries.size() == 3);
 
-  const NNCacheHitLedger afterDump = table->takeUnpersistedHitCounts();
-  testAssert(afterDump.isCounted());
+  const NNCacheObservationLedger afterDump = table->takeUnpersistedObservationCountsFor(card);
+  testAssert(afterDump.isObserved());
   testAssert(afterDump.entries().empty());
   cout << "  a dump of " << result.plan.entries.size() << " entries left "
-       << afterDump.entries().size() << " rows of new hits behind it" << endl;
+       << afterDump.entries().size() << " rows of new observations behind it" << endl;
 }
 
-// THE COMPOSED INVARIANT, at the seam this increment can reach: attach, look up, dump,
-// detach, RE-ATTACH THE SAME CARD, dump again with no queries in between. The count log must
-// be unchanged by the second dump -- not merely "not doubled", unchanged.
+// THE THREE LEGS THAT STOOD HERE ARE GONE WITH THE RETRIEVAL DELTA, and each is answered in
+// the currency that replaced it rather than dropped:
 //
-// The re-attach is modelled by discarding the table and building a fresh one over a level 0
-// carrying the same keys, which is exactly what a detach and a re-attach do to it. What is
-// NOT modelled here is the protocol: cache_attach and cache_dump do not exist yet, so the
-// walk is driven through the library seams those actions will call.
-void testAnAttachDumpDetachReattachDumpCycleLeavesTheCountLogUnchanged() {
-  ScopedTempDir dir(TMP_DIR_PREFIX);
-  const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "card-5455");
-  const vector<int> zeroSerials(1, 100);
-
-  {
-    unique_ptr<NNCacheTable> table = twoLevelTableOver(zeroSerials);
-    shared_ptr<NNOutput> got;
-    for(int i = 0; i < 5; i++)
-      testAssert(table->get(nthKey(100), got));
-    (void)log.appendDump(NNCacheHitCountDelta::take(*table));
-  }
-  const NNCacheCountLogContents afterFirst = log.load();
-  testAssert(logHasKey(afterFirst, nthKey(100)));
-  testAssert(logRowFor(afterFirst, nthKey(100)).lookups == 5);
-  testAssert(logRowFor(afterFirst, nthKey(100)).sessions == 1);
-
-  // The re-attach: the same card, freshly loaded, nothing looked up.
-  {
-    unique_ptr<NNCacheTable> table = twoLevelTableOver(zeroSerials);
-    const NNCacheHitCountDelta delta = NNCacheHitCountDelta::take(*table);
-    testAssert(delta.ledger().isCounted());
-    testAssert(delta.ledger().entries().empty());
-    (void)log.appendDump(delta);
-  }
-
-  // THE WITNESS: every key's accumulated figures, read back off disk, are what they were.
-  const NNCacheCountLogContents afterSecond = log.load();
-  testAssert(afterSecond.rows().size() == afterFirst.rows().size());
-  for(size_t i = 0; i < afterFirst.rows().size(); i++) {
-    const NNCacheCountRow before = afterFirst.rows()[i];
-    const NNCacheCountRow after = logRowFor(afterSecond, before.key);
-    testAssert(after.lookups == before.lookups);
-    testAssert(after.sessions == before.sessions);
-  }
-  cout << "  attach/dump/detach/re-attach/dump: key100 lookups "
-       << logRowFor(afterFirst, nthKey(100)).lookups << " -> " << logRowFor(afterSecond, nthKey(100)).lookups
-       << ", sessions " << logRowFor(afterFirst, nthKey(100)).sessions
-       << " -> " << logRowFor(afterSecond, nthKey(100)).sessions << endl;
-}
-
-// The same walk with the PURE-READ surface handed to the dump instead of the delta take --
-// the shape a caller reaches for if the two surfaces are confused. It is the defect this
-// increment's type exists to foreclose, kept here as the RUNTIME half of that witness: what
-// the record looks like when an absolute total reaches an additive reader.
+//   attach/dump/detach/re-attach with no traffic leaving the log unchanged -> witnessed in
+//   testnncacheobservations.cpp, on the observation delta, which is what a dump now appends.
 //
-// It no longer composes the way the defect originally did. appendDump takes
-// NNCacheHitCountDelta, so `log.appendDump(table->harvestHitCounts())` is a compile error --
-// which is the point, and which is witnessed as such rather than here. To keep the runtime
-// consequence observable the harvest is laundered through ofDeltaRows below, deliberately and
-// under a name that says "delta" over rows that are not one. That launder is what a caller
-// would now have to type on purpose to reach this defect; before the type existed it was the
-// obvious one-liner.
-void testTheSameCycleThroughTheReportingSurfaceDoesInflateTheRecord() {
-  ScopedTempDir dir(TMP_DIR_PREFIX);
-  const NNCacheCountLog log = NNCacheCountLog::forContext(dir.path(), "card-5455");
-  const vector<int> zeroSerials(1, 100);
-
-  {
-    unique_ptr<NNCacheTable> table = twoLevelTableOver(zeroSerials);
-    shared_ptr<NNOutput> got;
-    for(int i = 0; i < 5; i++)
-      testAssert(table->get(nthKey(100), got));
-    (void)log.appendDump(launderAsDelta(table->harvestHitCounts()));
-  }
-  const NNCacheCountLogContents afterFirst = log.load();
-  testAssert(logRowFor(afterFirst, nthKey(100)).lookups == 5);
-  testAssert(logRowFor(afterFirst, nthKey(100)).sessions == 1);
-
-  {
-    unique_ptr<NNCacheTable> table = twoLevelTableOver(zeroSerials);
-    // Not empty: the reporting surface reports a row of zero hits for a pre-warmed key that
-    // earned nothing, deliberately, and appendDump raises that key's sessions for it.
-    testAssert(!table->harvestHitCounts().entries().empty());
-    (void)log.appendDump(launderAsDelta(table->harvestHitCounts()));
-  }
-  const NNCacheCountLogContents afterSecond = log.load();
-  testAssert(logRowFor(afterSecond, nthKey(100)).lookups == 5);
-  testAssert(logRowFor(afterSecond, nthKey(100)).sessions == 2);
-  cout << "  same cycle through the reporting surface: key100 sessions "
-       << logRowFor(afterFirst, nthKey(100)).sessions << " -> "
-       << logRowFor(afterSecond, nthKey(100)).sessions << " with nothing looked up" << endl;
-}
-
-// A shadowing set hands level 1 the hits level 0 accrued. It must hand over the UNPERSISTED
-// remainder and not the total, or the part already written to the log is written again.
-void testShadowingTransfersOnlyTheHitsThatHaveNotReachedTheLog() {
-  unique_ptr<NNCacheTable> table = twoLevelTableOver(vector<int>(1, 100));
-  shared_ptr<NNOutput> got;
-  for(int i = 0; i < 4; i++)
-    testAssert(table->get(nthKey(100), got));
-
-  const NNCacheHitLedger firstTake = table->takeUnpersistedHitCounts();
-  testAssert(firstTake.entries().size() == 1);
-  testAssert(firstTake.entries()[0].hits == 4);
-
-  // Two more, then the ownership-map fall-through's set, which shadows the level-0 entry and
-  // transfers what it accrued into level 1's ledger.
-  testAssert(table->get(nthKey(100), got));
-  testAssert(table->get(nthKey(100), got));
-  table->set(makeOutput(100, 2, true));
-
-  const NNCacheHitLedger secondTake = table->takeUnpersistedHitCounts();
-  testAssert(secondTake.entries().size() == 1);
-  testAssert(secondTake.entries()[0].key == nthKey(100));
-  // TWO, not six: the four already in the log left with the log, not with the key.
-  testAssert(secondTake.entries()[0].hits == 2);
-  cout << "  shadowing transfers the unpersisted remainder: 6 hits, 4 already in the log, "
-       << secondTake.entries()[0].hits << " transferred" << endl;
-}
+//   the same cycle through the ABSOLUTE surface inflating the record -> there is no absolute
+//   observation surface a dump can be handed at all: appendDump takes NNCacheObservationDelta,
+//   whose only doors are a consuming per-context take and an explicit rows-and-a-residue
+//   constructor, so the laundering this leg had to perform on purpose no longer has anything
+//   to launder.
+//
+//   a shadowing set transferring only the UNPERSISTED remainder -> shadow() transfers the whole
+//   counter now, because no part of it has ever been written anywhere; the transfer itself is
+//   witnessed in testnncachetwolevel.cpp.
 
 //-------------------------------------------------------------------------------------
 // The cost claim, mechanized
 //-------------------------------------------------------------------------------------
 
-// The persisted mark is claimed to cost nothing, in three structures. A claim about bytes is
-// asserted against sizeof rather than left in a comment, because a comment about a byte
-// figure in this very file has already been wrong once (see the recorder's own header).
-void testThePersistedMarkCostsNoBytesInAnyStructureThatCarriesIt() {
-  // The attribution recorder's row: 16 of key, 8 of set id, 4 of context index, 1 of mark,
-  // in a structure aligned to 8. The mark is inside the alignment, not beside it.
+// THE PER-ROW SIZES THE COMMENTS CLAIM, ASSERTED AGAINST sizeof. A claim about bytes belongs
+// in a check and not in prose, because a comment about a byte figure in this very family has
+// already been wrong once (see the recorder's own header).
+//
+// The retrieval-side persisted marks are gone -- see "Claim 3" above -- and the point of
+// keeping this leg is that removing them changed NOTHING here: every figure is what it was,
+// because every mark lived in alignment padding that is still padding. A regression that
+// grew any of these rows fails here.
+void testTheCountingRowsAreTheSizesTheirCommentsClaim() {
+  // The attribution recorder's row: 16 of key, 8 of set id, 4 of context index, 1 of the
+  // persisted bit, in a structure aligned to 8.
   testAssert(NNCacheAttributionRecorder::rowBytes() == 32);
-  // The two-level hit ledger's row: 16 + 4 + 4, the last four being what alignment always
-  // spent here. twoLevelHitLedgerBytes is the one home of that arithmetic.
+  // The two-level hit ledger's row: 16 + 4 + 4 of padding. twoLevelHitLedgerBytes is the one
+  // home of that arithmetic.
   testAssert(twoLevelHitLedgerBytes(0) == 24);
   testAssert(twoLevelHitLedgerBytes(10) == 24 * 1024);
   // The frozen index's record: SPEC.md 8's whole cache-line argument rests on this being 32,
-  // and the mark went into the 4 bytes it already reserved.
+  // and it still is with the mark removed.
   testAssert(NNCacheFrozenIndex::recordBytes() == 32);
-  cout << "  the mark costs: recorder row " << NNCacheAttributionRecorder::rowBytes()
-       << " B, hit ledger row " << (twoLevelHitLedgerBytes(10) / 1024)
-       << " B, frozen record " << NNCacheFrozenIndex::recordBytes() << " B" << endl;
+  // The observation recorder's row: 16 of key, 4 of count, 4 of mark, 4 of context index, in a
+  // structure aligned to 8 -- two rows to a cache line.
+  testAssert(NNCacheObservationRecorder::rowBytes() == 32);
+  cout << "  row sizes: attribution " << NNCacheAttributionRecorder::rowBytes()
+       << " B, hit ledger " << (twoLevelHitLedgerBytes(10) / 1024)
+       << " B, frozen record " << NNCacheFrozenIndex::recordBytes()
+       << " B, observation " << NNCacheObservationRecorder::rowBytes() << " B" << endl;
 }
 
 //-------------------------------------------------------------------------------------
@@ -788,20 +650,16 @@ void testTheDumpSeamsRefuseAContextThisTableDidNotAttach() {
 void Tests::runNNCacheDumpTests() {
   cout << "Running NN cache dump admission and persistence tests" << endl;
 
-  testTheReadAndWriteSidesShareOneLookupThresholdRule();
+  testTheReadAndWriteSidesShareOneObservationThresholdRule();
   testAnEntryBelowTheAdmissionThresholdIsAbsentFromTheWrittenContainer();
   testTheSameSessionUnderAllAdmitsEveryEntryTheFirstOneRefused();
   testAnEntryFilledFromTheContainerIsNeverWrittenBackToIt();
   testTheSameFillDeclaredLiveDoesReAppendTheWholeRemainder();
   testASecondDumpWithNothingInBetweenLeavesTheContainerByteIdentical();
   testALiveOverwriteClearsTheMarkSoAnOwnermapUpgradeReachesDisk();
-  testASecondCountTakeWithNoInterveningLookupsYieldsNothing();
   testAnEarnedKeyTheTableNoLongerHoldsIsCountedAndNotWritten();
   testADumpDoesNotCountItselfIntoTheCountsItIsDumping();
-  testAnAttachDumpDetachReattachDumpCycleLeavesTheCountLogUnchanged();
-  testTheSameCycleThroughTheReportingSurfaceDoesInflateTheRecord();
-  testShadowingTransfersOnlyTheHitsThatHaveNotReachedTheLog();
-  testThePersistedMarkCostsNoBytesInAnyStructureThatCarriesIt();
+  testTheCountingRowsAreTheSizesTheirCommentsClaim();
   testTheDumpSeamsRefuseAContextThisTableDidNotAttach();
 
   cout << "Done" << endl;

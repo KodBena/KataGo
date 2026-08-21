@@ -135,7 +135,7 @@ void testTheLevelZeroBoundIsExactlyOneOfThree() {
   {
     json request = attachRequest();
     request["level0"] = json::object();
-    request["level0"]["minLookups"] = 2;
+    request["level0"]["minObservations"] = 2;
     const CacheActionDecode<CacheAttachRequest> decoded = decodeCacheAttach(request);
     testAssert(decoded.value().has_value());
     testAssert(decoded.value().value().levelZeroBound.describe().find("2") != string::npos);
@@ -144,7 +144,7 @@ void testTheLevelZeroBoundIsExactlyOneOfThree() {
     // Two bounds are two different prefixes of one ranked order, and the engine will not pick.
     json request = attachRequest();
     request["level0"] = json::object();
-    request["level0"]["minLookups"] = 2;
+    request["level0"]["minObservations"] = 2;
     request["level0"]["maxBytes"] = 1000;
     const CacheActionDecode<CacheAttachRequest> decoded = decodeCacheAttach(request);
     testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "level0");
@@ -168,7 +168,7 @@ void testTheLevelZeroBoundIsExactlyOneOfThree() {
   // Absent IS all(), which is the documented default.
   testAssert(decodeCacheAttach(attachRequest()).value().value().levelZeroBound.describe() ==
              NNCacheLevelZeroBound::all().describe());
-  cout << "  level0 takes exactly one of minLookups/maxEntries/maxBytes, or nothing" << endl;
+  cout << "  level0 takes exactly one of minObservations/maxEntries/maxBytes, or nothing" << endl;
 }
 
 void testTheLevelOneFillIsBoundedInBytesOrNotRequested() {
@@ -224,30 +224,36 @@ void testTheDumpTargetIsRequiredAndClosed() {
   cout << "  cache_dump's \"what\" is required and closed to three values" << endl;
 }
 
-// admission is REQUIRED and has no default (ledger row 1652: the operator rejected a silent
-// all() default -- a dump writes to disk, and SSD wear is not something to infer from an
-// absent field). Both explicit forms -- "all":true and minLookups -- are exercised, along with
-// every way of getting it wrong: absent, neither key, both keys, and all:false.
-void testTheDumpAdmissionIsRequiredAndClosed() {
+// admission IS OPTIONAL AND ITS ABSENCE MEANS minObservations(2) (ratified spec, ledger rows
+// 1717/1722). This REPLACES the required-field refusal of cd200625, whose reason -- that the
+// currency an admission ought to gate on was an open question, so no default could be picked
+// honestly -- is spent now that the currency is settled. What is exercised here: the default a
+// missing field gets, both explicit forms, every way of getting an explicit form wrong, and
+// the teaching refusal the retired "minLookups" key earns.
+void testTheDumpAdmissionDefaultsToSeenTwiceAndIsOtherwiseClosed() {
   {
+    // ABSENT: the default, and it is the conservative arm rather than "write everything".
     json request = dumpRequest();
     request.erase("admission");
     const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
-    testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "admission");
-    testAssert(decoded.refusal().value().message.find("minLookups") != string::npos);
-    testAssert(decoded.refusal().value().message.find("\"all\"") != string::npos);
+    testAssert(decoded.value().has_value());
+    const NNCacheDiskAdmission admission = decoded.value().value().admission;
+    testAssert(admission.admits(2));
+    testAssert(!admission.admits(1));
+    testAssert(admission.describe().find("2") != string::npos);
   }
   {
-    // Neither key inside the object: still refused, not read as all().
+    // AN EMPTY OBJECT IS NOT THE DEFAULT. Omitting the field says "give me yours"; sending {}
+    // says "here is my policy" and then names none, which is a client bug worth reporting.
     json request = dumpRequest();
     request["admission"] = json::object();
     const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
     testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "admission");
   }
   {
-    // Both keys: exactly one is required, not "at most one".
+    // Both keys: exactly one, not "at most one".
     json request = dumpRequest();
-    request["admission"]["minLookups"] = 2;
+    request["admission"]["minObservations"] = 2;
     const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
     testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "admission");
   }
@@ -264,12 +270,42 @@ void testTheDumpAdmissionIsRequiredAndClosed() {
   {
     json request = dumpRequest();
     request["admission"] = json::object();
-    request["admission"]["minLookups"] = 2;
+    request["admission"]["minObservations"] = 3;
     const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
     testAssert(decoded.value().has_value());
-    testAssert(decoded.value().value().admission.describe().find("2") != string::npos);
+    testAssert(decoded.value().value().admission.describe().find("3") != string::npos);
   }
-  cout << "  cache_dump's \"admission\" is required and closed to \"all\" or \"minLookups\"" << endl;
+  cout << "  cache_dump's \"admission\" defaults to minObservations(2) and is otherwise closed" << endl;
+}
+
+// THE RETIRED KEY IS A TEACHING REFUSAL, NOT AN ALIAS, and the refusal has to say why -- the
+// quantity changed, not just the word, so accepting it would have admitted strictly more to
+// disk than the client asked for with nothing in the response saying so.
+void testTheRetiredMinLookupsKeyIsRefusedAndNamesItsReplacement() {
+  {
+    json request = dumpRequest();
+    request["admission"] = json::object();
+    request["admission"]["minLookups"] = 2;
+    const CacheActionDecode<CacheDumpRequest> decoded = decodeCacheDump(request);
+    testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "admission");
+    const string& message = decoded.refusal().value().message;
+    testAssert(message.find("minObservations") != string::npos);
+    testAssert(message.find("no longer accepted") != string::npos);
+    // It explains the CHANGE, not just the spelling: a client that reads only the message has
+    // enough to know its policy means something different now.
+    testAssert(message.find("OBSERVATION") != string::npos);
+    testAssert(message.find("RETRIEVAL") != string::npos);
+  }
+  {
+    json request = attachRequest();
+    request["level0"] = json::object();
+    request["level0"]["minLookups"] = 2;
+    const CacheActionDecode<CacheAttachRequest> decoded = decodeCacheAttach(request);
+    testAssert(decoded.refusal().has_value() && decoded.refusal().value().field == "level0");
+    testAssert(decoded.refusal().value().message.find("minObservations") != string::npos);
+  }
+  cout << "  the retired \"minLookups\" key is refused by name on both actions, naming what "
+       << "replaced it and why" << endl;
 }
 
 void testAContextIsRequiredOnTheThreeActionsThatActOnOne() {
@@ -353,10 +389,7 @@ void testTheSwapRefusalNamesTheOpenRequestCount() {
 // model's internal name -- so a stub would make every model's container one file.
 class RealEngineCache {
  public:
-  // `admissionSignalMeasurement` is false by default, matching the operator's own gate default
-  // (ledger rows 1652/1655/1660): most callers of this fixture want the byte-identical default
-  // engine, and the one test that wants the gate on says so explicitly at its own call site.
-  explicit RealEngineCache(bool admissionSignalMeasurement = false)
+  RealEngineCache()
     : dir(TMP_DIR_PREFIX),
       cacheDir(TMP_DIR_PREFIX),
       logger(nullptr, false, false, false, false),
@@ -366,8 +399,7 @@ class RealEngineCache {
       "nnCacheSizePowerOfTwo = 12\n"
       "nnMutexPoolSizePowerOfTwo = 8\n"
       "numSearchThreads = 1\n"
-      "nnCacheDir = " + cacheDir.path() + "\n" +
-      (admissionSignalMeasurement ? "nnCacheAdmissionSignalMeasurement = true\n" : "")
+      "nnCacheDir = " + cacheDir.path() + "\n"
     );
     cfg.initialize(cfgIn);
     const bool randFileName = true;
@@ -482,14 +514,20 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
   testAssert(firstAttach["containerTail"].get<string>() == "intact");
   testAssert(eval.numLevelZeroSources() == 1);
 
-  // The session earns three entries under that context and retrieves one of them twice.
+  // The session PRESENTS three positions under that context, evaluating each once, and then
+  // asks for one of them twice more. observe() is the door NNEvaluator::evaluate calls once per
+  // request; the get/set pair beside it is what that request then did with the cache.
   const NNCacheContextId contextId = attachments.attachmentFor(model, CONTEXT).contextId;
   const NNCacheAttribution attribution = NNCacheAttribution::toContext(contextId);
-  for(int serial = 1; serial <= 3; serial++)
+  for(int serial = 1; serial <= 3; serial++) {
+    eval.cacheTable().observe(nthKey(serial), attribution);
     eval.cacheTable().set(makeOutput(serial, serial == 2), attribution);
+  }
   shared_ptr<NNOutput> got;
-  testAssert(eval.cacheTable().get(nthKey(1), got));
-  testAssert(eval.cacheTable().get(nthKey(1), got));
+  for(int again = 0; again < 2; again++) {
+    eval.cacheTable().observe(nthKey(1), attribution);
+    testAssert(eval.cacheTable().get(nthKey(1), got));
+  }
 
   // The dump. Counts first, then evaluations, which is the order the admission predicate needs.
   const CacheDumpRequest dumpBoth{CONTEXT, CacheDumpWhat::Both, NNCacheDiskAdmission::all()};
@@ -515,7 +553,9 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
   testAssert(!attachments.isAttached(model, CONTEXT));
 
   // THE WITNESS: re-attach and read what came back. Three entries in level 0, and the count log
-  // holds the two retrievals of key 1 -- both figures read off the files this cycle wrote.
+  // holds the THREE observations of key 1 -- one for the request that evaluated it and one for
+  // each of the two that were answered from cache. Both figures read off the files this cycle
+  // wrote.
   const json reattached = cacheAttachExecute(*engine.hosts, model, attachments, attachAll(CONTEXT));
   testAssert(reattached["entriesInLevelZero"].get<int64_t>() == 3);
   const NNCacheCountLogContents counts =
@@ -525,8 +565,8 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
   for(size_t i = 0; i < counts.rows().size(); i++) {
     if(counts.rows()[i].key == nthKey(1)) {
       foundKeyOne = true;
-      testAssert(counts.rows()[i].lookups == 2);
-      // ONE dump in which this key earned a retrieval. Not "one dump that carried it through":
+      testAssert(counts.rows()[i].observations == 3);
+      // ONE dump in which this key was observed. Not "one dump that carried it through":
       // see NNCacheCountRow::sessions.
       testAssert(counts.rows()[i].sessions == 1);
     }
@@ -715,20 +755,24 @@ void testCountsAreDumpedPerContextWithTwoContextsAttached(RealEngineCache& engin
   const NNCacheContextId idB = attachments.attachmentFor(model, cardB).contextId;
   testAssert(attachments.attachedContexts(model).size() == 2);
 
-  // Card A earns nothing and serves one of its own pre-warmed positions twice. Card B earns one
-  // key and retrieves it once. Both halves of both cards are therefore live.
+  // Card A earns nothing and is asked twice for one of its own pre-warmed positions. Card B is
+  // asked once for a position it has to evaluate. Both halves of both cards are therefore live,
+  // and BOTH are observations -- which is the currency change: A's card would once have been
+  // the only one of the two with anything to write.
   shared_ptr<NNOutput> got;
-  testAssert(eval.cacheTable().get(nthKey(401), got));
-  testAssert(eval.cacheTable().get(nthKey(401), got));
+  for(int again = 0; again < 2; again++) {
+    eval.cacheTable().observe(nthKey(401), NNCacheAttribution::toContext(idA));
+    testAssert(eval.cacheTable().get(nthKey(401), got));
+  }
+  eval.cacheTable().observe(nthKey(451), NNCacheAttribution::toContext(idB));
   eval.cacheTable().set(makeOutput(451, false), NNCacheAttribution::toContext(idB));
-  testAssert(eval.cacheTable().get(nthKey(451), got));
 
-  // A'S DUMP, with B attached. It writes A's retrievals...
+  // A'S DUMP, with B attached. It writes A's observations...
   const json dumpedA = cacheDumpExecute(*engine.hosts, model, attachments, countsA, counters(0));
   testAssert(dumpedA["counts"]["bytesAppended"].get<int64_t>() > 0);
   const std::optional<NNCacheCountRow> aRow = countRowFor(engine.cacheDir.path(), cardA, nthKey(401));
   testAssert(aRow.has_value());
-  testAssert(aRow.value().lookups == 2);
+  testAssert(aRow.value().observations == 2);
   testAssert(aRow.value().sessions == 1);
   // ...AND NOT B'S. Watched as a positive observation about A's file: B's key is not in it, and
   // B's file does not exist yet at all.
@@ -737,30 +781,31 @@ void testCountsAreDumpedPerContextWithTwoContextsAttached(RealEngineCache& engin
 
   // A SECOND DUMP OF A, WITH NOTHING IN BETWEEN, APPENDS NOTHING. Not "little" -- the delta is
   // empty, so no row of A's file changes and no key's sessions rises. Read off the file: a dump
-  // that had re-appended the running total would show lookups 2 -> 4 and sessions 1 -> 2, which
+  // that had re-appended the running total would show observations 2 -> 4 and sessions 1 -> 2, which
   // is exactly the record inflation the delta type exists to prevent.
   const json dumpedAgain = cacheDumpExecute(*engine.hosts, model, attachments, countsA, counters(0));
   const std::optional<NNCacheCountRow> aRowAgain = countRowFor(engine.cacheDir.path(), cardA, nthKey(401));
   testAssert(aRowAgain.has_value());
-  testAssert(aRowAgain.value().lookups == 2);
+  testAssert(aRowAgain.value().observations == 2);
   testAssert(aRowAgain.value().sessions == 1);
   testAssert(dumpedAgain["counts"]["rowsInLog"].get<int64_t>() == dumpedA["counts"]["rowsInLog"].get<int64_t>());
 
   // AND B'S DELTA IS STILL WHOLE AFTER A TOOK ITS OWN. A whole-table take dressed as a per-context
-  // one would have consumed B's retrieval here and dropped it on the floor, leaving B's file
-  // claiming its key was never looked up.
+  // one would have consumed B's observation here and dropped it on the floor, leaving B's file
+  // claiming its position never came up.
   const json dumpedB = cacheDumpExecute(*engine.hosts, model, attachments, countsB, counters(0));
   testAssert(dumpedB["counts"]["bytesAppended"].get<int64_t>() > 0);
   const std::optional<NNCacheCountRow> bRow = countRowFor(engine.cacheDir.path(), cardB, nthKey(451));
   testAssert(bRow.has_value());
-  testAssert(bRow.value().lookups == 1);
+  testAssert(bRow.value().observations == 1);
   testAssert(bRow.value().sessions == 1);
   testAssert(!countRowFor(engine.cacheDir.path(), cardB, nthKey(401)).has_value());
 
-  cout << "  two contexts attached: card A's counts dump wrote its own level-0 retrievals ("
-       << aRow.value().lookups << " lookups, " << aRow.value().sessions << " session) and none of B's; "
-       << "a second dump left them at " << aRowAgain.value().lookups << "/" << aRowAgain.value().sessions
-       << "; B's own dump then carried its " << bRow.value().lookups << endl;
+  cout << "  two contexts attached: card A's counts dump wrote its own level-0 observations ("
+       << aRow.value().observations << " observations, " << aRow.value().sessions
+       << " session) and none of B's; a second dump left them at " << aRowAgain.value().observations
+       << "/" << aRowAgain.value().sessions << "; B's own dump then carried its "
+       << bRow.value().observations << endl;
 
   (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{cardA, true});
   (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{cardB, true});
@@ -811,9 +856,14 @@ void testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(RealEngineCache& engine
   const json reattached = cacheAttachExecute(*engine.hosts, model, attachments, attachAll(card));
   testAssert(reattached["entriesInLevelZero"].get<int64_t>() == 2);
   shared_ptr<NNOutput> got;
-  testAssert(eval.cacheTable().get(nthKey(501), got));
-  testAssert(eval.cacheTable().get(nthKey(501), got));
-  testAssert(eval.cacheTable().get(nthKey(502), got));
+  const NNCacheContextId prewarmedId = attachments.attachmentFor(model, card).contextId;
+  const int prewarmedSerials[3] = {501, 501, 502};
+  shared_ptr<NNOutput> unused;
+  for(int i = 0; i < 3; i++) {
+    eval.cacheTable().observe(nthKey(prewarmedSerials[i]), NNCacheAttribution::toContext(prewarmedId));
+    testAssert(eval.cacheTable().get(nthKey(prewarmedSerials[i]), got));
+  }
+  (void)unused;
 
   // THE EXHIBIT, HALF ONE: both quantities the OLD refusal read are silent in this state.
   //
@@ -827,18 +877,18 @@ void testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(RealEngineCache& engine
   //   about a mechanism.
   const NNCacheContextId liveContextId = attachments.attachmentFor(model, card).contextId;
   testAssert(eval.cacheTable().unpersistedKeysFor(liveContextId).empty());
-  // And the retrievals really are there to be lost, read off the per-context surface rather than
-  // the whole-table one -- this fixture's engine has served other cards, and a figure that
+  // And the observations really are there to be lost, read off the per-context surface rather
+  // than the whole-table one -- this fixture's engine has served other cards, and a figure that
   // included them would not be about this card at all.
-  const NNCacheHitLedger held = eval.cacheTable().harvestHitCountsFor(liveContextId);
-  int64_t heldHits = 0;
+  const NNCacheObservationLedger held = eval.cacheTable().harvestObservationCountsFor(liveContextId);
+  int64_t heldObservations = 0;
   for(size_t i = 0; i < held.entries().size(); i++)
-    heldHits += (int64_t)held.entries()[i].hits;
-  testAssert(heldHits == 3);
+    heldObservations += (int64_t)held.entries()[i].observations;
+  testAssert(heldObservations == 3);
 
   // THE EXHIBIT, HALF TWO: THE LOSS. A detach that both blind checks permitted is what
   // discardUndumped:true reproduces exactly -- the same act, with the refusal stood down -- and
-  // the file afterwards is the observation. The three retrievals are not in it, and nothing
+  // the file afterwards is the witness. The three observations are not in it, and nothing
   // anywhere says they happened.
   (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{card, true});
   const std::optional<NNCacheCountRow> afterLoss = countRowFor(engine.cacheDir.path(), card, nthKey(501));
@@ -847,36 +897,37 @@ void testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(RealEngineCache& engine
 
   // NOW THE SAME HISTORY AGAIN, AGAINST THE QUERY THAT REPLACED THE PROXY.
   (void)cacheAttachExecute(*engine.hosts, model, attachments, attachAll(card));
-  testAssert(eval.cacheTable().get(nthKey(501), got));
-  testAssert(eval.cacheTable().get(nthKey(501), got));
-  testAssert(eval.cacheTable().get(nthKey(502), got));
   const NNCacheContextId secondId = attachments.attachmentFor(model, card).contextId;
+  for(int i = 0; i < 3; i++) {
+    eval.cacheTable().observe(nthKey(prewarmedSerials[i]), NNCacheAttribution::toContext(secondId));
+    testAssert(eval.cacheTable().get(nthKey(prewarmedSerials[i]), got));
+  }
   testAssert(eval.cacheTable().unpersistedKeysFor(secondId).empty());          // still silent
-  testAssert(eval.cacheTable().hasUnpersistedHitCountsFor(secondId));          // and this is not
+  testAssert(eval.cacheTable().hasUnpersistedObservationCountsFor(secondId));  // and this is not
 
   const std::optional<string> refusal = refusalOf([&]() {
     (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{card, false});
   });
   testAssert(refusal.has_value());
-  testAssert(refusal.value().find("retrieval counts that have not been dumped") != string::npos);
+  testAssert(refusal.value().find("observation counts that have not been dumped") != string::npos);
   // Naming zero undumped ENTRIES while refusing anyway is the whole point: this is the state the
   // entries half cannot see.
   testAssert(refusal.value().find("0 earned entries") != string::npos);
   testAssert(attachments.isAttached(model, card));
 
-  // AND THE REFUSAL IS ACTIONABLE: the dump it asks for writes exactly those retrievals, after
+  // AND THE REFUSAL IS ACTIONABLE: the dump it asks for writes exactly those observations, after
   // which the same detach goes through.
   (void)cacheDumpExecute(*engine.hosts, model, attachments, dumpCounts, counters(0));
   const std::optional<NNCacheCountRow> saved = countRowFor(engine.cacheDir.path(), card, nthKey(501));
   testAssert(saved.has_value());
-  testAssert(saved.value().lookups == 2);
-  testAssert(!eval.cacheTable().hasUnpersistedHitCountsFor(secondId));
+  testAssert(saved.value().observations == 2);
+  testAssert(!eval.cacheTable().hasUnpersistedObservationCountsFor(secondId));
   testAssert(!refusalOf([&]() {
     (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{card, false});
   }).has_value());
 
-  cout << "  level-0-only session: 0 earned entries and " << heldHits
-       << " retrievals; a detach with the refusal stood down left the count log with no row for the key, "
+  cout << "  level-0-only session: 0 earned entries and " << heldObservations
+       << " observations; a detach with the refusal stood down left the count log with no row for the key, "
        << "and the non-consuming query refuses instead: \"" << refusal.value().substr(0, 80) << "...\"" << endl;
   eval.clearCache();
 }
@@ -957,77 +1008,65 @@ void testStatsReportsWhatIsResidentAndWhatIsAttached(RealEngineCache& engine) {
   (void)cacheDetachExecute(*engine.hosts, model, attachments, CacheDetachRequest{CONTEXT, true});
 }
 
-// nncache-admission-currency-measurement (ledger rows 1652/1655/1660). Gate off is the byte-
-// identical default: cache_stats carries no "admissionSignalMeasurement" key at all, neither
-// whole-table nor per-context, because a caller reading json::contains would otherwise have to
-// tell "measured, and zero" apart from "not measuring" by some OTHER field.
-void testAdmissionSignalMeasurementIsAbsentUnlessTheGateIsOn() {
-  RealEngineCache gateOff(false);
+// WHAT cache_stats REPORTS ABOUT THE COUNT LOG'S OWN CURRENCY.
+//
+// THIS REPLACES THE GATED admissionSignalMeasurement LEGS. Those measured three candidate
+// currencies side by side -- retrievals, raw presentations, presentations deduplicated per
+// search -- so the operator could pick one; he picked, and the picked one is now what the
+// engine counts in production and what these legs read (ledger rows 1717/1722). The
+// instrument, its config key and its per-request window hook are gone: a measurement kept
+// running after its question is answered is a second counter of a fact production already
+// owns (ADR-0012 P1), and the deduped variant it also carried has no consumer left.
+//
+// The sequence below is built so OBSERVATIONS and RETRIEVALS DISAGREE, because a leg in which
+// they happened to coincide would witness nothing about which one is being reported:
+//
+//   key A: presented 4 times -- once for the request that evaluated it, three more that hit.
+//     observations = 4,  retrievals = 3
+//   key B: presented 3 times -- once evaluating, two that hit.
+//     observations = 3,  retrievals = 2
+//
+// Totals: observations 7, retrievals 5.
+void testCacheStatsReportsObservationsAndTheyDifferFromRetrievals() {
+  RealEngineCache engine;
   const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
-  NNEvaluator& eval = *gateOff.hosts->searchableEval(model);
-  (void)cacheAttachExecute(*gateOff.hosts, model, gateOff.attachments, attachAll(OTHER_CONTEXT));
-  const NNCacheContextId contextId = gateOff.attachments.attachmentFor(model, OTHER_CONTEXT).contextId;
-  eval.cacheTable().set(makeOutput(301, false), NNCacheAttribution::toContext(contextId));
-  const json stats = cacheStatsExecute(*gateOff.hosts, model, gateOff.attachments);
-  testAssert(!stats.contains("admissionSignalMeasurement"));
-  testAssert(!stats["contexts"][0].contains("admissionSignalMeasurement"));
-  (void)cacheDetachExecute(*gateOff.hosts, model, gateOff.attachments, CacheDetachRequest{OTHER_CONTEXT, true});
-  cout << "  admissionSignalMeasurement is absent from cache_stats with the gate off" << endl;
-}
-
-// Gate ON: a scripted get/set sequence built so the three candidate currencies DISAGREE, and
-// the arithmetic below is checked against nncache-admission-currency-measurement's own
-// definitions rather than assumed.
-//
-//   key A: set once, then get() 3 times, ALL within one measurement window (one "search").
-//     retrievals   (existing hit ledger)         = 3  (every get after the set is a hit)
-//     rawPresentations                           = 4  (the set, plus the 3 gets: every
-//                                                       offer counts, hit or miss)
-//     dedupedPresentations                       = 1  (one window; A is presented many
-//                                                       times in it, counted once)
-//
-//   key B: set once, then get() twice -- once in the SAME window as the set, once after a
-//   NEW window has opened.
-//     retrievals                                 = 2
-//     rawPresentations                           = 3  (set + 2 gets)
-//     dedupedPresentations                       = 2  (window 1 sees the set and the first
-//                                                       get -> counted once; the new window
-//                                                       sees the second get -> counted again)
-//
-// Totals over both keys: retrievals=5, rawPresentations=7, dedupedPresentations=3 -- three
-// different numbers, which is the whole point: a currency choice here is not a wash.
-void testAdmissionSignalMeasurementCountsThreeDifferingCurrenciesExactly() {
-  RealEngineCache gateOn(true);
-  const SearchableModelIdx model = AnalysisModelHosts::PRIMARY_SEARCHABLE_IDX;
-  NNEvaluator& eval = *gateOn.hosts->searchableEval(model);
-  (void)cacheAttachExecute(*gateOn.hosts, model, gateOn.attachments, attachAll(CONTEXT));
-  const NNCacheContextId contextId = gateOn.attachments.attachmentFor(model, CONTEXT).contextId;
+  NNEvaluator& eval = *engine.hosts->searchableEval(model);
+  (void)cacheAttachExecute(*engine.hosts, model, engine.attachments, attachAll(CONTEXT));
+  const NNCacheContextId contextId = engine.attachments.attachmentFor(model, CONTEXT).contextId;
   const NNCacheAttribution attribution = NNCacheAttribution::toContext(contextId);
   NNCacheTable& table = eval.cacheTable();
 
-  // Window 1 (the analysis engine opens the first one implicitly; nothing has closed one yet).
-  // Key A's every presentation happens in this one window; key B straddles the window that
-  // opens below, which is exactly what makes their dedupedPresentations differ (1 vs 2)
-  // while their rawPresentations are close (4 vs 3).
   shared_ptr<NNOutput> got;
-  table.set(makeOutput(401, false), attribution);  // key A: set (presentation 1 of 4)
-  table.set(makeOutput(402, false), attribution);  // key B: set (presentation 1 of 3)
-  testAssert(table.get(nthKey(401), got));  // A hit 1 (retrieval 1, presentation 2)
-  testAssert(table.get(nthKey(401), got));  // A hit 2 (retrieval 2, presentation 3)
-  testAssert(table.get(nthKey(401), got));  // A hit 3 (retrieval 3, presentation 4) -- still window 1
-  testAssert(table.get(nthKey(402), got));  // B hit 1 (retrieval 1, presentation 2), same window
+  // The two requests that evaluated: one presentation each, and the set that followed is not a
+  // second one -- see nncacheobservations.h for why the door is per request.
+  table.observe(nthKey(401), attribution);
+  table.set(makeOutput(401, false), attribution);
+  table.observe(nthKey(402), attribution);
+  table.set(makeOutput(402, false), attribution);
+  // The requests that hit.
+  for(int i = 0; i < 3; i++) {
+    table.observe(nthKey(401), attribution);
+    testAssert(table.get(nthKey(401), got));
+  }
+  for(int i = 0; i < 2; i++) {
+    table.observe(nthKey(402), attribution);
+    testAssert(table.get(nthKey(402), got));
+  }
 
-  // A new window opens -- what cache_dump's analysis-request boundary does between requests.
-  // Only key B is presented again; key A is never touched after this, so its
-  // dedupedPresentations stays at 1.
-  table.beginAdmissionSignalMeasurementWindow();
-  testAssert(table.get(nthKey(402), got));  // B hit 2 (retrieval 2, presentation 3), new window
+  const NNCacheObservationLedger observations = table.harvestObservationCountsFor(contextId);
+  testAssert(observations.isObserved());
+  int64_t observationsA = 0, observationsB = 0;
+  for(size_t i = 0; i < observations.entries().size(); i++) {
+    if(observations.entries()[i].key == nthKey(401)) observationsA = observations.entries()[i].observations;
+    if(observations.entries()[i].key == nthKey(402)) observationsB = observations.entries()[i].observations;
+  }
+  testAssert(observationsA == 4);
+  testAssert(observationsB == 3);
 
-  const NNCacheHitLedger hits = table.harvestHitCountsFor(contextId);
+  // The retrieval surface still exists and still answers a DIFFERENT question, which is why it
+  // was kept rather than folded in: 3 and 2 against 4 and 3.
+  const NNCacheHitLedger hits = table.harvestHitCounts();
   testAssert(hits.isCounted());
-  const NNCachePresentationLedger presentations = table.harvestPresentationCountsFor(contextId);
-  testAssert(presentations.isCounted());
-
   int64_t retrievalsA = 0, retrievalsB = 0;
   for(size_t i = 0; i < hits.entries().size(); i++) {
     if(hits.entries()[i].key == nthKey(401)) retrievalsA = hits.entries()[i].hits;
@@ -1036,33 +1075,22 @@ void testAdmissionSignalMeasurementCountsThreeDifferingCurrenciesExactly() {
   testAssert(retrievalsA == 3);
   testAssert(retrievalsB == 2);
 
-  int64_t rawA = 0, rawB = 0, dedupedA = 0, dedupedB = 0;
-  for(size_t i = 0; i < presentations.entries().size(); i++) {
-    if(presentations.entries()[i].key == nthKey(401)) {
-      rawA = presentations.entries()[i].rawPresentations;
-      dedupedA = presentations.entries()[i].dedupedPresentations;
-    }
-    if(presentations.entries()[i].key == nthKey(402)) {
-      rawB = presentations.entries()[i].rawPresentations;
-      dedupedB = presentations.entries()[i].dedupedPresentations;
-    }
-  }
-  testAssert(rawA == 4);
-  testAssert(dedupedA == 1);
-  testAssert(rawB == 3);
-  testAssert(dedupedB == 2);
+  const json stats = cacheStatsExecute(*engine.hosts, model, engine.attachments);
+  testAssert(stats["observationsThisSession"].get<int64_t>() == 7);
+  testAssert(stats["observedKeys"].get<int64_t>() == 2);
+  testAssert(stats["unrecordedObservations"].get<int64_t>() == 0);
+  // The memory bill is reported rather than buried: this feature costs tens of megabytes the
+  // moment anything is attached, and the operator's whole complaint is resident size.
+  testAssert(stats["observationLedgerBytes"].get<int64_t>() > 0);
+  testAssert(stats["contexts"][0]["observationsThisSession"].get<int64_t>() == 7);
+  testAssert(stats["contexts"][0]["observedKeys"].get<int64_t>() == 2);
+  // And the retired instrument leaves nothing behind on the wire.
+  testAssert(!stats.contains("admissionSignalMeasurement"));
+  testAssert(!stats["contexts"][0].contains("admissionSignalMeasurement"));
 
-  // And cache_stats surfaces the same totals, read-only, gate on.
-  const json stats = cacheStatsExecute(*gateOn.hosts, model, gateOn.attachments);
-  testAssert(stats.contains("admissionSignalMeasurement"));
-  testAssert(stats["admissionSignalMeasurement"]["totalRawPresentations"].get<int64_t>() == 7);
-  testAssert(stats["admissionSignalMeasurement"]["totalDedupedPresentations"].get<int64_t>() == 3);
-  testAssert(stats["contexts"][0]["admissionSignalMeasurement"]["totalRawPresentations"].get<int64_t>() == 7);
-  testAssert(stats["contexts"][0]["admissionSignalMeasurement"]["totalDedupedPresentations"].get<int64_t>() == 3);
-
-  cout << "  gate on: retrievals(5) != rawPresentations(7) != dedupedPresentations(3), each exact"
-       << endl;
-  (void)cacheDetachExecute(*gateOn.hosts, model, gateOn.attachments, CacheDetachRequest{CONTEXT, true});
+  cout << "  cache_stats: observations(7) != retrievals(5), and observationLedgerBytes="
+       << stats["observationLedgerBytes"].get<int64_t>() << endl;
+  (void)cacheDetachExecute(*engine.hosts, model, engine.attachments, CacheDetachRequest{CONTEXT, true});
 }
 
 // THE DEBUG TRIPWIRE THAT STOOD HERE IS GONE, AND SO IS THE BYPASS IT WITNESSED.
@@ -1142,7 +1170,8 @@ void Tests::runAnalysisCacheActionTests() {
   testTheLevelZeroBoundIsExactlyOneOfThree();
   testTheLevelOneFillIsBoundedInBytesOrNotRequested();
   testTheDumpTargetIsRequiredAndClosed();
-  testTheDumpAdmissionIsRequiredAndClosed();
+  testTheDumpAdmissionDefaultsToSeenTwiceAndIsOtherwiseClosed();
+  testTheRetiredMinLookupsKeyIsRefusedAndNamesItsReplacement();
   testAContextIsRequiredOnTheThreeActionsThatActOnOne();
   testAContextNameOutsideTheAlphabetIsRefusedUnderItsOwnField();
   testForeignModelSourcesAreAnOrderedListWithoutRepeats();
@@ -1160,7 +1189,6 @@ void Tests::runAnalysisCacheActionTests() {
   }
   testTheSwapPermitCannotBeMintedHere();
   testAnEngineWithoutACacheDirectoryRefusesEveryAct();
-  testAdmissionSignalMeasurementIsAbsentUnlessTheGateIsOn();
-  testAdmissionSignalMeasurementCountsThreeDifferingCurrenciesExactly();
+  testCacheStatsReportsObservationsAndTheyDifferFromRetrievals();
   cout << "Done" << endl;
 }

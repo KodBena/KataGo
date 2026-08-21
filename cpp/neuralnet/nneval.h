@@ -210,9 +210,10 @@ class NNEvaluator {
   // NotAttributed if there is no cache or no context was attached.
   [[nodiscard]] NNCacheAttributionLedger harvestCacheAttribution() const;
 
-  // The hit-count rows a dump of exactly this context would write. Throws StringError if
-  // there is no cache, or for a context this evaluator did not attach.
-  [[nodiscard]] NNCacheHitLedger harvestCacheHitCountsFor(const NNCacheContextId& context) const;
+  // This session's observation count for every key of exactly this context, reported without
+  // taking. Throws StringError if there is no cache, or for a context this evaluator did not
+  // attach.
+  [[nodiscard]] NNCacheObservationLedger harvestCacheObservationCountsFor(const NNCacheContextId& context) const;
 
   //-----------------------------------------------------------------------------------
   // The persisted cache (see nncachelevelzero.h, nnevalcontainer.h, nncachedump.h)

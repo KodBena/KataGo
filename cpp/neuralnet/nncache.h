@@ -11,6 +11,7 @@
 #include "../core/global.h"
 #include "../core/hash.h"
 #include "../neuralnet/nncachecontext.h"
+#include "../neuralnet/nncacheobservations.h"
 #include "../neuralnet/nninputs.h"
 
 class ConfigParser;
@@ -236,13 +237,6 @@ struct NNCacheConfig {
   // so that the next field added here does not silently become "whatever the caller forgot".
   std::optional<std::string> cacheDirectory = std::nullopt;
 
-  // GATED OFF BY DEFAULT (ledger rows 1652/1655/1660). When true, the two-level table
-  // maintains the admission-signal-candidate side counters (NNCachePresentationLedger) and
-  // cache_stats surfaces them; every other table shape and every other behavior is
-  // unaffected. See NNCachePresentationLedger's own comment for what this measures and why
-  // it exists rather than picking a currency outright.
-  bool admissionSignalMeasurement = false;
-
   // The status-quo configuration: exactly what NNEvaluator built before the policy
   // axes existed.
   static NNCacheConfig statusQuo(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo);
@@ -263,7 +257,6 @@ struct NNCacheConfig {
   static const char* const KEY_REPLACEMENT; // nnCacheReplacement
   static const char* const KEY_SIGHTING_GHOST_POW; // nnCacheSightingGhostPowerOfTwo
   static const char* const KEY_DIR;         // nnCacheDir
-  static const char* const KEY_ADMISSION_SIGNAL_MEASUREMENT; // nnCacheAdmissionSignalMeasurement
 
   static const std::set<std::string>& collisionVocabulary();
   static const std::set<std::string>& evictionVocabulary();
@@ -368,73 +361,6 @@ class NNCacheHitLedger {
   NNCacheHitLedgerDisposition disposition_;
   std::vector<NNCacheHitCount> entries_;
   int64_t unrecordedHits_;
-};
-
-//-------------------------------------------------------------------------------------
-// The admission-signal-candidate measurement (nncache-admission-currency-measurement,
-// ledger rows 1652/1655/1660)
-//-------------------------------------------------------------------------------------
-//
-// The correct CURRENCY a disk-admission decision ought to gate on is an open empirical
-// question this file deliberately does not answer: retrievals (NNCacheHitLedger, already
-// exists), raw PRESENTATIONS (every offer to the table, get or set, hit or miss -- the
-// same quantity NNCacheReplacementPolicy's sighting axis counts; see nncachesighting.cpp's
-// own header comment), or presentations DEDUPLICATED PER SEARCH (counted at most once per
-// key per measurement window). This structure carries the latter two, gated OFF by
-// default, so the operator can compare all three against real traffic before picking one
-// as cache_dump's currency. It changes no admission decision anywhere; it only counts.
-
-// One key's two candidate signals, alongside its already-existing NNCacheHitCount.
-struct NNCachePresentationCount {
-  Hash128 key;
-  // Every get() or set() this session offered for this key, hit or miss.
-  uint32_t rawPresentations;
-  // The same, counted at most once per key per measurement window. See
-  // NNCacheTable::beginAdmissionSignalMeasurementWindow for what closes a window.
-  uint32_t dedupedPresentations;
-};
-
-// Whether a table is measuring the admission-signal candidates at all. A typed
-// disposition for the same reason NNCacheHitLedgerDisposition is one: an empty row
-// vector cannot say whether nothing was presented or the table was never asked to count.
-enum class NNCachePresentationLedgerDisposition {
-  // NNCacheConfig::admissionSignalMeasurement is false (the default), or this table shape
-  // never carries the axis. Zero memory, zero hot-path cost -- see nncachetwolevel.cpp.
-  NotCounted,
-  Counted,
-};
-
-class NNCachePresentationLedger {
- public:
-  static NNCachePresentationLedger notCounted();
-  static NNCachePresentationLedger counted(
-    std::vector<NNCachePresentationCount> entries, int64_t unrecordedRaw, int64_t unrecordedDeduped
-  );
-
-  NNCachePresentationLedgerDisposition disposition() const { return disposition_; }
-  bool isCounted() const { return disposition_ == NNCachePresentationLedgerDisposition::Counted; }
-
-  const std::vector<NNCachePresentationCount>& entries() const;
-
-  // Presentations that occurred but could not be attributed to a row, because the
-  // measurement ledger had no room for the key (the same bounded-probe-window overflow
-  // NNCacheHitLedger reports as unrecordedHits). Two counters, not one: a raw
-  // presentation and a deduped one can overflow independently once a key's row is gone.
-  int64_t unrecordedRaw() const;
-  int64_t unrecordedDeduped() const;
-
- private:
-  NNCachePresentationLedger(
-    NNCachePresentationLedgerDisposition disposition,
-    std::vector<NNCachePresentationCount> entries,
-    int64_t unrecordedRaw,
-    int64_t unrecordedDeduped
-  );
-
-  NNCachePresentationLedgerDisposition disposition_;
-  std::vector<NNCachePresentationCount> entries_;
-  int64_t unrecordedRaw_;
-  int64_t unrecordedDeduped_;
 };
 
 // A concurrent, hash-sharded table mapping an NN input hash to its NNOutput.
@@ -574,146 +500,104 @@ class NNCacheTable {
   // table anyway. Reading it as "what is resident" would be wrong under those policies.
   [[nodiscard]] NNCacheAttributionLedger harvestAttribution() const;
 
-  // The hit-count rows a dump of exactly `context` writes: one per key that context earned,
-  // carrying the hits that key took this session. A key earned and never retrieved again
-  // appears with zero hits, because "this context earned this position and nothing came back
-  // for it" is precisely the fact that says to stop carrying it.
+  //-----------------------------------------------------------------------------------
+  // Observation counting: the currency the count log records
+  //-----------------------------------------------------------------------------------
   //
-  // NotCounted from a table that keeps no per-key hit counts, exactly as harvestHitCounts is.
-  // Throws StringError for a context this table did not attach.
-  //
-  // unrecordedHits() on the returned ledger is zero, and that is a statement rather than an
-  // omission: the unrecorded-hit and unattributed-entry residues are hits and entries whose
-  // CONTEXT is the thing that was lost, so they cannot be divided among contexts. They are
-  // reported once, whole, by harvestHitCounts() and harvestAttribution(), and are never
-  // smeared across per-context dumps where each context would appear to carry all of them.
-  [[nodiscard]] virtual NNCacheHitLedger harvestHitCountsFor(const NNCacheContextId& context) const;
+  // See nncacheobservations.h for what an observation IS and why the currency is this and
+  // not retrievals. What belongs here is only the door and its cost.
 
-  // THE DELTA TWIN OF harvestHitCountsFor: exactly the rows a dump of `context` appends, taking
-  // them as it reports them.
+  // RECORDS ONE PRESENTATION of this position under `attribution`. Thread-safe, and NOT
+  // virtual: observing is the same act for every table shape, and no table shape has any say
+  // in it.
   //
-  // It stands to harvestHitCountsFor exactly as takeUnpersistedHitCounts stands to
-  // harvestHitCounts -- CONSUMING, and OMITTING A KEY WITH NOTHING TO SAY -- and it exists for
-  // the same reason that one does: a count log record is an INCREMENT, so what a dump may
-  // append is the delta, never the running total.
+  // THE ONE DOOR, AND IT IS CALLED ONCE PER EVALUATION REQUEST -- by NNEvaluator::evaluate,
+  // immediately after the position's hash is final and before any level is consulted. Hit or
+  // miss, get or skipCache-set, one request is one observation; see nncacheobservations.h for
+  // the three reasons this is not folded into get() and set() instead.
   //
-  // WHY A PER-CONTEXT DELTA IS A SURFACE AND NOT A FILTER THE CALLER APPLIES. The whole-table
-  // delta is exact only while one context is attached, because then everything the table earned
-  // and everything its level 0 served belongs to that one context. With two attached, a caller
-  // holding the whole-table delta cannot divide it: the rows carry keys, and a key names a
-  // position, never a card. The division is knowable only where the two facts live -- which
-  // level-0 source serves which context, and which context earned which level-1 key -- and both
-  // of those live in the table. So the table divides, and the marks it advances are exactly the
-  // ones whose rows it handed over (ADR-0012 P1).
+  // THE COST WHEN NOTHING IS ATTACHED IS ONE PREDICTABLE BRANCH. The ledger is allocated by
+  // the first attachCacheContext and by nothing else, so plain play -- no cache directory, no
+  // context, which is the overwhelmingly common configuration -- pays one null test against a
+  // pointer that is null for the life of the process, and not one byte of memory (ADR-0009).
+  // A NoAttributableContext attribution costs one more test and no work: an observation
+  // belongs to a card or to no file at all, and there is no third place to put it.
   //
-  // unrecordedHits() on the result is zero, for the reason harvestHitCountsFor states: the
-  // residues are hits whose CONTEXT is what was lost, so they cannot be divided among contexts
-  // and are reported once, whole, by the whole-table surfaces.
+  // Throws StringError for an attribution naming a context this table did not attach, exactly
+  // as set() does and from the same rule: an id minted by another model's cache cannot be
+  // spent here.
   //
-  // WHAT NO PER-CONTEXT DUMP WRITES, named rather than left to be discovered. Retrievals of a key
-  // that no context can be attributed to -- a key earned while several contexts were attached and
-  // the request named none, or earned before any context was -- belong to no context's file, so
-  // they are written by no per-context dump and their marks never advance. That population is not
-  // silent: it is exactly what NNCacheAttributionLedger::noAttributableContextEntries counts, and
-  // the dump action reports that figure in every response. The same is true of a level-0 source
-  // attached under no context, which only the whole-table delta above ever reaches.
-  //
-  // NotCounted from a table that keeps no per-key hit counts. Throws StringError for a context
-  // this table did not attach.
-  [[nodiscard]] virtual NNCacheHitLedger takeUnpersistedHitCountsFor(const NNCacheContextId& context);
+  // DEFINED HERE RATHER THAN IN THE .cpp, and that is the whole of the "zero-to-one branch"
+  // claim above: inlined, the no-context configuration compiles to one test of a pointer that
+  // is null for the life of the process and a call that is never made. Out of line it would be
+  // an unconditional call on the path MCTS hammers, which is a cost the default configuration
+  // has no reason to pay for a feature it does not use (ADR-0009).
+  void observe(Hash128 nnHash, const NNCacheAttribution& attribution) {
+    if(observations_ != nullptr)
+      recordObservation(nnHash, attribution);
+  }
 
-  // ARE THERE UNPERSISTED HIT COUNTS FOR `context`, WITHOUT TAKING THEM?
+  // Exactly the rows a dump of `context` appends: one per key this context has presented since
+  // the last dump, carrying that many observations. CONSUMING -- it advances each row's
+  // persisted mark -- and OMITTING A KEY WITH NOTHING TO SAY, because a count-log record is an
+  // INCREMENT and its presence raises that key's `sessions`.
+  //
+  // A ROW FOR EVERY KEY OBSERVED, INCLUDING ONE OBSERVED EXACTLY ONCE whose evaluation no
+  // admission threshold will let onto disk. That is the whole mechanism of the cross-session
+  // bootstrap: the count is what a later session adds to, so it must be written in the session
+  // that could not yet use it (ratified spec, ledger rows 1717/1722).
+  //
+  // NotObserved from a table with no attached context. Throws StringError for a context this
+  // table did not attach.
+  [[nodiscard]] NNCacheObservationLedger takeUnpersistedObservationCountsFor(const NNCacheContextId& context);
+
+  // The same population reported WITHOUT taking: this session's running observation count for
+  // every key of `context`, every mark left where it was. For a one-shot report, never for a
+  // dump -- appendDump takes a delta, and this is a level.
+  [[nodiscard]] NNCacheObservationLedger harvestObservationCountsFor(const NNCacheContextId& context) const;
+
+  // ARE THERE UNPERSISTED OBSERVATIONS FOR `context`, WITHOUT TAKING THEM?
   //
   // THE NON-CONSUMING QUESTION, which is the only question a REFUSAL can ask. cache_detach
-  // refuses to drop a context holding work that has not reached disk; to ask "is there any" it
-  // may not use the delta surface, because taking the delta advances the marks -- which is
-  // exactly what makes the delta safe to append, and exactly what would make a refusal destroy
-  // the thing it refused to lose. Before this existed the refusal read a protocol-layer PROXY
-  // (whether any request had been accepted since the last counts dump), which under-refuses:
-  // a retrieval served entirely out of level 0 calls no set(), records no attributed key, and
-  // accepts no new request, so a session that only re-studied pre-warmed positions could be
-  // detached with every one of its retrievals unwritten.
+  // refuses to drop a context holding work that has not reached disk; taking the delta is
+  // exactly what makes it safe to append, so a refusal that asked the consuming question would
+  // destroy the thing it refused to lose. TRUE MEANS EXACTLY
+  // "takeUnpersistedObservationCountsFor(context) WOULD YIELD AT LEAST ONE ROW".
   //
-  // TRUE MEANS EXACTLY "takeUnpersistedHitCountsFor(context) WOULD YIELD AT LEAST ONE ROW", so
-  // the two cannot disagree about a state. False from a table that keeps no per-key hit counts
-  // -- which is not a hedge: a table that counts nothing has nothing unpersisted.
-  //
-  // Const, and it advances no mark anywhere. Throws StringError for a context this table did
-  // not attach.
-  [[nodiscard]] virtual bool hasUnpersistedHitCountsFor(const NNCacheContextId& context) const;
+  // False from a table with no attached context, which is not a hedge: a table that observes
+  // nothing has nothing unpersisted. Throws StringError for a context this table did not attach.
+  [[nodiscard]] bool hasUnpersistedObservationCountsFor(const NNCacheContextId& context) const;
+
+  // Every observed row of every context, this session, for a whole-table one-shot report.
+  // NotObserved from a table with no attached context.
+  [[nodiscard]] NNCacheObservationLedger harvestObservationCounts() const;
+
+  // What the observation ledger costs in resident memory, or ZERO for a table with no attached
+  // context -- which is a real figure and not an absence, because such a table allocates
+  // nothing. Reported by cache_stats: it is tens of megabytes on a table that has attached
+  // anything, and a memory bill this feature adds is a bill the operator gets to see
+  // (ADR-0002).
+  [[nodiscard]] int64_t observationStructureBytes() const;
 
   // Thread-safe, and O(table). See NNCacheStats: a reporting call, not a hot-path one.
   virtual NNCacheStats stats() const = 0;
 
-  // The unified per-key hit counts of this session, for whoever persists them. Thread-safe
-  // and O(table); a reporting call taken between sessions, never inside a search.
+  // The unified per-key RETRIEVAL counts of this session: how many times each key was
+  // actually SERVED out of a level, whichever level served it. Thread-safe and O(table); a
+  // reporting call taken between sessions, never inside a search.
+  //
+  // THIS IS NOT WHAT THE COUNT LOG PERSISTS, and the two are not two homes for one fact.
+  // Retrievals answer "how well is the cache working" -- a diagnostic, reported by
+  // cache_stats and by nothing else. What a dump writes is OBSERVATIONS, which count every
+  // presentation whether a level answered it or a forward pass had to, and which live in a
+  // different structure with a different door (see observe() above and
+  // nncacheobservations.h). Nothing appends this surface to a count log; there is no delta
+  // twin of it, deliberately, so there is no expression that could.
   //
   // A single-level table returns NotCounted, which is the default configuration's answer
   // and is why the default get/set path is untouched by this surface existing. The
   // two-level table returns Counted with one row per key.
   virtual NNCacheHitLedger harvestHitCounts() const;
-
-  // THE COUNTS THAT HAVE NOT REACHED THE COUNT LOG YET, and taking them advances the mark.
-  //
-  // This is the numeric twin of the persisted bit, and it exists for the same defect in the
-  // same shape. A count log record is an INCREMENT: appendDump adds each row's lookups to
-  // that key's running total and adds one to its sessions. So a dump must hand it the DELTA
-  // this attachment earned, and a second dump with nothing in between must hand it NOTHING
-  // -- otherwise an attach, a dump, a detach and a re-attach re-append what the attach
-  // loaded, and the record inflates by a whole session's worth of retrievals that never
-  // happened.
-  //
-  // TWO PROPERTIES, both of which harvestHitCounts() deliberately does NOT have, which is
-  // why this is a second surface rather than a change to that one:
-  //
-  //   IT IS CONSUMING. Taking the rows advances each key's persisted mark to its current
-  //   count, so the next take reports only what accrued after this one. The accumulated
-  //   total's one home is the count log file; what the in-memory counters hold is exactly
-  //   what has not reached it (ADR-0012 P1).
-  //
-  //   IT OMITS A KEY WITH NOTHING TO SAY. harvestHitCounts() reports a pre-warmed entry that
-  //   earned nothing with a row of zero hits, deliberately -- that is the fact that says to
-  //   stop carrying it. A DUMP must not write that row, because appendDump would raise its
-  //   sessions, so an attach-dump-detach-attach-dump cycle over an untouched card would
-  //   climb the sessions of every key it loaded while nothing was ever looked up.
-  //
-  // NotCounted from a table that keeps no per-key hit counts, exactly as harvestHitCounts is.
-  [[nodiscard]] virtual NNCacheHitLedger takeUnpersistedHitCounts();
-
-  //-----------------------------------------------------------------------------------
-  // The gated admission-signal-candidate measurement. See NNCachePresentationLedger.
-  //-----------------------------------------------------------------------------------
-
-  // The whole-table totals. NotCounted whenever NNCacheConfig::admissionSignalMeasurement
-  // was false at construction, or this table shape never carries the axis (every shape but
-  // the two-level table, today) -- the base default, deliberately not overridden except by
-  // NNCacheTableTwoLevel.
-  [[nodiscard]] virtual NNCachePresentationLedger harvestPresentationCounts() const;
-
-  // Exactly `context`'s earned keys' rows, the same intersection harvestHitCountsFor forms
-  // for retrievals. NotCounted under the same conditions as harvestPresentationCounts().
-  // Throws StringError for a context this table did not attach, exactly as
-  // harvestHitCountsFor does.
-  [[nodiscard]] virtual NNCachePresentationLedger harvestPresentationCountsFor(
-    const NNCacheContextId& context
-  ) const;
-
-  // Closes the current deduped-presentation measurement window and opens a new one: a key
-  // presented again after this call counts as a fresh deduped presentation even if it was
-  // already seen in the window just closed. A NO-OP on a table not measuring (the base
-  // default), and a no-op is exactly the right answer for the gate-off, single-predictable-
-  // check cost this axis is required to carry (ADR-0009).
-  //
-  // WHAT A "WINDOW" IS HERE, NAMED RATHER THAN LEFT IMPLICIT. The natural boundary this
-  // signal wants is one MCTS search; there is no call reachable from NNCacheTable's own
-  // surface that fires exactly there without threading a new argument through every
-  // evaluate() call on the hot path. The analysis engine already has a call it makes once
-  // per incoming analyze request, immediately before that request's search begins
-  // (cpp/command/analysis.cpp, beside bot->setCacheAttribution) -- ONE per-request boundary
-  // substitutes for ONE per-search boundary today, which is coarser only when a single
-  // analyze request's search is interrupted and resumed by a later request without an
-  // intervening dump/stats read, a case the persisted-cache protocol does not create.
-  virtual void beginAdmissionSignalMeasurementWindow();
 
   // Builds the table a config asks for. Throws, naming what is missing, for a
   // shape that is coherent but not implemented yet -- never silently substituting
@@ -740,8 +624,20 @@ class NNCacheTable {
   NNCacheTable();
 
  private:
-  // Allocated by the first attachCacheContext and never before. See attachCacheContext.
+  // What observe() does once the null test above it has passed. Out of line so the hot path
+  // holds one branch and a call that is never taken, rather than the ownership check and the
+  // attribution switch inlined into every evaluation.
+  void recordObservation(Hash128 nnHash, const NNCacheAttribution& attribution);
+
+  // The ownership refusal every per-context surface makes, written once (ADR-0012 P1).
+  void refuseForeignContext(const NNCacheContextId& context) const;
+
+  // BOTH ALLOCATED BY THE FIRST attachCacheContext, IN ONE STATEMENT, AND NEVER OTHERWISE.
+  // They are two different facts about one session -- which context earned a key, and how
+  // often each key was presented -- so they are two structures; but "one exists and the other
+  // does not" is a state no caller could act on, so there is no path that creates one alone.
   std::unique_ptr<NNCacheAttributionRecorder> attribution_;
+  std::unique_ptr<NNCacheObservationRecorder> observations_;
   NNCacheContextSet contexts_;
 };
 

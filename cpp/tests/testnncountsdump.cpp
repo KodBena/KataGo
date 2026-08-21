@@ -27,7 +27,7 @@ using json = nlohmann::json;
 // is faithfulness: does the per-block view show exactly what a block's own bytes recorded
 // (a delta), and does the accumulated view still match what load() has always computed
 // (a sum across blocks) -- see nncachecountlog.cpp's scanLog, where the merge itself lives
-// ("result.rows[it->second].lookups += ...").
+// ("result.rows[it->second].observations += ...").
 
 namespace {
 
@@ -40,15 +40,15 @@ Hash128 nthKey(int serial) {
   );
 }
 
-NNCacheHitCountDelta deltaOf(const vector<pair<int,uint32_t>>& serialAndHits, int64_t unrecorded) {
-  vector<NNCacheHitCount> rows;
-  for(size_t i = 0; i < serialAndHits.size(); i++) {
-    NNCacheHitCount row;
-    row.key = nthKey(serialAndHits[i].first);
-    row.hits = serialAndHits[i].second;
+NNCacheObservationDelta deltaOf(const vector<pair<int,uint32_t>>& serialAndObservations, int64_t unrecorded) {
+  vector<NNCacheObservationCount> rows;
+  for(size_t i = 0; i < serialAndObservations.size(); i++) {
+    NNCacheObservationCount row;
+    row.key = nthKey(serialAndObservations[i].first);
+    row.observations = serialAndObservations[i].second;
     rows.push_back(row);
   }
-  return NNCacheHitCountDelta::ofDeltaRows(std::move(rows), unrecorded);
+  return NNCacheObservationDelta::ofDeltaRows(std::move(rows), unrecorded);
 }
 
 // The one row in a block for `serial`, or NULL if that block did not mention it -- the
@@ -129,31 +129,31 @@ void testDetailedLoadShowsPerBlockDeltasAndAccumulatedTotals() {
 
   // Per block: each row is that dump's own delta, never a running total.
   const NNCacheCountLogBlockRow* b0k1 = blockRowFor(detailed.blocks()[0], 1);
-  testAssert(b0k1 != NULL && b0k1->lookups == 3 && b0k1->sessions == 1);
+  testAssert(b0k1 != NULL && b0k1->observations == 3 && b0k1->sessions == 1);
   testAssert(blockRowFor(detailed.blocks()[0], 2) != NULL);
   testAssert(blockRowFor(detailed.blocks()[0], 3) == NULL);
-  testAssert(detailed.blocks()[0].unattributedLookups == 0);
+  testAssert(detailed.blocks()[0].unattributedObservations == 0);
 
   const NNCacheCountLogBlockRow* b1k1 = blockRowFor(detailed.blocks()[1], 1);
-  testAssert(b1k1 != NULL && b1k1->lookups == 4 && b1k1->sessions == 1);
+  testAssert(b1k1 != NULL && b1k1->observations == 4 && b1k1->sessions == 1);
   testAssert(blockRowFor(detailed.blocks()[1], 2) == NULL);
-  testAssert(detailed.blocks()[1].unattributedLookups == 2);
+  testAssert(detailed.blocks()[1].unattributedObservations == 2);
 
   const NNCacheCountLogBlockRow* b2k1 = blockRowFor(detailed.blocks()[2], 1);
-  testAssert(b2k1 != NULL && b2k1->lookups == 1 && b2k1->sessions == 1);
+  testAssert(b2k1 != NULL && b2k1->observations == 1 && b2k1->sessions == 1);
   const NNCacheCountLogBlockRow* b2k3 = blockRowFor(detailed.blocks()[2], 3);
-  testAssert(b2k3 != NULL && b2k3->lookups == 9 && b2k3->sessions == 1);
-  testAssert(detailed.blocks()[2].unattributedLookups == 7);
+  testAssert(b2k3 != NULL && b2k3->observations == 9 && b2k3->sessions == 1);
+  testAssert(detailed.blocks()[2].unattributedObservations == 7);
 
-  // Aggregate: the same merge load() has always computed -- key 1's lookups accumulate
+  // Aggregate: the same merge load() has always computed -- key 1's observations accumulate
   // (3+4+1=8) across the three dumps it appeared in every time, matching
-  // nncachecountlog.cpp's scanLog merge ("result.rows[it->second].lookups += ...").
+  // nncachecountlog.cpp's scanLog merge ("result.rows[it->second].observations += ...").
   const NNCacheCountLogContents& agg = detailed.aggregate();
   testAssert(agg.blocksApplied() == 3);
-  testAssert(aggregateRowFor(agg, 1).lookups == 8 && aggregateRowFor(agg, 1).sessions == 3);
-  testAssert(aggregateRowFor(agg, 2).lookups == 5 && aggregateRowFor(agg, 2).sessions == 1);
-  testAssert(aggregateRowFor(agg, 3).lookups == 9 && aggregateRowFor(agg, 3).sessions == 1);
-  testAssert(agg.unattributedLookups() == 9);
+  testAssert(aggregateRowFor(agg, 1).observations == 8 && aggregateRowFor(agg, 1).sessions == 3);
+  testAssert(aggregateRowFor(agg, 2).observations == 5 && aggregateRowFor(agg, 2).sessions == 1);
+  testAssert(aggregateRowFor(agg, 3).observations == 9 && aggregateRowFor(agg, 3).sessions == 1);
+  testAssert(agg.unattributedObservations() == 9);
   testAssert(agg.tail() == NNCacheCountLogTail::Intact);
 }
 
@@ -186,8 +186,8 @@ void testDetailedLoadReportsTornTailAndKeepsThePrefix() {
   const NNCacheCountLogContents& agg = detailed.aggregate();
   testAssert(agg.tail() == NNCacheCountLogTail::Truncated);
   testAssert(agg.discardedTailBytes() == keptOfSecondBlock);
-  testAssert(aggregateRowFor(agg, 1).lookups == 10);
-  testAssert(aggregateRowFor(agg, 2).lookups == 20);
+  testAssert(aggregateRowFor(agg, 1).observations == 10);
+  testAssert(aggregateRowFor(agg, 2).observations == 20);
 }
 
 //-------------------------------------------------------------------------------------
@@ -209,10 +209,9 @@ void testNNCountsDumpSubcommandHumanOutput() {
   testAssert(output.find("block 1 (one cache_dump's append)") != string::npos);
   testAssert(output.find(nthKey(1).toString()) != string::npos);
   // The currency line is asserted by CONSTANT, not by pasting its literal text here again:
-  // the wording is owned by NNCacheCountLog::countsCurrencyDescription() and is due to
-  // change under nncache-observation-currency (ledger rows 1717/1722/1723). Hard-coding
-  // today's sentence into this test would make that landing break a test that has nothing
-  // to say about wording.
+  // the wording is owned by NNCacheCountLog::countsCurrencyDescription(). It DID change under
+  // nncache-observation-currency (ledger rows 1717/1722), and this assertion needed no edit --
+  // which is exactly what asserting the constant instead of the sentence buys.
   testAssert(output.find(NNCacheCountLog::countsCurrencyDescription()) != string::npos);
   testAssert(output.find("accumulated totals") != string::npos);
   testAssert(output.find("tail:") != string::npos);
@@ -238,7 +237,7 @@ void testNNCountsDumpSubcommandJsonOutput() {
   testAssert(parsed["blocks"][1]["rows"].size() == 1);
   testAssert(parsed["totals"]["rows"] == 2);
   testAssert(parsed["totals"]["blocksApplied"] == 2);
-  testAssert(parsed["totals"]["totalLookups"] == 10);
+  testAssert(parsed["totals"]["totalObservations"] == 10);
   testAssert(parsed["tail"] == "intact");
 }
 

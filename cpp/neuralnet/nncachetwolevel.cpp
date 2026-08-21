@@ -302,8 +302,8 @@ std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvest() const {
     return entries_[0].source->harvest();
 
   std::vector<NNCacheHitCount> out;
-  // ONE ROW PER KEY, by folding every holder's count into the first holder's row -- the same
-  // rule takeUnpersistedHits below folds by, through the same function. The map is built and
+  // ONE ROW PER KEY, by folding every holder's count into the first holder's row, through
+  // the one function that owns that rule (foldByKey above). The map is built and
   // thrown away inside this call: harvest is an O(table) between-sessions report and is never
   // on the get or set path, so the allocation costs nothing that matters, and the alternative
   // -- a permanent cross-source key index -- would be a second home for a fact the sources
@@ -315,76 +315,6 @@ std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvest() const {
       foldByKey(
         rows[j], rowFor, out,
         "NNCacheLevelZeroSources::harvest",
-        "This call reports without taking, so nothing has been consumed and no mark has moved."
-      );
-  }
-  return out;
-}
-
-std::vector<NNCacheHitCount> NNCacheLevelZeroSources::takeUnpersistedHits() {
-  std::vector<NNCacheHitCount> out;
-  // NO EARLY EXIT AND NO SINGLE-SOURCE FAST PATH, unlike harvest() just above. This call
-  // advances every entry's persisted mark as it reads it, so a source not visited is a source
-  // whose mark stays behind and whose delta is reported again next time. The map costs one
-  // lookup per emitted row on a between-sessions call and is what buys that.
-  std::map<Hash128, size_t> rowFor;
-  for(size_t i = 0; i < entries_.size(); i++) {
-    const std::vector<NNCacheHitCount> rows = entries_[i].source->takeUnpersistedHits();
-    for(size_t j = 0; j < rows.size(); j++)
-      foldByKey(
-        rows[j], rowFor, out,
-        "NNCacheLevelZeroSources::takeUnpersistedHits",
-        "The marks of every source visited so far have already advanced, so this take must "
-        "not be retried against the same attachment."
-      );
-  }
-  return out;
-}
-
-std::vector<NNCacheHitCount> NNCacheLevelZeroSources::takeUnpersistedHitsFor(const NNCacheContextId& context) {
-  std::vector<NNCacheHitCount> out;
-  std::map<Hash128, size_t> rowFor;
-  for(size_t i = 0; i < entries_.size(); i++) {
-    // A source attached under no context, or under another one, is NOT taken from. Its mark
-    // stays where it is, so its own context's dump still finds its delta whole -- which is the
-    // difference between a per-context take and a filter applied to a whole-table one.
-    if(!entries_[i].servesContext.has_value() || entries_[i].servesContext.value() != context)
-      continue;
-    const std::vector<NNCacheHitCount> rows = entries_[i].source->takeUnpersistedHits();
-    for(size_t j = 0; j < rows.size(); j++)
-      foldByKey(
-        rows[j], rowFor, out,
-        "NNCacheLevelZeroSources::takeUnpersistedHitsFor",
-        "The marks of every source of this context visited so far have already advanced, so this "
-        "take must not be retried against the same attachment."
-      );
-  }
-  return out;
-}
-
-bool NNCacheLevelZeroSources::anyUnpersistedHitsFor(const NNCacheContextId& context) const {
-  for(size_t i = 0; i < entries_.size(); i++) {
-    if(!entries_[i].servesContext.has_value() || entries_[i].servesContext.value() != context)
-      continue;
-    // The first source with anything to say answers for the whole list: the question is "is
-    // there any", and nothing is consumed on the way to the answer.
-    if(entries_[i].source->anyUnpersistedHits())
-      return true;
-  }
-  return false;
-}
-
-std::vector<NNCacheHitCount> NNCacheLevelZeroSources::harvestFor(const NNCacheContextId& context) const {
-  std::vector<NNCacheHitCount> out;
-  std::map<Hash128, size_t> rowFor;
-  for(size_t i = 0; i < entries_.size(); i++) {
-    if(!entries_[i].servesContext.has_value() || entries_[i].servesContext.value() != context)
-      continue;
-    const std::vector<NNCacheHitCount> rows = entries_[i].source->harvest();
-    for(size_t j = 0; j < rows.size(); j++)
-      foldByKey(
-        rows[j], rowFor, out,
-        "NNCacheLevelZeroSources::harvestFor",
         "This call reports without taking, so nothing has been consumed and no mark has moved."
       );
   }
@@ -527,88 +457,22 @@ class HitLedger {
     return out;
   }
 
-  // The hits that have not reached the count log yet, taking them as it reports them: per
-  // occupied row, the count minus its persisted mark, with the mark then advanced.
-  //
-  // THE MARK IS WHY THE COUNT IS NOT SIMPLY RESET TO ZERO. A count of zero is this
-  // structure's FREE-ROW marker, so zeroing an occupied row would cut the probe chain of
-  // every key placed behind it and lose their counts silently. The mark is a second word in
-  // the 4 bytes Row already padded away -- twoLevelHitLedgerBytes has always counted them --
-  // so this costs the ledger nothing and forecloses that whole failure by not needing to
-  // touch count at all.
-  std::vector<NNCacheHitCount> takeUnpersisted() {
-    std::vector<NNCacheHitCount> out;
-    for(size_t i = 0; i < rows_.size(); i++) {
-      std::mutex& mutex = mutexPool_.getMutex((uint32_t)i & mutexMask_);
-      std::lock_guard<std::mutex> lock(mutex);
-      Row& row = rows_[i];
-      if(row.count == 0)
-        continue;
-      if(row.count <= row.persisted)
-        continue;
-      NNCacheHitCount out_row;
-      out_row.key = row.key;
-      out_row.hits = row.count - row.persisted;
-      row.persisted = row.count;
-      out.push_back(out_row);
-    }
-    return out;
-  }
-
-  // ONE KEY'S UNPERSISTED DELTA, TAKEN. The per-key twin of takeUnpersisted above, for a dump
-  // that is writing one context's file and must advance the marks of exactly the rows it wrote.
-  // Same rule, same mark, same reason the count is never zeroed -- read that method for both.
-  uint32_t takeUnpersistedFor(Hash128 key) {
-    const uint64_t home = key.hash0 & mask_;
-    std::mutex& mutex = mutexPool_.getMutex((uint32_t)home & mutexMask_);
-    std::lock_guard<std::mutex> lock(mutex);
-    for(uint32_t step = 0; step < PROBE_WINDOW; step++) {
-      Row& row = rows_[(home + step) & mask_];
-      if(row.count == 0)
-        return 0;
-      if(row.key == key) {
-        if(row.count <= row.persisted)
-          return 0;
-        const uint32_t delta = row.count - row.persisted;
-        row.persisted = row.count;
-        return delta;
-      }
-    }
-    return 0;
-  }
-
-  // The same question asked without taking: what takeUnpersistedFor WOULD return, leaving the
-  // mark exactly where it is. The two read the same two words under the same lock, so they
-  // cannot disagree about a state (ADR-0012 P1).
-  uint32_t unpersistedFor(Hash128 key) const {
-    const uint64_t home = key.hash0 & mask_;
-    std::mutex& mutex = mutexPool_.getMutex((uint32_t)home & mutexMask_);
-    std::lock_guard<std::mutex> lock(mutex);
-    for(uint32_t step = 0; step < PROBE_WINDOW; step++) {
-      const Row& row = rows_[(home + step) & mask_];
-      if(row.count == 0)
-        return 0;
-      if(row.key == key)
-        return row.count > row.persisted ? row.count - row.persisted : 0u;
-    }
-    return 0;
-  }
-
   int64_t unrecordedHits() const { return unrecorded_.load(std::memory_order_relaxed); }
   size_t structureBytes() const {
     return rows_.size() * sizeof(Row) + ((size_t)mutexMask_ + 1) * sizeof(std::mutex);
   }
 
  private:
-  // 24 bytes: 16 of key, 4 of count, and 4 that alignment has always spent on this row
-  // whether they held anything or not -- twoLevelHitLedgerBytes counts them explicitly. The
-  // persisted mark is those 4 bytes, so the delta surface costs this structure nothing.
+  // 24 bytes: 16 of key, 4 of count, and 4 that alignment spends on this row whether they
+  // hold anything or not -- twoLevelHitLedgerBytes counts them explicitly. They held a
+  // PERSISTED MARK while a dump appended this ledger's retrievals to a count log; nothing
+  // appends retrievals anywhere now (the count log's currency is observations, and its rows
+  // come from nncacheobservations.h), so the mark has no reader and is gone. The row's size is
+  // unchanged, which is what twoLevelHitLedgerBytes reads from the type rather than restating.
   struct Row {
     Hash128 key;
     uint32_t count;
-    // How much of `count` has already been written to the count log. See takeUnpersisted.
-    uint32_t persisted;
-    Row() : key(), count(0), persisted(0) {}
+    Row() : key(), count(0) {}
   };
 
   std::vector<Row> rows_;
@@ -616,115 +480,6 @@ class HitLedger {
   mutable MutexPool mutexPool_;
   uint32_t mutexMask_;
   std::atomic<int64_t> unrecorded_;
-};
-
-//-------------------------------------------------------------------------------------
-// The admission-signal-candidate measurement (nncache-admission-currency-measurement)
-//-------------------------------------------------------------------------------------
-//
-// Same shape as HitLedger just above -- direct-mapped, bounded probe window, overflow
-// reported rather than absorbed -- carrying two counters per key instead of one: RAW
-// presentations (every get/set offered for the key, hit or miss) and DEDUPED
-// presentations (the same, counted at most once per measurement window). A third word,
-// the window a key was last counted in, is what tells the two apart; it costs nothing
-// this row was not already paying for in alignment, exactly as HitLedger's persisted mark
-// does.
-//
-// ONLY BUILT WHEN NNCacheConfig::admissionSignalMeasurement IS TRUE. NNCacheTableTwoLevel
-// holds this behind a std::unique_ptr that is null when the gate is off, so get() and
-// set() each pay exactly one null-pointer check on the path this measurement does not use
-// (ADR-0009: a single, predictable, always-taken-the-same-way branch, not a probe).
-class PresentationLedger {
- public:
-  PresentationLedger(int powerOfTwo, int mutexPoolSizePowerOfTwo)
-    :rows_(((size_t)1) << powerOfTwo),
-     mask_((((uint64_t)1) << powerOfTwo) - 1),
-     mutexPool_(((uint32_t)1) << mutexPoolSizePowerOfTwo),
-     mutexMask_((((uint32_t)1) << mutexPoolSizePowerOfTwo) - 1),
-     window_(1),  // 0 means "never seen"; the first real window is 1.
-     unrecordedRaw_(0),
-     unrecordedDeduped_(0)
-  {}
-
-  static const uint32_t PROBE_WINDOW = 16;
-
-  // Records one presentation of `key` in the CURRENT window. Always bumps rawCount; bumps
-  // dedupedCount only the first time this key is seen in the window that is current right
-  // now, which is exactly what "counted at most once per key per window" means.
-  void present(Hash128 key) {
-    const uint64_t currentWindow = window_.load(std::memory_order_relaxed);
-    const uint64_t home = key.hash0 & mask_;
-    std::mutex& mutex = mutexPool_.getMutex((uint32_t)home & mutexMask_);
-    std::lock_guard<std::mutex> lock(mutex);
-    for(uint32_t step = 0; step < PROBE_WINDOW; step++) {
-      Row& row = rows_[(home + step) & mask_];
-      if(row.rawCount == 0 && row.lastWindow == 0) {
-        row.key = key;
-        row.rawCount = 1;
-        row.dedupedCount = 1;
-        row.lastWindow = currentWindow;
-        return;
-      }
-      if(row.key == key) {
-        row.rawCount = row.rawCount == 0xFFFFFFFFu ? row.rawCount : row.rawCount + 1;
-        if(row.lastWindow != currentWindow) {
-          row.dedupedCount = row.dedupedCount == 0xFFFFFFFFu ? row.dedupedCount : row.dedupedCount + 1;
-          row.lastWindow = currentWindow;
-        }
-        return;
-      }
-    }
-    unrecordedRaw_.fetch_add(1, std::memory_order_relaxed);
-    unrecordedDeduped_.fetch_add(1, std::memory_order_relaxed);
-  }
-
-  // Closes the current window: a key presented after this call is a fresh deduped
-  // presentation even if it was already seen in the window just closed. Advancing a
-  // counter rather than clearing per-row state is what keeps this O(1) rather than O(rows)
-  // -- exactly the same trick HitLedger's persisted mark uses to avoid re-walking the table.
-  void beginNewWindow() { window_.fetch_add(1, std::memory_order_relaxed); }
-
-  std::vector<NNCachePresentationCount> harvest() const {
-    std::vector<NNCachePresentationCount> out;
-    for(size_t i = 0; i < rows_.size(); i++) {
-      std::mutex& mutex = mutexPool_.getMutex((uint32_t)i & mutexMask_);
-      std::lock_guard<std::mutex> lock(mutex);
-      if(rows_[i].rawCount == 0 && rows_[i].lastWindow == 0)
-        continue;
-      NNCachePresentationCount row;
-      row.key = rows_[i].key;
-      row.rawPresentations = rows_[i].rawCount;
-      row.dedupedPresentations = rows_[i].dedupedCount;
-      out.push_back(row);
-    }
-    return out;
-  }
-
-  int64_t unrecordedRaw() const { return unrecordedRaw_.load(std::memory_order_relaxed); }
-  int64_t unrecordedDeduped() const { return unrecordedDeduped_.load(std::memory_order_relaxed); }
-  size_t structureBytes() const {
-    return rows_.size() * sizeof(Row) + ((size_t)mutexMask_ + 1) * sizeof(std::mutex);
-  }
-
- private:
-  // 32 bytes: 16 of key, 4+4 of the two counts, 8 of lastWindow. rawCount == 0 &&
-  // lastWindow == 0 is the free-row marker: a row is only ever written with rawCount at
-  // least one, and window_ starts at 1, so no occupied row can read as free.
-  struct Row {
-    Hash128 key;
-    uint32_t rawCount;
-    uint32_t dedupedCount;
-    uint64_t lastWindow;
-    Row() : key(), rawCount(0), dedupedCount(0), lastWindow(0) {}
-  };
-
-  std::vector<Row> rows_;
-  uint64_t mask_;
-  mutable MutexPool mutexPool_;
-  uint32_t mutexMask_;
-  std::atomic<uint64_t> window_;
-  std::atomic<int64_t> unrecordedRaw_;
-  std::atomic<int64_t> unrecordedDeduped_;
 };
 
 //-------------------------------------------------------------------------------------
@@ -740,21 +495,11 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
     std::unique_ptr<NNCacheFrozen> levelZero,
     std::unique_ptr<NNCacheTable> levelOne,
     int hitLedgerPowerOfTwo,
-    int hitLedgerMutexPowerOfTwo,
-    bool admissionSignalMeasurement
+    int hitLedgerMutexPowerOfTwo
   )
     :levelZero_(),
      levelOne_(std::move(levelOne)),
-     ledger_(hitLedgerPowerOfTwo, hitLedgerMutexPowerOfTwo),
-     // Null when the gate is off (the default): get()/set() then pay exactly one
-     // null-pointer check and allocate nothing, sized identically to the hit ledger and
-     // for the same reason -- both are bounded against the distinct keys one session
-     // earns. See PresentationLedger's own comment.
-     presentationLedger_(
-       admissionSignalMeasurement
-         ? new PresentationLedger(hitLedgerPowerOfTwo, hitLedgerMutexPowerOfTwo)
-         : nullptr
-     )
+     ledger_(hitLedgerPowerOfTwo, hitLedgerMutexPowerOfTwo)
   {
     // The factory has already refused a null, so this cannot throw; the first source is
     // attached through the same door every later one goes through -- reconcile included, against
@@ -801,12 +546,6 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
   }
 
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
-    // ADMISSION-SIGNAL MEASUREMENT: a get is a presentation whether it hits or misses,
-    // exactly the same fact NNCacheReplacementPolicy's sighting axis counts (see
-    // nncachesighting.cpp). One null-pointer check when the gate is off; nothing else on
-    // this path changes (ADR-0009).
-    if(presentationLedger_)
-      presentationLedger_->present(nnHash);
     // The attached sources first, in attach order, first match winning. A hit counts
     // itself in the same 32-bit word the lookup's own entry read already brought into
     // cache, so counting costs the level-0 path nothing beyond the increment.
@@ -823,11 +562,6 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
   }
 
   void set(const std::shared_ptr<NNOutput>& p) override {
-    // Same measurement, same single null check, on the OTHER half of "every get and set,
-    // hit or miss" nncachesighting.cpp's presentation definition names -- a set offered is
-    // a presentation exactly as a get is, whether or not admission stores it.
-    if(presentationLedger_)
-      presentationLedger_->present(p->nnHash);
     // Level 0 is frozen, so every set is level 1's. If level 0 holds this key, retire its
     // entry FIRST and fold the count it accrued into the ledger, so the key and its count
     // change hands together and are never resolvable in two places at once.
@@ -851,7 +585,7 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
   // LEVEL 1 ONLY, AND WITHOUT COUNTING. Both halves are the point. Not counting is what
   // keeps a dump from appearing in the counts it is dumping (ADR-0009); skipping level 0 is
   // what keeps a dump from being handed an entry whose bytes are already in the file it is
-  // appending to, which is the duplicate the whole persisted mark exists to foreclose.
+  // appending to, which is the duplicate NNCacheEntryProvenance exists to foreclose.
   bool peek(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
     return levelOne_->get(nnHash, ret);
   }
@@ -882,9 +616,7 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
     s.fixedStructureBytes +=
       levelZero_.structureBytes() +
       (int64_t)ledger_.structureBytes() +
-      levelZero_.shadowedPayloadBytes() +
-      // Zero when the gate is off: nothing was allocated to report.
-      (presentationLedger_ ? (int64_t)presentationLedger_->structureBytes() : 0);
+      levelZero_.shadowedPayloadBytes();
     // A chained level 1 reports no slot capacity because it is bounded by bytes; adding
     // level 0's fixed count to a zero would fabricate a ratio, so the zero is preserved.
     if(s.capacitySlots != 0)
@@ -941,186 +673,10 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
     );
   }
 
-  // The delta twin of harvestHitCounts above, composed from the same two owners, in the same
-  // order, and folding by the same rule -- across several attached sources a shared key's
-  // deltas are SUMMED into one row. See NNCacheTable::takeUnpersistedHitCounts for what it is
-  // for, and NNCacheLevelZeroSources::takeUnpersistedHits for what it does that its twin does
-  // not: it consumes, and it omits a key with nothing to say.
-  //
-  // unrecordedHits is reported WHOLE rather than as a delta, and that is deliberate: it is a
-  // count of hits whose KEY was lost, so there is no row to hold a mark against and no way to
-  // divide it. A caller reading it twice sees the same running figure; it is a health number,
-  // not a payload.
-  NNCacheHitLedger takeUnpersistedHitCounts() override {
-    std::vector<NNCacheHitCount> rows = levelZero_.takeUnpersistedHits();
-    const std::vector<NNCacheHitCount> levelOneRows = ledger_.takeUnpersisted();
-    // Folded, exactly as the absolute surface is and for exactly the same reason -- and here the
-    // cost of getting it wrong is higher, because these rows are INCREMENTS a count log adds:
-    // one key on two rows would raise its sessions twice for a single dump.
-    return NNCacheHitLedger::counted(
-      foldLevelOneInto(
-        std::move(rows), levelOneRows,
-        "NNCacheTableTwoLevel::takeUnpersistedHitCounts",
-        "Every mark this take reached has already advanced, so it must not be retried."
-      ),
-      ledger_.unrecordedHits()
-    );
-  }
-
-  // What a dump of one context writes. The two facts are owned in two places and joined
-  // here, once: WHICH keys this context earned is the base table's attribution ledger, and
-  // HOW OFTEN each was retrieved is this table's hit ledger. Neither is re-derived from the
-  // other -- an earned key with no hit row appears with zero, which is a fact a dump wants,
-  // not a row to drop.
-  NNCacheHitLedger harvestHitCountsFor(const NNCacheContextId& context) const override {
-    // THE CONTEXT'S LEVEL-0 SOURCES FIRST, then the keys it earned. Three facts, owned in three
-    // places and joined here once: WHICH sources this context attached is the resolution list's
-    // (a source serves one context, and no key-shaped predicate could recover that -- cards
-    // share keys); WHICH level-1 keys it earned is the base table's attribution ledger; HOW
-    // OFTEN each was retrieved is this table's own two counters. Nothing is re-derived from
-    // anything else -- an earned key with no hit row appears with zero, which is a fact a dump
-    // wants and not a row to drop.
-    //
-    // ITS LEVEL-0 HALF IS NOT OPTIONAL, and leaving it out is what made this surface and its
-    // delta twin disagree about what a context's counts even are: a retrieval served out of a
-    // card's own pre-warmed level 0 calls no set() and earns no key, so a per-context surface
-    // built on attributed keys alone would report a fully pre-warmed card as having been
-    // retrieved zero times -- for precisely the mature card this whole feature exists for.
-    std::vector<NNCacheHitCount> rows = levelZero_.harvestFor(context);
-    const std::vector<Hash128> keys = attributedKeysFor(context);
-    std::vector<NNCacheHitCount> levelOneRows;
-    levelOneRows.reserve(keys.size());
-    for(size_t i = 0; i < keys.size(); i++) {
-      NNCacheHitCount row;
-      row.key = keys[i];
-      row.hits = ledger_.hitsFor(keys[i]);
-      levelOneRows.push_back(row);
-    }
-    // Zero, and see NNCacheTable::harvestHitCountsFor for why the residue is not divided.
-    return NNCacheHitLedger::counted(
-      foldLevelOneInto(
-        std::move(rows), levelOneRows,
-        "NNCacheTableTwoLevel::harvestHitCountsFor",
-        "This call reports without taking, so nothing has been consumed and no mark has moved."
-      ),
-      0
-    );
-  }
-
-  // THE DELTA TWIN, over exactly the same population, taking what it reports.
-  //
-  // Both halves are consuming and both are restricted to this context: the sources attached for
-  // it advance their own entry marks, and the ledger advances the mark of each key this context
-  // earned -- and of no other key, so another context's dump still finds its own delta whole.
-  // That is what makes several attached cards dumpable at all: the division is made where the
-  // two facts live, rather than by a caller trying to divide rows that carry only keys.
-  NNCacheHitLedger takeUnpersistedHitCountsFor(const NNCacheContextId& context) override {
-    std::vector<NNCacheHitCount> rows = levelZero_.takeUnpersistedHitsFor(context);
-    const std::vector<Hash128> keys = attributedKeysFor(context);
-    std::vector<NNCacheHitCount> levelOneRows;
-    for(size_t i = 0; i < keys.size(); i++) {
-      const uint32_t delta = ledger_.takeUnpersistedFor(keys[i]);
-      // A KEY WITH NOTHING TO SAY YIELDS NO ROW, exactly as the whole-table delta omits one:
-      // appendDump would raise this key's sessions for a dump in which it earned nothing.
-      if(delta == 0)
-        continue;
-      NNCacheHitCount row;
-      row.key = keys[i];
-      row.hits = delta;
-      levelOneRows.push_back(row);
-    }
-    return NNCacheHitLedger::counted(
-      foldLevelOneInto(
-        std::move(rows), levelOneRows,
-        "NNCacheTableTwoLevel::takeUnpersistedHitCountsFor",
-        "Every mark this take reached has already advanced, so it must not be retried."
-      ),
-      0
-    );
-  }
-
-  // THE SAME QUESTION, ASKED WITHOUT TAKING. It reads the same two counters against the same two
-  // marks that the take above reads, in the same order, and stops at the first thing either has
-  // to say -- so it is true exactly when that take would yield a row, and it leaves every mark
-  // where it found it. See NNCacheTable::hasUnpersistedHitCountsFor for what needs a question
-  // that consumes nothing.
-  bool hasUnpersistedHitCountsFor(const NNCacheContextId& context) const override {
-    if(levelZero_.anyUnpersistedHitsFor(context))
-      return true;
-    const std::vector<Hash128> keys = attributedKeysFor(context);
-    for(size_t i = 0; i < keys.size(); i++) {
-      if(ledger_.unpersistedFor(keys[i]) > 0)
-        return true;
-    }
-    return false;
-  }
-
-  //---- The gated admission-signal-candidate measurement --------------------------------
-
-  // Whole-table totals: NotCounted when the gate was off at construction, exactly the base
-  // default every other table shape already gives.
-  NNCachePresentationLedger harvestPresentationCounts() const override {
-    if(!presentationLedger_)
-      return NNCachePresentationLedger::notCounted();
-    return NNCachePresentationLedger::counted(
-      presentationLedger_->harvest(), presentationLedger_->unrecordedRaw(), presentationLedger_->unrecordedDeduped()
-    );
-  }
-
-  // ONE CONTEXT'S EARNED KEYS ONLY, the same population harvestHitCountsFor's level-1 half
-  // uses -- NOT levelZero_'s own pre-warmed-card retrievals, unlike harvestHitCountsFor
-  // above. A pre-warmed key never reaches set() and so is never attributed to a context
-  // (attributedKeysFor's own contract), and this measurement follows that same rule rather
-  // than growing a second, inconsistent notion of "this context's keys". A card served
-  // entirely out of level 0 therefore reports zero rows here while still contributing to
-  // harvestPresentationCounts()'s whole-table total -- named rather than silently absorbed,
-  // because the currency-comparison this measurement exists for must not be misread as
-  // "this context was never asked for anything".
-  //
-  // attributedKeysFor already throws for a context this table did not attach, so no
-  // separate ownership check is needed here.
-  NNCachePresentationLedger harvestPresentationCountsFor(const NNCacheContextId& context) const override {
-    if(!presentationLedger_) {
-      (void)attributedKeysFor(context);  // still refuses an unowned context, as every sibling does
-      return NNCachePresentationLedger::notCounted();
-    }
-    const std::vector<Hash128> keys = attributedKeysFor(context);
-    std::vector<NNCachePresentationCount> rows;
-    rows.reserve(keys.size());
-    // std::map, not unordered_map: Hash128 has operator< (foldLevelOneInto above already
-    // keys a std::map<Hash128,size_t> on it) but no std::hash<Hash128> specialization
-    // anywhere in this codebase, and this fold runs only on the cold cache_stats/dump path
-    // -- never per-eval -- so there is no ordered-vs-hashed cost question here worth adding
-    // one for.
-    const std::vector<NNCachePresentationCount> all = presentationLedger_->harvest();
-    std::map<Hash128, NNCachePresentationCount> byKey;
-    for(size_t i = 0; i < all.size(); i++)
-      byKey[all[i].key] = all[i];
-    for(size_t i = 0; i < keys.size(); i++) {
-      NNCachePresentationCount row;
-      row.key = keys[i];
-      const auto it = byKey.find(keys[i]);
-      row.rawPresentations = it == byKey.end() ? 0 : it->second.rawPresentations;
-      row.dedupedPresentations = it == byKey.end() ? 0 : it->second.dedupedPresentations;
-      rows.push_back(row);
-    }
-    return NNCachePresentationLedger::counted(std::move(rows), 0, 0);
-  }
-
-  // See NNCacheTable::beginAdmissionSignalMeasurementWindow for what a window is and why
-  // this substitutes a per-analyze-request boundary for a per-search one.
-  void beginAdmissionSignalMeasurementWindow() override {
-    if(presentationLedger_)
-      presentationLedger_->beginNewWindow();
-  }
-
  private:
   NNCacheLevelZeroSources levelZero_;
   std::unique_ptr<NNCacheTable> levelOne_;
   mutable HitLedger ledger_;
-  // Null unless NNCacheConfig::admissionSignalMeasurement was true at construction. See
-  // PresentationLedger.
-  mutable std::unique_ptr<PresentationLedger> presentationLedger_;
 };
 
 }  // namespace
@@ -1129,8 +685,8 @@ size_t twoLevelHitLedgerBytes(int hitLedgerPowerOfTwo) {
   // Kept in step with HitLedger::Row by construction rather than by a second copy of the
   // arithmetic (ADR-0012 P1). The mutex pool is not included: it is sized independently
   // and is reported through stats(), where the whole figure is what matters.
-  // The second uint32_t is the persisted mark, which before it existed was the padding this
-  // arithmetic already charged for. The figure is unchanged by its arrival, which is the
+  // The second uint32_t is the alignment padding the row has always carried; it briefly held
+  // a persisted mark and no longer does, and the figure is unchanged either way, which is the
   // point (ADR-0012 P1: the row type decides, this reads it).
   return (((size_t)1) << hitLedgerPowerOfTwo) * (sizeof(Hash128) + sizeof(uint32_t) + sizeof(uint32_t));
 }
@@ -1138,8 +694,7 @@ size_t twoLevelHitLedgerBytes(int hitLedgerPowerOfTwo) {
 std::unique_ptr<NNCacheTwoLevelTable> makeTwoLevelNNCacheTable(
   std::unique_ptr<NNCacheFrozen> levelZero,
   std::unique_ptr<NNCacheTable> levelOne,
-  int hitLedgerPowerOfTwo,
-  bool admissionSignalMeasurement
+  int hitLedgerPowerOfTwo
 ) {
   // "No level 0" is represented by not building one of these, never by one of these
   // holding a null. Refusing here keeps that the only representation there is.
@@ -1160,7 +715,7 @@ std::unique_ptr<NNCacheTwoLevelTable> makeTwoLevelNNCacheTable(
   const int mutexPow = hitLedgerPowerOfTwo < 10 ? hitLedgerPowerOfTwo : 10;
   return std::unique_ptr<NNCacheTwoLevelTable>(
     new NNCacheTableTwoLevel(
-      std::move(levelZero), std::move(levelOne), hitLedgerPowerOfTwo, mutexPow, admissionSignalMeasurement
+      std::move(levelZero), std::move(levelOne), hitLedgerPowerOfTwo, mutexPow
     )
   );
 }

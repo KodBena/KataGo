@@ -121,23 +121,23 @@ void printHuman(
     cout << "block " << b << " (one cache_dump's append):" << endl;
     for(size_t i = 0; i < block.rows.size(); i++) {
       const NNCacheCountLogBlockRow& row = block.rows[i];
-      cout << "  " << row.key.toString() << "  lookups=" << row.lookups << "  sessions=" << row.sessions << endl;
+      cout << "  " << row.key.toString() << "  observations=" << row.observations << "  sessions=" << row.sessions << endl;
     }
     if(block.rows.empty())
       cout << "  (no rows)" << endl;
-    cout << "  unattributed lookups this block: " << block.unattributedLookups << endl;
+    cout << "  unattributed observations this block: " << block.unattributedObservations << endl;
     cout << endl;
   }
   if(detailed.blocks().empty())
     cout << "(no blocks applied)" << endl << endl;
 
   cout << "accumulated totals (merged across every block above):" << endl;
-  const vector<NNCacheCountRow> sorted = agg.byDescendingLookups();
-  uint64_t totalLookups = 0;
+  const vector<NNCacheCountRow> sorted = agg.byDescendingObservations();
+  uint64_t totalObservations = 0;
   for(size_t i = 0; i < sorted.size(); i++) {
-    cout << "  " << sorted[i].key.toString() << "  lookups=" << sorted[i].lookups
+    cout << "  " << sorted[i].key.toString() << "  observations=" << sorted[i].observations
          << "  sessions=" << sorted[i].sessions << endl;
-    totalLookups += sorted[i].lookups;
+    totalObservations += sorted[i].observations;
   }
   if(sorted.empty())
     cout << "  (no rows)" << endl;
@@ -147,8 +147,8 @@ void printHuman(
   cout << "  rows:                  " << agg.rows().size() << endl;
   cout << "  blocks applied:        " << agg.blocksApplied() << endl;
   cout << "  records applied:       " << agg.recordsApplied() << endl;
-  cout << "  total lookups:         " << totalLookups << endl;
-  cout << "  unattributed lookups:  " << agg.unattributedLookups() << endl;
+  cout << "  total observations:         " << totalObservations << endl;
+  cout << "  unattributed observations:  " << agg.unattributedObservations() << endl;
   cout << "  tail:                  " << tailVerdict(agg) << endl;
 }
 
@@ -179,26 +179,26 @@ json toJson(
     for(size_t i = 0; i < block.rows.size(); i++) {
       json row;
       row["key"] = block.rows[i].key.toString();
-      row["lookups"] = block.rows[i].lookups;
+      row["observations"] = block.rows[i].observations;
       row["sessions"] = block.rows[i].sessions;
       rows.push_back(row);
     }
     blockJson["rows"] = rows;
-    blockJson["unattributedLookups"] = block.unattributedLookups;
+    blockJson["unattributedObservations"] = block.unattributedObservations;
     blocks.push_back(blockJson);
   }
   out["blocks"] = blocks;
 
   json accumulated = json::array();
-  uint64_t totalLookups = 0;
-  const vector<NNCacheCountRow> sorted = agg.byDescendingLookups();
+  uint64_t totalObservations = 0;
+  const vector<NNCacheCountRow> sorted = agg.byDescendingObservations();
   for(size_t i = 0; i < sorted.size(); i++) {
     json row;
     row["key"] = sorted[i].key.toString();
-    row["lookups"] = sorted[i].lookups;
+    row["observations"] = sorted[i].observations;
     row["sessions"] = sorted[i].sessions;
     accumulated.push_back(row);
-    totalLookups += sorted[i].lookups;
+    totalObservations += sorted[i].observations;
   }
   out["accumulatedTotals"] = accumulated;
 
@@ -206,8 +206,8 @@ json toJson(
   totals["rows"] = (int64_t)agg.rows().size();
   totals["blocksApplied"] = agg.blocksApplied();
   totals["recordsApplied"] = agg.recordsApplied();
-  totals["totalLookups"] = totalLookups;
-  totals["unattributedLookups"] = agg.unattributedLookups();
+  totals["totalObservations"] = totalObservations;
+  totals["unattributedObservations"] = agg.unattributedObservations();
   out["totals"] = totals;
 
   out["tail"] = agg.tail() == NNCacheCountLogTail::Intact ? "intact" : "torn";

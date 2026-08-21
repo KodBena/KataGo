@@ -13,27 +13,27 @@ using namespace std;
 // The admission predicate
 //-------------------------------------------------------------------------------------
 
-NNCacheDiskAdmission::NNCacheDiskAdmission(Kind kind, uint64_t lookups)
-  :kind_(kind), lookups_(lookups)
+NNCacheDiskAdmission::NNCacheDiskAdmission(Kind kind, uint64_t observations)
+  :kind_(kind), observations_(observations)
 {}
 
 NNCacheDiskAdmission NNCacheDiskAdmission::all() {
   return NNCacheDiskAdmission(Kind::All, 0);
 }
 
-NNCacheDiskAdmission NNCacheDiskAdmission::minLookups(uint64_t lookups) {
-  return NNCacheDiskAdmission(Kind::MinLookups, lookups);
+NNCacheDiskAdmission NNCacheDiskAdmission::minObservations(uint64_t observations) {
+  return NNCacheDiskAdmission(Kind::MinObservations, observations);
 }
 
-bool NNCacheDiskAdmission::admits(uint64_t recordedLookups) const {
+bool NNCacheDiskAdmission::admits(uint64_t recordedObservations) const {
   switch(kind_) {
   case Kind::All:
     return true;
-  case Kind::MinLookups:
-    // THE COMPARISON IS NOT WRITTEN HERE. NNCacheLookupThreshold owns "this key has been seen
+  case Kind::MinObservations:
+    // THE COMPARISON IS NOT WRITTEN HERE. NNCacheObservationThreshold owns "this key has been seen
     // often enough" for the read side's level-0 bound and for this predicate alike, so the two
     // cannot drift on the uncounted-key boundary case (ADR-0012 P1).
-    return NNCacheLookupThreshold::of(lookups_).admits(recordedLookups);
+    return NNCacheObservationThreshold::of(observations_).admits(recordedObservations);
   default:
     break;
   }
@@ -44,8 +44,8 @@ string NNCacheDiskAdmission::describe() const {
   switch(kind_) {
   case Kind::All:
     return "every entry this context earned and has not already stored";
-  case Kind::MinLookups:
-    return NNCacheLookupThreshold::of(lookups_).describe();
+  case Kind::MinObservations:
+    return NNCacheObservationThreshold::of(observations_).describe();
   default:
     break;
   }
@@ -61,7 +61,7 @@ namespace {
 // The count log's rows as a lookup by key. Built once per dump rather than scanned per key:
 // at the operator's largest card that is 291,129 keys against 291,129 candidates, and the
 // quadratic form of the same join is the difference between a dump and a stall.
-unordered_map<uint64_t, uint64_t> lookupsByKeyHash(const vector<NNCacheCountRow>& observations) {
+unordered_map<uint64_t, uint64_t> observationsByKeyHash(const vector<NNCacheCountRow>& observations) {
   unordered_map<uint64_t, uint64_t> out;
   out.reserve(observations.size() * 2);
   for(size_t i = 0; i < observations.size(); i++) {
@@ -71,7 +71,7 @@ unordered_map<uint64_t, uint64_t> lookupsByKeyHash(const vector<NNCacheCountRow>
     // collision, which the whole cache already treats as not happening. What a collision
     // would cost here is one entry admitted or refused on its colliding twin's count -- a
     // policy misapplication to one entry, not a wrong evaluation served.
-    out[observations[i].key.hash0] = observations[i].lookups;
+    out[observations[i].key.hash0] = observations[i].observations;
   }
   return out;
 }
@@ -96,16 +96,16 @@ NNCacheEvaluationDumpPlan nnCachePlanEvaluationDump(
   const vector<Hash128> owed = table.unpersistedKeysFor(context);
   plan.alreadyPersisted = (int64_t)earned.size() - (int64_t)owed.size();
 
-  const unordered_map<uint64_t, uint64_t> lookups = lookupsByKeyHash(observations);
+  const unordered_map<uint64_t, uint64_t> recordedByKeyHash = observationsByKeyHash(observations);
 
   plan.entries.reserve(owed.size());
   plan.keys.reserve(owed.size());
   for(size_t i = 0; i < owed.size(); i++) {
     const Hash128 key = owed[i];
-    const unordered_map<uint64_t, uint64_t>::const_iterator it = lookups.find(key.hash0);
+    const unordered_map<uint64_t, uint64_t>::const_iterator it = recordedByKeyHash.find(key.hash0);
     // A key the count log has never mentioned is passed as zero, not dropped and not guessed
-    // at: NNCacheLookupThreshold owns what a threshold makes of that.
-    const uint64_t recorded = (it == lookups.end()) ? 0 : it->second;
+    // at: NNCacheObservationThreshold owns what a threshold makes of that.
+    const uint64_t recorded = (it == recordedByKeyHash.end()) ? 0 : it->second;
     if(!admission.admits(recorded)) {
       plan.belowThreshold += 1;
       continue;

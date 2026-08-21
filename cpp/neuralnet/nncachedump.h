@@ -24,11 +24,12 @@
 // engine enforces, "mechanism, not policy", because what belongs in a study session's cache
 // is the client's business and custody of the files is KataGo's. The write side had NO such
 // predicate at all: every entry a context earned was owed to disk. NNCacheDiskAdmission is
-// that predicate, in the same stance and in the same currency -- recorded lookups, read from
-// the count log, compared through the one shared NNCacheLookupThreshold the read side's
-// minLookups bound uses. "Store only what has been seen at least twice" is then
-// NNCacheDiskAdmission::minLookups(2): the operator's own typical policy expressed as an
-// argument, not compiled in as a constant.
+// that predicate, in the same stance and in the same currency -- recorded OBSERVATIONS, read
+// from the count log, compared through the one shared NNCacheObservationThreshold the read
+// side's minObservations bound uses. "Store only what has been seen at least twice" is then
+// NNCacheDiskAdmission::minObservations(2): the operator's own typical policy, and the
+// DEFAULT a cache_dump that names no admission gets -- expressed as an argument, never
+// compiled in as a constant here.
 //
 // QUESTION TWO, THE FACT: IS THIS ENTRY ALREADY ON DISK? This is not a policy and no client
 // gets to answer it. An attach fills level 1 with the container keys its level-0 bound did
@@ -60,24 +61,24 @@ class NNCacheDiskAdmission {
   // Every entry the context earned and does not already have on disk. The default, and what
   // the write side did before a predicate existed.
   static NNCacheDiskAdmission all();
-  // Every entry whose count-log record clears `lookups` retrievals. minLookups(2) is "store
-  // only entries seen at least twice"; minLookups(0) is all().
-  static NNCacheDiskAdmission minLookups(uint64_t lookups);
+  // Every entry whose count-log record clears `observations` observations. minObservations(2)
+  // is "store only entries seen at least twice"; minObservations(0) is all().
+  static NNCacheDiskAdmission minObservations(uint64_t observations);
 
-  // Whether an entry the count log records `recordedLookups` retrievals for is admitted. A
-  // key the count log does not mention is passed as zero -- see NNCacheLookupThreshold, which
-  // owns that rule for both sides.
-  [[nodiscard]] bool admits(uint64_t recordedLookups) const;
+  // Whether an entry the count log records `recordedObservations` observations for is
+  // admitted. A key the count log does not mention is passed as zero -- see
+  // NNCacheObservationThreshold, which owns that rule for both sides.
+  [[nodiscard]] bool admits(uint64_t recordedObservations) const;
 
   // For a report or a refusal: what was asked for, in words.
   [[nodiscard]] std::string describe() const;
 
  private:
-  enum class Kind { All, MinLookups };
-  NNCacheDiskAdmission(Kind kind, uint64_t lookups);
+  enum class Kind { All, MinObservations };
+  NNCacheDiskAdmission(Kind kind, uint64_t observations);
 
   Kind kind_;
-  uint64_t lookups_;
+  uint64_t observations_;
 };
 
 //-------------------------------------------------------------------------------------

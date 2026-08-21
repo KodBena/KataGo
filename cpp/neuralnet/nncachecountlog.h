@@ -7,19 +7,23 @@
 
 #include "../core/hash.h"
 #include "../neuralnet/nncache.h"
+#include "../neuralnet/nncacheobservations.h"
 
-// An APPEND-ONLY LOG of per-(key, context) hit counts, with no dependency on anything
-// outside the C and C++ standard libraries.
+// An APPEND-ONLY LOG of per-(key, context) OBSERVATION counts, with no dependency on
+// anything outside the C and C++ standard libraries.
 //
 // WHAT IT IS FOR, AND WHAT IT IS NOT FOR. It persists COUNTS: for each 128-bit position
-// hash, how many times an evaluation was retrieved for it, and in how many dumps it
-// appeared. It does not persist evaluations. There is no NNOutput in this header, no
-// payload container, and no schema for one -- persisting evaluations is a separate piece
-// of work, and a container format invented here in passing would be that work done badly.
+// hash, how many times that position was PRESENTED to the cache under this context, and in
+// how many dumps it appeared. An observation is a would-have-been-computed forward pass --
+// one evaluation request for one position, hit or miss -- and NOT a cache hit; see
+// nncacheobservations.h, which owns that definition and the reasoning behind it. It does not
+// persist evaluations. There is no NNOutput in this header, no payload container, and no
+// schema for one -- persisting evaluations is a separate piece of work, and a container
+// format invented here in passing would be that work done badly.
 //
 // WRITES HAPPEN ONLY ON AN EXPLICIT DUMP. Nothing in this file is reachable from the MCTS
-// hot path, from NNCacheTable::get or from NNCacheTable::set. appendDump reads the finished
-// per-key surface a table already keeps (NNCacheTable::harvestHitCounts) and writes it once.
+// hot path. appendDump reads the finished per-key surface a table already keeps
+// (NNCacheTable::takeUnpersistedObservationCountsFor) and writes it once.
 //
 // ONE WRITER. The file format assumes a single engine process owns a given context's log
 // for the duration of a dump. There is no lock file, no advisory locking, and no
@@ -45,44 +49,57 @@
 // One key's accumulated totals across every dump the log holds.
 //
 // The totals are 64-bit here and 32-bit on the wire, deliberately: a single dump's count
-// comes from NNCacheHitCount::hits, which is a uint32_t, but a sum across dumps has no such
+// comes from NNCacheObservationCount::observations, which is a uint32_t, but a sum across dumps has no such
 // bound and silently wrapping it would be the worst kind of quiet failure. Compaction,
 // which is the only operation that has to fit an accumulated total back into a record,
 // refuses loudly and names the key if one will not fit (ADR-0002).
 struct NNCacheCountRow {
   Hash128 key;
-  // Total retrievals recorded for this key, summed over every dump in the log.
-  uint64_t lookups;
-  // HOW MANY DUMPS THIS KEY EARNED A RETRIEVAL IN. Named "sessions" in the operator's own
-  // schema and kept under that name; the definition is the one stated here.
+  // Total OBSERVATIONS recorded for this key, summed over every dump in the log: how many
+  // times this position has been presented to the cache under this context across every
+  // session that has dumped here. This is the quantity a level-0 attach orders by and a disk
+  // admission threshold compares against.
+  uint64_t observations;
+  // HOW MANY DUMPS THIS KEY WAS OBSERVED IN. Named "sessions" in the operator's own schema
+  // and kept under that name; the definition is the one stated here.
   //
-  // A dump appends the DELTA since the last one (NNCacheHitCountDelta below), and the delta
-  // surface omits a key with nothing to say -- so this rises by one per dump in which the
-  // key was actually looked up, and a pre-warmed key a whole session never touched does not
-  // rise at all. That is what an additive log of deltas necessarily produces, and it is the
-  // reading a client wants: in how many study sessions did this position come up.
+  // A dump appends the DELTA since the last one (NNCacheObservationDelta below), and the
+  // delta surface omits a key with nothing to say -- so this rises by one per dump in which
+  // the position was actually presented at least once, and a pre-warmed key a whole session
+  // never asked for does not rise at all. That is what an additive log of deltas necessarily
+  // produces, and it is the reading a client wants: in how many study sessions did this
+  // position come up.
   //
-  // NOT "how many dumps carried this key through", which an earlier statement of this field
-  // implied. Whether an entry is still being carried is a fact about CACHE RETENTION -- it
-  // is answered by the entry still being in the container -- and not a fact about how often
-  // the position was needed. The two readings agreed only while nothing marked which counts
-  // had already been persisted; the persisted mark is what separates them.
+  // WHAT THE CURRENCY CHANGE DID TO THIS FIELD, stated rather than left to drift (the K8
+  // reconciliation). Its NAME, its wire slot, its arithmetic and the sentence above are all
+  // unchanged. What changed is that the sentence is now TRUE. Under the old retrieval
+  // currency a position that came up and MISSED -- freshly evaluated, or evaluated again
+  // after an eviction -- earned no row, so its sessions did not rise even though the session
+  // demonstrably worked on it; "in how many study sessions did this come up" was a claim the
+  // field could not actually support, and only a position that came up AND was already
+  // cached was ever credited. An observation is counted whether a level answered it or a
+  // forward pass had to, so every session in which the position came up now credits it,
+  // which is exactly what the field always said.
+  //
+  // NOT "how many dumps carried this key through". Whether an entry is still being carried
+  // is a fact about CACHE RETENTION -- answered by the entry still being in the container --
+  // and not a fact about how often the position was needed.
   //
   // The log still cannot tell two dumps in one engine run from two runs, and does not
   // pretend to: it counts dumps, which is what a dump can observe.
   uint64_t sessions;
 };
 
-// A MINIMUM RECORDED-LOOKUP COUNT: the one home of the rule "this key has been seen often
-// enough", for every side that asks it.
+// A MINIMUM RECORDED-OBSERVATION COUNT: the one home of the rule "this key has been seen
+// often enough", for every side that asks it.
 //
 // WHY THIS IS A TYPE AND NOT A uint64_t PASSED AROUND. Two independent surfaces apply the
-// same rule to the same fact. The READ side is NNCacheLevelZeroBound::minLookups, which
+// same rule to the same fact. The READ side is NNCacheLevelZeroBound::minObservations, which
 // decides what an attach admits into a frozen level 0. The WRITE side is
-// NNCacheDiskAdmission::minLookups, which decides what a dump lets onto disk. They are
+// NNCacheDiskAdmission::minObservations, which decides what a dump lets onto disk. They are
 // different decisions -- one is a prefix of a ranked order, the other a per-entry
 // predicate -- but the QUESTION they ask of a key is one question, and a key's recorded
-// lookups are one fact with one home, this log. Written out twice, the two comparisons
+// observations are one fact with one home, this log. Written out twice, the two comparisons
 // could drift in the one place drifting is silent: the boundary case below (ADR-0012 P1).
 //
 // THE BOUNDARY CASE, stated once here so neither side restates it. A key the log has never
@@ -92,85 +109,94 @@ struct NNCacheCountRow {
 // given a separate check, because there is nothing for one to catch; see
 // NNCacheLevelZeroBound::select, where the same reasoning is already recorded against the
 // read side's own comparison.
-class NNCacheLookupThreshold {
+class NNCacheObservationThreshold {
  public:
-  // Admits a key recorded at `lookups` retrievals or more. of(0) admits every key, counted
-  // or not.
-  static NNCacheLookupThreshold of(uint64_t lookups) { return NNCacheLookupThreshold(lookups); }
+  // Admits a key recorded at `observations` observations or more. of(0) admits every key,
+  // counted or not.
+  static NNCacheObservationThreshold of(uint64_t observations) { return NNCacheObservationThreshold(observations); }
 
-  [[nodiscard]] uint64_t lookups() const { return lookups_; }
+  [[nodiscard]] uint64_t observations() const { return observations_; }
 
-  // Whether a key the log records `recordedLookups` retrievals for clears this threshold.
-  // A key the log does not mention is passed as zero, by the rule above.
-  [[nodiscard]] bool admits(uint64_t recordedLookups) const { return recordedLookups >= lookups_; }
+  // Whether a key the log records `recordedObservations` observations for clears this
+  // threshold. A key the log does not mention is passed as zero, by the rule above.
+  [[nodiscard]] bool admits(uint64_t recordedObservations) const { return recordedObservations >= observations_; }
 
   // For a report or a refusal: what was asked for, in words, without a caller re-deriving
   // it from the number.
   [[nodiscard]] std::string describe() const;
 
  private:
-  explicit NNCacheLookupThreshold(uint64_t lookups) : lookups_(lookups) {}
-  uint64_t lookups_;
+  explicit NNCacheObservationThreshold(uint64_t observations) : observations_(observations) {}
+  uint64_t observations_;
 };
 
-// THE ONLY THING A DUMP MAY APPEND: a table's UNPERSISTED DELTA, as a type that only the
-// delta surface can produce.
+// THE ONLY THING A DUMP MAY APPEND: a table's UNPERSISTED OBSERVATION DELTA, as a type that
+// only the delta surface can produce.
 //
 // WHY THIS IS A TYPE AND NOT A SENTENCE IN appendDump's COMMENT. A block is a set of
-// INCREMENTS -- the reader ADDS each record's lookups to that key's running total and its
+// INCREMENTS -- the reader ADDS each record's observations to that key's running total and its
 // sessions to that key's dump count (see the format description above NNCacheCountLog). So
 // the only sound thing to append is what has accrued since the last dump, which is
-// NNCacheTable::takeUnpersistedHitCounts. Beside it sits NNCacheTable::harvestHitCounts,
-// which reports this session's RUNNING TOTAL for every key: a legitimate answer to a
-// different question -- a one-shot report such as the cache_stats action -- and a double
-// count the instant it reaches an additive reader.
+// NNCacheTable::takeUnpersistedObservationCountsFor. Beside it sits
+// NNCacheTable::harvestObservationCountsFor, which reports this session's RUNNING TOTAL for
+// every key: a legitimate answer to a different question -- a one-shot report such as the
+// cache_stats action -- and a double count the instant it reaches an additive reader.
 //
-// Both surfaces return NNCacheHitLedger. So while appendDump took a ledger, the unsound
-// composition read exactly as well as the sound one, and the only thing standing between
-// them was a reviewer noticing. Choosing correctly once does not stop the next caller
+// Both surfaces return NNCacheObservationLedger. So while appendDump took a ledger, the
+// unsound composition read exactly as well as the sound one, and the only thing standing
+// between them was a reviewer noticing. Choosing correctly once does not stop the next caller
 // choosing wrong, so the fix is the one ADR-0000 Rule 2a asks for: appendDump takes a type
-// the absolute surface cannot produce, and `log.appendDump(table.harvestHitCounts())`
+// the absolute surface cannot produce, and `log.appendDump(table.harvestObservationCounts())`
 // stops compiling instead of stopping at review. This is the same move SearchableModelIdx
 // (command/analysismodels.h) makes for a wrong-axis subscript, in the delta-versus-absolute
 // register.
 //
-// THE TWO DOORS, and why neither of them lets an absolute through. take() consumes a live
-// table's delta and is the production path. ofDeltaRows takes ROWS and never a ledger, for
-// a caller that assembled the delta itself -- a test's synthetic dump, a fixture -- so
-// there is no expression that converts a harvest into one of these; unwrapping a harvest's
-// rows and re-wrapping them under a name that says "delta" is a deliberate act with the
-// wrong word written at the call site, not a plausible-looking one-liner.
-class NNCacheHitCountDelta {
+// AND THE WRONG CURRENCY IS FORECLOSED IN THE SAME MOVE, which is new. This type is
+// constructible only from an OBSERVATION ledger, so `log.appendDump(table.harvestHitCounts())`
+// -- retrievals, a different quantity that happens to have the same shape -- does not name a
+// viable overload either. The two currencies were confused once already (ledger rows
+// 1651/1654); the type is now what keeps them apart, not a comment.
+//
+// THE TWO DOORS, and why neither of them lets an absolute through. takeFor consumes a live
+// table's per-context delta and is the production path. ofDeltaRows takes ROWS and never a
+// ledger, for a caller that assembled the delta itself -- a test's synthetic dump, a fixture
+// -- so there is no expression that converts a harvest into one of these; unwrapping a
+// harvest's rows and re-wrapping them under a name that says "delta" is a deliberate act with
+// the wrong word written at the call site, not a plausible-looking one-liner.
+//
+// THERE IS NO WHOLE-TABLE take(), and its absence is deliberate rather than an omission. A
+// count log file belongs to ONE context, and an observation row belongs to exactly one context
+// by construction -- the ledger is keyed on (key, context) -- so a whole-table delta could
+// only be written into some context's file by attributing another context's presentations to
+// it. The division is made where the fact lives and there is no door that skips it.
+class NNCacheObservationDelta {
  public:
-  // Takes `table`'s counts that have not reached a count log yet, advancing its persisted
-  // marks. CONSUMING: the same retrievals are never reported twice, which is exactly the
-  // property that makes the result appendable.
-  [[nodiscard]] static NNCacheHitCountDelta take(NNCacheTable& table);
-
-  // Takes the counts of exactly `context` that have not reached a count log yet, advancing the
-  // marks of the rows it hands over AND OF NO OTHERS. Consuming, exactly as take() is, and it is
-  // what makes several attached cards dumpable in one session: with two contexts attached, the
-  // whole-table delta cannot be divided by any caller, because a row carries a key and a key
-  // names a position, never a card (NNCacheTable::takeUnpersistedHitCountsFor).
+  // Takes the observations of exactly `context` that have not reached a count log yet,
+  // advancing the marks of the rows it hands over AND OF NO OTHERS. CONSUMING: the same
+  // presentations are never reported twice, which is exactly the property that makes the
+  // result appendable. With two cards attached, each one's dump still finds its own delta
+  // whole.
   //
   // Throws StringError for a context the table did not attach.
-  [[nodiscard]] static NNCacheHitCountDelta takeFor(NNCacheTable& table, const NNCacheContextId& context);
+  [[nodiscard]] static NNCacheObservationDelta takeFor(NNCacheTable& table, const NNCacheContextId& context);
 
-  // A delta the caller already holds as rows. `unrecordedHits` is the honesty residue --
-  // retrievals that happened and could not be given a row -- carried whole, exactly as
-  // NNCacheHitLedger carries it.
-  [[nodiscard]] static NNCacheHitCountDelta ofDeltaRows(std::vector<NNCacheHitCount> rows, int64_t unrecordedHits);
+  // A delta the caller already holds as rows. `unrecordedObservations` is the honesty residue
+  // -- presentations that happened and could not be given a row -- carried whole, exactly as
+  // NNCacheObservationLedger carries it.
+  [[nodiscard]] static NNCacheObservationDelta ofDeltaRows(
+    std::vector<NNCacheObservationCount> rows, int64_t unrecordedObservations
+  );
 
-  // A delta from a table that keeps no per-key counts. Distinct from a delta of zero rows,
-  // and appendDump refuses it by name: see appendDump.
-  [[nodiscard]] static NNCacheHitCountDelta notCounted();
+  // A delta from a table that observes nothing, because no context is attached to it.
+  // Distinct from a delta of zero rows, and appendDump refuses it by name: see appendDump.
+  [[nodiscard]] static NNCacheObservationDelta notObserved();
 
   // The rows and the residue, as the ledger type the rest of the cache already speaks.
-  [[nodiscard]] const NNCacheHitLedger& ledger() const { return ledger_; }
+  [[nodiscard]] const NNCacheObservationLedger& ledger() const { return ledger_; }
 
  private:
-  explicit NNCacheHitCountDelta(NNCacheHitLedger ledger);
-  NNCacheHitLedger ledger_;
+  explicit NNCacheObservationDelta(NNCacheObservationLedger ledger);
+  NNCacheObservationLedger ledger_;
 };
 
 // Whether the file ended on a block boundary, or on bytes a crash left behind.
@@ -197,7 +223,7 @@ class NNCacheCountLogContents {
   // states a reader has to be careful about.
   static NNCacheCountLogContents of(
     std::vector<NNCacheCountRow> rows,
-    int64_t unattributedLookups,
+    int64_t unattributedObservations,
     NNCacheCountLogTail tail,
     int64_t discardedTailBytes,
     int64_t blocksApplied,
@@ -205,14 +231,14 @@ class NNCacheCountLogContents {
   );
 
   // One row per distinct key, in first-appearance order. Not sorted: see
-  // byDescendingLookups.
+  // byDescendingObservations.
   const std::vector<NNCacheCountRow>& rows() const { return rows_; }
 
-  // Lookups that happened and could not be attributed to any key, summed over every applied
-  // block. This is NNCacheHitLedger::unrecordedHits carried through the log rather than
-  // dropped at the door: a harvest that was short says by how much, and so does the log
-  // that stored it (ADR-0002). Zero in every ordinary run.
-  int64_t unattributedLookups() const { return unattributedLookups_; }
+  // Observations that happened and could not be attributed to any key, summed over every
+  // applied block. This is NNCacheObservationLedger::unrecordedObservations carried through
+  // the log rather than dropped at the door: a harvest that was short says by how much, and so
+  // does the log that stored it (ADR-0002). Zero in every ordinary run.
+  int64_t unattributedObservations() const { return unattributedObservations_; }
 
   NNCacheCountLogTail tail() const { return tail_; }
   // Bytes after the last intact block. Positive exactly when tail() is Truncated.
@@ -224,20 +250,20 @@ class NNCacheCountLogContents {
   // the compaction trigger reads.
   int64_t recordsApplied() const { return recordsApplied_; }
 
-  // The rows in descending lookups, ties broken by key so the order is total and a test can
-  // assert it.
+  // The rows in descending observations, ties broken by key so the order is total and a test
+  // can assert it.
   //
-  // ORDERING IS BY LOOKUPS. That is the operator's ruling for what a frozen level 0 should
-  // be built in the order of, and it is why this is the only ordering helper here. Nothing
-  // in this file ranks, weights or prefers sessions; sessions is stored because it is cheap
-  // to store and is a fact he asked for, not because anything here treats it as the better
-  // predictor.
-  [[nodiscard]] std::vector<NNCacheCountRow> byDescendingLookups() const;
+  // ORDERING IS BY OBSERVATIONS. That is the operator's ruling for what a frozen level 0
+  // should be built in the order of -- in the currency he ratified, which is how often the
+  // position comes up -- and it is why this is the only ordering helper here. Nothing in this
+  // file ranks, weights or prefers sessions; sessions is stored because it is cheap to store
+  // and is a fact he asked for, not because anything here treats it as the better predictor.
+  [[nodiscard]] std::vector<NNCacheCountRow> byDescendingObservations() const;
 
  private:
   NNCacheCountLogContents(
     std::vector<NNCacheCountRow> rows,
-    int64_t unattributedLookups,
+    int64_t unattributedObservations,
     NNCacheCountLogTail tail,
     int64_t discardedTailBytes,
     int64_t blocksApplied,
@@ -245,7 +271,7 @@ class NNCacheCountLogContents {
   );
 
   std::vector<NNCacheCountRow> rows_;
-  int64_t unattributedLookups_;
+  int64_t unattributedObservations_;
   NNCacheCountLogTail tail_;
   int64_t discardedTailBytes_;
   int64_t blocksApplied_;
@@ -259,16 +285,16 @@ class NNCacheCountLogContents {
 // gives.
 struct NNCacheCountLogBlockRow {
   Hash128 key;
-  uint64_t lookups;
+  uint64_t observations;
   uint64_t sessions;
 };
 
 // One applied block, in file order.
 struct NNCacheCountLogBlock {
   std::vector<NNCacheCountLogBlockRow> rows;
-  // Lookups this one dump could not attribute to any key. See
-  // NNCacheCountLogContents::unattributedLookups for the sum of these over every block.
-  int64_t unattributedLookups;
+  // Observations this one dump could not attribute to any key. See
+  // NNCacheCountLogContents::unattributedObservations for the sum of these over every block.
+  int64_t unattributedObservations;
 };
 
 // load()'s answer, but with every applied block's own rows kept separate as well as merged
@@ -325,13 +351,13 @@ struct NNCacheCountLogAppendResult {
 //     block header, 32 bytes:
 //       [ 0.. 4)  block magic, u32
 //       [ 4.. 8)  record count, u32
-//       [ 8..16)  unattributed lookups this dump, u64
+//       [ 8..16)  unattributed observations this dump, u64
 //       [16..24)  checksum over the block's records, u64
 //       [24..32)  checksum over bytes [0..24) of this header, u64
 //     then record count records, 24 bytes each:
 //       [ 0.. 8)  key.hash0, u64
 //       [ 8..16)  key.hash1, u64
-//       [16..20)  lookups, u32
+//       [16..20)  observations, u32
 //       [20..24)  sessions, u32
 //
 // Every multi-byte field is little-endian and is packed and unpacked byte by byte. The
@@ -364,7 +390,7 @@ struct NNCacheCountLogAppendResult {
 // the new block at an offset no loader ever reaches, so every subsequent dump would be
 // silently lost while every call reported success.
 //
-// A BLOCK IS ONE DUMP AND ITS RECORDS ARE INCREMENTS. Merging is addition: a key's lookups
+// A BLOCK IS ONE DUMP AND ITS RECORDS ARE INCREMENTS. Merging is addition: a key's observations
 // accumulate and its sessions rise by whatever the block says, which is 1 per dump. A
 // compacted file holding one block of accumulated sums is therefore observationally
 // identical to the log it replaced, and there is no absolute-versus-delta flag to get wrong.
@@ -402,25 +428,32 @@ class NNCacheCountLog {
   // rather than in a page cache.
   //
   // TAKES A DELTA, AND THE TYPE IS WHAT SAYS SO. A record is an increment, so what this
-  // appends must be what has accrued since the last dump; NNCacheHitCountDelta is the type
-  // only the delta surface can produce, and handing this an absolute harvest is a compile
-  // error rather than a silent double count. The reasoning is above that type.
+  // appends must be what has accrued since the last dump; NNCacheObservationDelta is the type
+  // only the delta surface can produce, and handing this an absolute harvest -- or a ledger of
+  // retrievals, which is a different currency of the same shape -- is a compile error rather
+  // than a silent double count. The reasoning is above that type.
   //
-  // Every row's lookups is added to that key's running total and every row present adds 1
-  // to that key's sessions. The delta surface omits a key with nothing to say, so a
-  // pre-warmed entry a session never touched contributes no record and its sessions does
+  // Every row's observations is added to that key's running total and every row present adds
+  // 1 to that key's sessions. The delta surface omits a key with nothing to say, so a
+  // pre-warmed entry a session never asked for contributes no record and its sessions does
   // not rise -- see NNCacheCountRow::sessions, which states that reading in full.
   //
-  // A delta whose disposition is NotCounted is REFUSED here, naming that a single-level
-  // table keeps no per-key counts, rather than being written as a dump of zero rows that a
-  // later reader would take for "this session hit nothing".
+  // EVERY OBSERVED KEY GETS A ROW, INCLUDING ONE OBSERVED EXACTLY ONCE whose evaluation no
+  // admission threshold will admit to disk. That is not an oversight in the caller: the count
+  // is what a LATER session adds to, so the session that could not yet use it is the session
+  // that has to write it. It is the whole mechanism of a seen-twice policy bootstrapping
+  // across sessions (ratified spec, ledger rows 1717/1722).
+  //
+  // A delta whose disposition is NotObserved is REFUSED here, naming that a table with no
+  // attached context observes nothing, rather than being written as a dump of zero rows that a
+  // later reader would take for "this session asked for nothing".
   //
   // Repairs a torn tail first, if there is one, and reports it in the result. Creates the
   // file, with its header, if it does not exist.
   //
   // Throws StringError if the delta is NotCounted, if any file operation fails, or if a
   // repair would produce a total that does not fit a record.
-  NNCacheCountLogAppendResult appendDump(const NNCacheHitCountDelta& delta) const;
+  NNCacheCountLogAppendResult appendDump(const NNCacheObservationDelta& delta) const;
 
   // Reads the whole log. A missing file is not an error: it reads as zero rows, Intact --
   // "no dump has happened here yet" is a normal answer.
@@ -480,14 +513,14 @@ class NNCacheCountLog {
   // The exact bytes a dump of `numRows` rows adds to an existing file.
   static int64_t bytesForDumpOf(int64_t numRows);
 
-  // WHAT EVERY COUNT IN THIS LOG CURRENTLY MEASURES, as one sentence for a reader to print
-  // rather than invent its own wording of. TODAY that is a RECORDED RETRIEVAL: a cache hit
-  // for a key some earlier dump had already stored, not a forward pass. This is the one home
-  // for that sentence so that a later re-denomination of what the log counts changes it once,
-  // here, and every reader (nncountsdump among them) picks up the new wording rather than one
-  // copy drifting from another -- see the currency confusion this already caused once
-  // (ledger rows 1651/1654) and the tracked follow-up that will change what this file counts
-  // (ledger rows 1717/1722/1723).
+  // WHAT EVERY COUNT IN THIS LOG MEASURES, as one sentence for a reader to print rather than
+  // invent its own wording of. TODAY that is an OBSERVATION: one presentation of the position
+  // to the cache under this context -- a would-have-been-computed forward pass -- counted
+  // whether a cached evaluation answered it or one had to be computed. This is the one home
+  // for that sentence so that a re-denomination of what the log counts changes it once, here,
+  // and every reader (nncountsdump among them) picks up the new wording rather than one copy
+  // drifting from another -- see the currency confusion this already caused once (ledger rows
+  // 1651/1654) and the ratification that settled it (ledger rows 1717/1722).
   static const std::string& countsCurrencyDescription();
 
  private:

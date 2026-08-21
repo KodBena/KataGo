@@ -64,18 +64,6 @@ namespace {
 
 const char* const TMP_DIR_PREFIX = "tmpnncachecontext";
 
-// The per-context hit surface, as the delta type appendDump takes.
-//
-// harvestHitCountsFor reports a context's RUNNING TOTAL, and appendDump takes a DELTA -- two
-// different quantities, which is why the type refuses the conversion and this helper has to
-// say what it is doing. The tests below each dump ONCE per context, into a log with no prior
-// block, so the running total IS the delta and the two coincide exactly. That coincidence is
-// what makes the conversion honest here and nowhere else: there is no per-context delta
-// surface, so a second dump of the same context through this route would double-count, and no
-// test below takes one.
-NNCacheHitCountDelta asDelta(const NNCacheHitLedger& perContextTotals) {
-  return NNCacheHitCountDelta::ofDeltaRows(perContextTotals.entries(), perContextTotals.unrecordedHits());
-}
 
 // A distinct key per serial, spread over both halves.
 Hash128 nthKey(int serial) {
@@ -159,10 +147,10 @@ bool logHasKey(const NNCacheCountLogContents& contents, Hash128 key) {
   return false;
 }
 
-uint64_t logLookupsFor(const NNCacheCountLogContents& contents, Hash128 key) {
+uint64_t logObservationsFor(const NNCacheCountLogContents& contents, Hash128 key) {
   for(size_t i = 0; i < contents.rows().size(); i++) {
     if(contents.rows()[i].key == key)
-      return contents.rows()[i].lookups;
+      return contents.rows()[i].observations;
   }
   testAssert(false);
   return 0;
@@ -257,9 +245,9 @@ void testAnIdFromAnotherCachesNameSpaceMeansNothingHere() {
 //-------------------------------------------------------------------------------------
 
 // THE CENTRAL WITNESS. Two contexts are attached to one table; each earns its own entries and
-// one of them is retrieved twice. The observation is the pair of real count-log files on disk
-// after each context's dump: A's file holds A's key with its two lookups, and B's file does
-// NOT hold it. A ledger that filed the entry under the wrong context, or under both, is a
+// one of them is presented twice more. The witness is the pair of real count-log files on disk
+// after each context's dump: A's file holds A's key with its three observations, and B's file
+// does NOT hold it. A ledger that filed the entry under the wrong context, or under both, is a
 // different pair of files.
 void testEachContextsEarningsReachThatContextsCountLogAndNoOthers() {
   TestCommon::ScopedTempDir dir(TMP_DIR_PREFIX);
@@ -272,34 +260,42 @@ void testEachContextsEarningsReachThatContextsCountLogAndNoOthers() {
   const Hash128 alsoEarnedByA = nthKey(2);
   const Hash128 earnedByB = nthKey(3);
 
+  // Each key is PRESENTED once and then evaluated: observe() is the door a request goes
+  // through, and the set beside it is what that request did with the result.
+  table->observe(earnedByA, NNCacheAttribution::toContext(cardA));
   table->set(outputFor(earnedByA), NNCacheAttribution::toContext(cardA));
+  table->observe(alsoEarnedByA, NNCacheAttribution::toContext(cardA));
   table->set(outputFor(alsoEarnedByA), NNCacheAttribution::toContext(cardA));
+  table->observe(earnedByB, NNCacheAttribution::toContext(cardB));
   table->set(outputFor(earnedByB), NNCacheAttribution::toContext(cardB));
 
-  // Two retrievals of A's key, so the count that lands in A's file is a number and not a zero
-  // that any wiring would produce.
+  // Two more presentations of A's key, both answered from cache, so the count that lands in
+  // A's file is a number and not a zero that any wiring would produce.
   shared_ptr<NNOutput> got;
-  testAssert(table->get(earnedByA, got));
-  testAssert(table->get(earnedByA, got));
+  for(int again = 0; again < 2; again++) {
+    table->observe(earnedByA, NNCacheAttribution::toContext(cardA));
+    testAssert(table->get(earnedByA, got));
+  }
 
   const NNCacheCountLog logA = NNCacheCountLog::forContext(dir.path(), "card-5455");
   const NNCacheCountLog logB = NNCacheCountLog::forContext(dir.path(), "card-9001");
-  logA.appendDump(asDelta(table->harvestHitCountsFor(cardA)));
-  logB.appendDump(asDelta(table->harvestHitCountsFor(cardB)));
+  logA.appendDump(NNCacheObservationDelta::takeFor(*table, cardA));
+  logB.appendDump(NNCacheObservationDelta::takeFor(*table, cardB));
 
   const NNCacheCountLogContents contentsA = logA.load();
   const NNCacheCountLogContents contentsB = logB.load();
   testAssert(contentsA.tail() == NNCacheCountLogTail::Intact);
   testAssert(contentsB.tail() == NNCacheCountLogTail::Intact);
 
-  // A's file: A's two keys, with the retrievals that actually happened.
+  // A's file: A's two keys, with the presentations that actually happened.
   testAssert(contentsA.rows().size() == 2);
   testAssert(logHasKey(contentsA, earnedByA));
-  testAssert(logLookupsFor(contentsA, earnedByA) == 2);
+  testAssert(logObservationsFor(contentsA, earnedByA) == 3);
   testAssert(logHasKey(contentsA, alsoEarnedByA));
-  // A key earned and never retrieved is present with zero, because "this card earned this
-  // position and nothing came back for it" is the fact that says to stop carrying it.
-  testAssert(logLookupsFor(contentsA, alsoEarnedByA) == 0);
+  // A key presented exactly ONCE -- evaluated fresh and never asked for again -- is present
+  // with 1, not with zero and not absent. That row is what a later session adds to, and it is
+  // the whole reason a seen-twice admission policy can ever be reached.
+  testAssert(logObservationsFor(contentsA, alsoEarnedByA) == 1);
   testAssert(!logHasKey(contentsA, earnedByB));
 
   // B's file: B's one key, and none of A's. This is the leg that fails if attribution is
@@ -339,8 +335,11 @@ void testAnEntryWithNoAttributableContextIsCountedAndNotGuessedIntoOne() {
   const NNCacheContextResolution resolution =
     table->cacheContexts().resolveForRequest(std::optional<string>());
   testAssert(!resolution.attribution().value().isToContext());
+  table->observe(orphan, resolution.attribution().value());
   table->set(outputFor(orphan), resolution.attribution().value());
+  table->observe(secondOrphan, resolution.attribution().value());
   table->set(outputFor(secondOrphan), resolution.attribution().value());
+  table->observe(attributed, NNCacheAttribution::toContext(cardA));
   table->set(outputFor(attributed), NNCacheAttribution::toContext(cardA));
 
   const NNCacheAttributionLedger ledger = table->harvestAttribution();
@@ -356,8 +355,8 @@ void testAnEntryWithNoAttributableContextIsCountedAndNotGuessedIntoOne() {
   // And the same, observed on the files a dump actually writes: neither card's log carries it.
   const NNCacheCountLog logA = NNCacheCountLog::forContext(dir.path(), "card-5455");
   const NNCacheCountLog logB = NNCacheCountLog::forContext(dir.path(), "card-9001");
-  logA.appendDump(asDelta(table->harvestHitCountsFor(cardA)));
-  logB.appendDump(asDelta(table->harvestHitCountsFor(cardB)));
+  logA.appendDump(NNCacheObservationDelta::takeFor(*table, cardA));
+  logB.appendDump(NNCacheObservationDelta::takeFor(*table, cardB));
   testAssert(!logHasKey(logA.load(), orphan));
   testAssert(!logHasKey(logB.load(), orphan));
   testAssert(logHasKey(logA.load(), attributed));
@@ -374,7 +373,7 @@ void testAnAttributionFromAnotherCacheCannotBeSpentHere() {
     [&]() { mine->set(outputFor(nthKey(11)), NNCacheAttribution::toContext(foreign)); },
     "different cache"
   ));
-  testAssert(refused([&]() { mine->harvestHitCountsFor(foreign); }, "not attached to this cache"));
+  testAssert(refused([&]() { (void)mine->harvestObservationCountsFor(foreign); }, "not attached to this cache"));
 }
 
 void testACacheWithNoAttachedContextIsExactlyWhatItWasBefore() {
@@ -396,21 +395,32 @@ void testACacheWithNoAttachedContextIsExactlyWhatItWasBefore() {
   testAssert(table->harvestAttribution().disposition() == NNCacheAttributionDisposition::NotAttributed);
 }
 
-// A table that keeps no per-key hit counts answers the per-context dump question with the same
-// NotCounted it answers the whole-table one with -- rather than an empty Counted ledger, which
-// a dump would write as "this context earned nothing this session".
-void testASingleLevelTablesPerContextDumpIsNotCountedRatherThanEmpty() {
+// A SINGLE-LEVEL TABLE OBSERVES, AND THAT IS THE CHANGE THIS LEG NOW WITNESSES.
+//
+// It used to assert the opposite: the per-context count surface answered NotCounted from any
+// table without a frozen level 0, because counting was a property of the two-level strategy.
+// Observations are not -- they are counted at the table's own door, on the base, so an
+// ordinary table with a context attached has real counts to dump. That is what makes a card
+// dumpable in a session that never attached one.
+void testASingleLevelTableStillObservesUnderAContext() {
   unique_ptr<NNCacheTable> table = defaultLevelOne(10);
   const NNCacheContextId card = table->attachCacheContext("card-5455");
+  table->observe(nthKey(31), NNCacheAttribution::toContext(card));
   table->set(outputFor(nthKey(31)), NNCacheAttribution::toContext(card));
 
   // The attribution IS recorded -- the earnings are known.
   const NNCacheAttributionLedger ledger = table->harvestAttribution();
   testAssert(ledger.isAttributed());
   testAssert(contextOwns(ledger, nthKey(31), "card-5455"));
-  // But there are no counts to put beside them, and that is said rather than implied.
-  const NNCacheHitLedger perContext = table->harvestHitCountsFor(card);
-  testAssert(perContext.disposition() == NNCacheHitLedgerDisposition::NotCounted);
+  // And so is the observation, on a table with no level 0 at all.
+  const NNCacheObservationLedger perContext = table->harvestObservationCountsFor(card);
+  testAssert(perContext.isObserved());
+  testAssert(perContext.entries().size() == 1);
+  testAssert(perContext.entries()[0].observations == 1);
+
+  // The RETRIEVAL surface is still NotCounted here, which is the honest answer for a table
+  // that keeps no per-key hit counts -- the two dispositions now say two different things.
+  testAssert(table->harvestHitCounts().disposition() == NNCacheHitLedgerDisposition::NotCounted);
 }
 
 // THE RELATION THE DEFAULT SIZE CLAIMS, ASSERTED RATHER THAN TRUSTED FROM A COMMENT.
@@ -625,7 +635,7 @@ void Tests::runNNCacheContextTests() {
   testAnEntryWithNoAttributableContextIsCountedAndNotGuessedIntoOne();
   testAnAttributionFromAnotherCacheCannotBeSpentHere();
   testACacheWithNoAttachedContextIsExactlyWhatItWasBefore();
-  testASingleLevelTablesPerContextDumpIsNotCountedRatherThanEmpty();
+  testASingleLevelTableStillObservesUnderAContext();
   testTheDefaultRecorderSizeCoversTheScaleItsRationaleNames();
   testAnAttributionThatCannotBeGivenARowIsCountedAndDisplacesNothing();
   testTheRequestTagReachesTheEvaluatorsSetPathThroughASearch();
