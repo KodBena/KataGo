@@ -156,4 +156,109 @@ namespace NNCacheFileSync {
   void directoryOf(const std::string& path);
 }
 
+//-------------------------------------------------------------------------------------
+// The cross-process lock
+//-------------------------------------------------------------------------------------
+
+// WHOSE TURN IT IS TO WRITE A CONTEXT'S FILES, when more than one engine process shares a
+// cache directory.
+//
+// WHAT THIS REPLACES. Both formats used to open with the sentence "ONE WRITER ... stated
+// rather than defended against, because the deployment is one engine process." That was a
+// true scoping decision and it has expired: a proxy fanning queries across several KataGo
+// LEAFs on one host puts several writers on one directory, and the failure mode is not the
+// benign one the sentence implies. Two appenders do not merely lose the loser's dump. A
+// block is written through a reused per-entry buffer -- many small writes, not one -- so
+// concurrent appends interleave IN THE MIDDLE of the file, and the reader stops at the
+// first block that fails its checksum and discards THE ENTIRE REMAINDER. One interleaved
+// append therefore costs every block written after it, including blocks that were
+// themselves perfectly good.
+//
+// THE LOCK IS ON A FILE OF ITS OWN (<context>.nnlock) AND THAT IS THE WHOLE POINT. The
+// obvious implementation -- lock the count log, or lock the container -- is wrong for a
+// reason that only shows up in the one operation that most needs the lock. Compaction
+// writes a temp sibling and renames it over the data path. A lock held on the data file's
+// inode survives that rename, but the inode no longer has the name: the next process to
+// open the path gets the NEW inode and locks something nobody else is holding. Mutual
+// exclusion would evaporate precisely during compaction. A file that is only ever created
+// and locked -- never renamed, never truncated, never written -- has no such failure mode.
+//
+// THE UNIT IS THE CONTEXT, not the directory and not the individual file. A dump touches
+// exactly one context's two files, so a context-wide lock is the smallest one that makes a
+// dump atomic against another dump, and a directory-wide lock would serialise unrelated
+// cards for no benefit.
+//
+// SHARED FOR READERS, EXCLUSIVE FOR WRITERS. An attach reads both files while another
+// process may be appending, and a reader that observes a half-written block sees a torn
+// tail and silently discards everything after it -- the same data loss as the writer/writer
+// case, reached from the other side. Several engines attached to one card and none dumping
+// is the common case, and it stays contention-free.
+//
+// A FILESYSTEM THAT CANNOT LOCK IS AN ERROR, NEVER A SHRUG. If the lock cannot be taken
+// because the filesystem does not implement locking, this throws and names the errno rather
+// than proceeding unlocked. Proceeding unlocked is exactly the silent-corruption case the
+// class exists to prevent, so degrading to it on the platforms least able to afford it
+// would invert the contract (ADR-0002).
+enum class NNCacheFileLockMode {
+  // Concurrent readers admitted; excludes every writer.
+  Shared,
+  // Excludes every other holder, reader or writer.
+  Exclusive,
+};
+
+class NNCacheFileLock {
+ public:
+  // Acquires `mode` over `context`'s files in `directory`, creating the lock file if it is
+  // not there. Waits up to `waitMilliseconds` for a conflicting holder to finish, then
+  // throws StringError naming the context and the lock path.
+  //
+  // WHY A BOUNDED WAIT AND NOT EITHER EXTREME. Failing immediately would turn ordinary,
+  // expected contention -- two engines dumping the same card seconds apart -- into a client-
+  // visible error. Blocking forever would turn a wedged peer into a wedged engine carrying
+  // no diagnostic. The bound is what makes contention survivable and a stuck holder
+  // reportable.
+  static NNCacheFileLock overContext(
+    const std::string& directory,
+    const std::string& context,
+    NNCacheFileLockMode mode,
+    int waitMilliseconds
+  );
+  // The same, at defaultWaitMilliseconds().
+  static NNCacheFileLock overContext(
+    const std::string& directory,
+    const std::string& context,
+    NNCacheFileLockMode mode
+  );
+
+  ~NNCacheFileLock();
+  NNCacheFileLock(NNCacheFileLock&&) noexcept;
+  NNCacheFileLock& operator=(NNCacheFileLock&&) noexcept;
+  NNCacheFileLock(const NNCacheFileLock&) = delete;
+  NNCacheFileLock& operator=(const NNCacheFileLock&) = delete;
+
+  // The lock file this holds, for a message that has to name it.
+  const std::string& path() const { return path_; }
+  NNCacheFileLockMode mode() const { return mode_; }
+
+  // How long overContext waits before it throws, when not told otherwise.
+  static int defaultWaitMilliseconds();
+  // The path overContext would lock, without acquiring it -- for a report, a test, or a
+  // refusal that has to name the file. Validates `context` exactly as the acquiring form
+  // does, so a bad name is refused identically whether or not a lock is taken.
+  static std::string pathForContext(const std::string& directory, const std::string& context);
+
+ private:
+  NNCacheFileLock(std::string path, NNCacheFileLockMode mode);
+  void release() noexcept;
+
+  std::string path_;
+  NNCacheFileLockMode mode_;
+#ifdef _WIN32
+  // A HANDLE, kept as void* so this header does not drag in windows.h.
+  void* handle_;
+#else
+  int fd_;
+#endif
+};
+
 #endif  // NEURALNET_NNCACHEFILEFORMAT_H_

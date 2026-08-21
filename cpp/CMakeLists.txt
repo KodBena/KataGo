@@ -1099,6 +1099,7 @@ add_executable(katago
   tests/testnnevalcontainer.cpp
   tests/testnncachelevelzero.cpp
   tests/testnncachedump.cpp
+  tests/testnncachefilelock.cpp
   tests/testanalysiscacheactions.cpp
   tests/testanalysismodels.cpp
   tests/testnncachecountlogbench.cpp

@@ -4,18 +4,57 @@
 
 #ifdef _WIN32
 #include <io.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #endif
+
+#include <cerrno>
+#include <chrono>
+#include <thread>
 
 #include "../core/global.h"
 
 // The byte layer shared by the count log and the evaluation container. See
-// nncachefileformat.h for why each of the three pieces has one home rather than two.
+// nncachefileformat.h for why each of the four pieces has one home rather than two.
 
 namespace {
   const size_t MAX_NAME_LEN = 128;
+
+  // How long an acquisition waits out a conflicting holder before it gives up and says so.
+  // Sized against what it is waiting FOR: the longest legitimate holder is a dump of a large
+  // container, which is bounded by the fsync of a file the header sizes at ~69-135 MB for a
+  // median card and ~6x that at the largest. Twenty seconds clears that with room spare on any
+  // plausible device, and anything still holding after it is not slow but stuck -- which is a
+  // fact worth reporting rather than waiting on.
+  const int DEFAULT_LOCK_WAIT_MS = 20000;
+  // The retry schedule. Advisory locks carry no wait-and-notify primitive that is portable
+  // across the platforms KataGo builds on, so acquisition polls -- and the interval is a
+  // BACKOFF rather than a flat period for a reason that was measured rather than assumed.
+  //
+  // WHAT A FLAT 20 MS COST, WITNESSED. A reader holds the shared lock for as long as its read
+  // takes and then re-acquires; the gap in which an exclusive acquirer can win is the interval
+  // BETWEEN one reader's release and its next acquisition. A writer polling every 20 ms gets
+  // fifty chances a second to land in that gap, and against a reader whose gap is a fraction
+  // of a millisecond it essentially never does: a test in which one process appended blocks
+  // while another sampled the same container in a loop starved the writer for the entire
+  // 20-second deadline and then threw.
+  //
+  // A FAST FIRST RETRY IS WHAT MAKES ORDINARY CONTENTION CHEAP, AND THE CAP IS WHAT KEEPS A
+  // LONG WAIT FROM SPINNING. Brief contention -- the common case, two dumps seconds apart --
+  // is resolved in about a millisecond instead of up to twenty. A genuinely long wait settles
+  // onto the 20 ms ceiling, so a full timeout still costs about a thousand syscalls rather
+  // than twenty thousand.
+  //
+  // THIS IMPROVES THE ODDS AND DOES NOT MAKE THEM CERTAIN, which is stated here rather than
+  // left for a reader to discover: flock offers no fairness guarantee and no queue, so a
+  // continuous procession of shared holders with no gap at all can still starve an exclusive
+  // acquirer to its deadline. The deadline is what makes that survivable -- it is reported by
+  // name rather than waited on forever (ADR-0002).
+  const int LOCK_POLL_MIN_MS = 1;
+  const int LOCK_POLL_MAX_MS = 20;
 }
 
 //-------------------------------------------------------------------------------------
@@ -170,4 +209,183 @@ void NNCacheFileSync::directoryOf(const std::string& path) {
 #else
   (void)path;
 #endif
+}
+
+//-------------------------------------------------------------------------------------
+// The cross-process lock
+//-------------------------------------------------------------------------------------
+
+std::string NNCacheFileLock::pathForContext(const std::string& directory, const std::string& context) {
+  NNCacheFileName::verify(context, "NNCacheFileLock", "context name");
+  return directory + "/" + context + ".nnlock";
+}
+
+int NNCacheFileLock::defaultWaitMilliseconds() {
+  return DEFAULT_LOCK_WAIT_MS;
+}
+
+NNCacheFileLock::NNCacheFileLock(std::string path, NNCacheFileLockMode mode)
+  :path_(std::move(path)),
+   mode_(mode),
+#ifdef _WIN32
+   handle_(nullptr)
+#else
+   fd_(-1)
+#endif
+{}
+
+NNCacheFileLock::NNCacheFileLock(NNCacheFileLock&& other) noexcept
+  :path_(std::move(other.path_)),
+   mode_(other.mode_),
+#ifdef _WIN32
+   handle_(other.handle_)
+#else
+   fd_(other.fd_)
+#endif
+{
+#ifdef _WIN32
+  other.handle_ = nullptr;
+#else
+  other.fd_ = -1;
+#endif
+}
+
+NNCacheFileLock& NNCacheFileLock::operator=(NNCacheFileLock&& other) noexcept {
+  if(this != &other) {
+    release();
+    path_ = std::move(other.path_);
+    mode_ = other.mode_;
+#ifdef _WIN32
+    handle_ = other.handle_;
+    other.handle_ = nullptr;
+#else
+    fd_ = other.fd_;
+    other.fd_ = -1;
+#endif
+  }
+  return *this;
+}
+
+NNCacheFileLock::~NNCacheFileLock() {
+  release();
+}
+
+// Unlocking is implicit in closing the descriptor on both platforms, but it is done
+// explicitly first so that the release is not resting on that equivalence.
+void NNCacheFileLock::release() noexcept {
+#ifdef _WIN32
+  if(handle_ != nullptr) {
+    OVERLAPPED overlapped;
+    std::memset(&overlapped, 0, sizeof(overlapped));
+    (void)::UnlockFileEx((HANDLE)handle_, 0, MAXDWORD, MAXDWORD, &overlapped);
+    (void)::CloseHandle((HANDLE)handle_);
+    handle_ = nullptr;
+  }
+#else
+  if(fd_ >= 0) {
+    (void)::flock(fd_, LOCK_UN);
+    (void)::close(fd_);
+    fd_ = -1;
+  }
+#endif
+}
+
+NNCacheFileLock NNCacheFileLock::overContext(
+  const std::string& directory,
+  const std::string& context,
+  NNCacheFileLockMode mode
+) {
+  return overContext(directory, context, mode, DEFAULT_LOCK_WAIT_MS);
+}
+
+NNCacheFileLock NNCacheFileLock::overContext(
+  const std::string& directory,
+  const std::string& context,
+  NNCacheFileLockMode mode,
+  int waitMilliseconds
+) {
+  if(waitMilliseconds < 0)
+    throw StringError(
+      "NNCacheFileLock: a negative wait of " + Global::intToString(waitMilliseconds) +
+      " ms has no reading; pass 0 to attempt the lock once."
+    );
+
+  const std::string path = pathForContext(directory, context);
+  const char* const what = mode == NNCacheFileLockMode::Exclusive ? "exclusive" : "shared";
+  NNCacheFileLock lock(path, mode);
+
+  // The lock file is CREATED but never written, and that is deliberate: its only content is
+  // its existence, so there is nothing in it a torn write could damage and nothing a reader
+  // has to interpret.
+#ifdef _WIN32
+  const HANDLE handle = ::CreateFileA(
+    path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
+  );
+  if(handle == INVALID_HANDLE_VALUE)
+    throw StringError(
+      "NNCacheFileLock: could not open lock file " + path + " for context '" + context +
+      "' (Windows error " + Global::int64ToString((int64_t)::GetLastError()) + ")."
+    );
+  lock.handle_ = (void*)handle;
+  const DWORD flags =
+    LOCKFILE_FAIL_IMMEDIATELY | (mode == NNCacheFileLockMode::Exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0);
+#else
+  lock.fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+  if(lock.fd_ < 0)
+    throw StringError(
+      "NNCacheFileLock: could not open lock file " + path + " for context '" + context +
+      "': " + std::strerror(errno) + "."
+    );
+  const int op = (mode == NNCacheFileLockMode::Exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB;
+#endif
+
+  const std::chrono::steady_clock::time_point deadline =
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMilliseconds);
+  int pollMs = LOCK_POLL_MIN_MS;
+  for(;;) {
+#ifdef _WIN32
+    OVERLAPPED overlapped;
+    std::memset(&overlapped, 0, sizeof(overlapped));
+    if(::LockFileEx((HANDLE)lock.handle_, flags, 0, MAXDWORD, MAXDWORD, &overlapped))
+      return lock;
+    const DWORD err = ::GetLastError();
+    const bool heldByAnother = err == ERROR_LOCK_VIOLATION || err == ERROR_IO_PENDING;
+    if(!heldByAnother)
+      throw StringError(
+        "NNCacheFileLock: could not take the " + std::string(what) + " lock on " + path +
+        " (Windows error " + Global::int64ToString((int64_t)err) + "). The cache directory must be "
+        "on a filesystem that implements locking: KataGo will not append to a shared cache file it "
+        "cannot lock, because an unlocked concurrent append interleaves mid-file and costs every "
+        "block written after it."
+      );
+#else
+    if(::flock(lock.fd_, op) == 0)
+      return lock;
+    const int err = errno;
+    // EWOULDBLOCK is the one refusal that means "someone else holds it"; every other errno
+    // means the lock cannot be taken AT ALL, which is a different fact with a different
+    // remedy and must not be retried until the deadline as though it were contention.
+    // EAGAIN is named beside it because POSIX permits the two to be distinct values, and on
+    // a platform where they are, the one this flock returns is not fixed by the standard.
+    if(err != EWOULDBLOCK && err != EAGAIN && err != EINTR)
+      throw StringError(
+        "NNCacheFileLock: could not take the " + std::string(what) + " lock on " + path +
+        ": " + std::strerror(err) + ". The cache directory must be on a filesystem that "
+        "implements advisory locking: KataGo will not append to a shared cache file it cannot "
+        "lock, because an unlocked concurrent append interleaves mid-file and costs every block "
+        "written after it."
+      );
+#endif
+    if(std::chrono::steady_clock::now() >= deadline)
+      throw StringError(
+        "NNCacheFileLock: waited " + Global::intToString(waitMilliseconds) + " ms for the " +
+        std::string(what) + " lock on " + path + " (context '" + context + "') and another "
+        "process still holds it. A dump or a compaction of this context is either still running "
+        "elsewhere or has left the lock behind; no bytes of this context's files were touched."
+      );
+    std::this_thread::sleep_for(std::chrono::milliseconds(pollMs));
+    if(pollMs < LOCK_POLL_MAX_MS)
+      pollMs = pollMs * 2 < LOCK_POLL_MAX_MS ? pollMs * 2 : LOCK_POLL_MAX_MS;
+  }
 }

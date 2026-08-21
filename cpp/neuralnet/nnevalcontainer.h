@@ -336,6 +336,22 @@ struct NNEvalContainerAppendResult {
 // cached entry lacking a requested ownership map costs a full re-evaluation (42% of hits in
 // a measured mixed workload), so a later ownermap-less re-evaluation must not be allowed to
 // erase ownership knowledge a card already earned. Compaction applies the same two rules.
+//
+// EVERY PUBLIC OPERATION BELOW TAKES THE CONTEXT'S CROSS-PROCESS LOCK, and which one it takes
+// is decided by whether it writes: appendBlock, compact and compactIfNeeded take the EXCLUSIVE
+// lock, load, loadIndex and readEntriesInto take the SHARED one. See NNCacheFileLock
+// (nncachefileformat.h) for why the lock lives on a file of its own and why a reader needs one
+// at all. The lock is acquired and released WITHIN each call, so this class holds no lock
+// between calls and a caller cannot forget to release one.
+//
+// THE LOCK IS TAKEN HERE, NOT AT THE ACTION LAYER, and the choice is load-bearing rather than
+// aesthetic. Locking inside the primitive covers every caller -- the dump path, the level-0
+// attach loader, and the reporting path (cacheStatsExecute reads a context's count log to
+// answer cache_stats, which no lock at a dump or attach entry point would ever cover) -- and it
+// is the only placement under which a caller cannot reach these bytes unlocked by taking a
+// different route to them. It also means locks nest nowhere: an outer exclusive lock at an
+// action entry point around an inner exclusive lock here would self-conflict, because flock
+// excludes two open file descriptions whether or not they belong to the same process.
 class NNEvalContainer {
  public:
   // Binds to the container for `context` and `modelInternalName` under `directory`.
@@ -432,13 +448,28 @@ class NNEvalContainer {
  private:
   NNEvalContainer(
     std::string path,
+    std::string directory,
     std::string context,
     std::string modelInternalName,
     int modelVersion,
     uint64_t contextHash
   );
 
+  // compact() WITHOUT taking the context lock, for the one caller that is already holding it.
+  // compactIfNeeded decides on a scan it took under its own exclusive lock and then rewrites;
+  // routing that rewrite through the public compact() would ask for a SECOND exclusive lock on
+  // the same context from the same process. An advisory lock has no reason to grant that to its
+  // own holder -- flock conflicts between two open file descriptions whoever owns them -- so the
+  // call would sit out the whole deadline and then throw. The rewrite still has exactly one home
+  // (this function); the public entry point is a lock plus a call to it.
+  NNEvalContainerContents compactUnlocked() const;
+
   std::string path_;
+  // The directory the two data files and the lock file share. Kept rather than recovered from
+  // path_ by stripping a suffix: the lock file is a THIRD name in this directory, not a
+  // rewriting of the container's own name, and a parser that recovered the directory from a
+  // path would be a second author of the naming convention (ADR-0012 P1).
+  std::string directory_;
   std::string context_;
   std::string modelInternalName_;
   int modelVersion_;

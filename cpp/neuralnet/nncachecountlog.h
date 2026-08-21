@@ -327,6 +327,13 @@ struct NNCacheCountLogAppendResult {
 // accumulate and its sessions rise by whatever the block says, which is 1 per dump. A
 // compacted file holding one block of accumulated sums is therefore observationally
 // identical to the log it replaced, and there is no absolute-versus-delta flag to get wrong.
+//
+// EVERY PUBLIC OPERATION TAKES THE CONTEXT'S CROSS-PROCESS LOCK, shared to read and exclusive
+// to write: load takes the SHARED lock, appendDump, compact and compactIfNeeded take the
+// EXCLUSIVE one. THE LOCK IS THE CONTEXT'S AND NOT THIS FILE'S -- one <context>.nnlock,
+// shared with the evaluation containers of the same context -- because a dump of a context
+// writes this log AND its container, and two locks would let one process hold each. See
+// NNCacheFileLock (nncachefileformat.h). The lock is acquired and released within each call.
 class NNCacheCountLog {
  public:
   // Binds to the log for `context` under `directory`.
@@ -412,9 +419,19 @@ class NNCacheCountLog {
   static int64_t bytesForDumpOf(int64_t numRows);
 
  private:
-  NNCacheCountLog(std::string path, std::string context, uint64_t contextHash);
+  NNCacheCountLog(std::string path, std::string directory, std::string context, uint64_t contextHash);
+
+  // compact() WITHOUT taking the context lock, for the one caller that already holds it. See
+  // NNEvalContainer::compactUnlocked, which exists for the same reason and in the same shape:
+  // asking for a second exclusive lock on a context this process already locked would wait out
+  // the whole deadline against itself and then throw.
+  NNCacheCountLogContents compactUnlocked() const;
 
   std::string path_;
+  // The directory this log, its context's evaluation containers, and their shared lock file all
+  // live in. Kept rather than recovered from path_ by stripping ".nncounts": the lock file is a
+  // third name in this directory, not a rewriting of this one (ADR-0012 P1).
+  std::string directory_;
   std::string context_;
   uint64_t contextHash_;
 };

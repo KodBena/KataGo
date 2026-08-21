@@ -177,6 +177,9 @@ namespace Tests {
   //testnncachedump.cpp
   void runNNCacheDumpTests();
 
+  //testnncachefilelock.cpp
+  void runNNCacheFileLockTests();
+
   //testanalysismodels.cpp
   void runAnalysisModelNameSpaceTests();
   void runAnalysisCacheActionTests();

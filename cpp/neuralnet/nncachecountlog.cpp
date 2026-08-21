@@ -426,8 +426,13 @@ std::vector<NNCacheCountRow> NNCacheCountLogContents::byDescendingLookups() cons
 // NNCacheCountLog
 //-------------------------------------------------------------------------------------
 
-NNCacheCountLog::NNCacheCountLog(std::string path, std::string context, uint64_t contextHash)
-  :path_(std::move(path)), context_(std::move(context)), contextHash_(contextHash)
+NNCacheCountLog::NNCacheCountLog(
+  std::string path, std::string directory, std::string context, uint64_t contextHash
+)
+  :path_(std::move(path)),
+   directory_(std::move(directory)),
+   context_(std::move(context)),
+   contextHash_(contextHash)
 {}
 
 NNCacheCountLog NNCacheCountLog::forContext(const std::string& directory, const std::string& context) {
@@ -435,7 +440,7 @@ NNCacheCountLog NNCacheCountLog::forContext(const std::string& directory, const 
   if(!FileUtils::isDirectory(directory))
     throw StringError("NNCacheCountLog: '" + directory + "' is not an existing directory.");
   const std::string path = directory + "/" + context + ".nncounts";
-  return NNCacheCountLog(path, context, contextHashOf(context));
+  return NNCacheCountLog(path, directory, context, contextHashOf(context));
 }
 
 uint32_t NNCacheCountLog::formatVersion() { return FORMAT_VERSION; }
@@ -449,6 +454,12 @@ int64_t NNCacheCountLog::bytesForDumpOf(int64_t numRows) {
 }
 
 NNCacheCountLogContents NNCacheCountLog::load() const {
+  // SHARED: admits every other reader, excludes every writer. A read concurrent with an
+  // unlocked append would see the partial block as a torn tail and discard it along with
+  // everything after it.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Shared);
+  (void)lock;
   const ScanResult scan = scanLog(path_, context_, contextHash_);
   return NNCacheCountLogContents::of(
     scan.rows,
@@ -461,6 +472,16 @@ NNCacheCountLogContents NNCacheCountLog::load() const {
 }
 
 NNCacheCountLogContents NNCacheCountLog::compact() const {
+  // EXCLUSIVE. rewriteAsOneBlock writes a temp sibling and renames it over path_, which is
+  // exactly why the lock is on the separate <context>.nnlock and never on this file: a lock on
+  // this inode would outlive its own name.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Exclusive);
+  (void)lock;
+  return compactUnlocked();
+}
+
+NNCacheCountLogContents NNCacheCountLog::compactUnlocked() const {
   const ScanResult scan = scanLog(path_, context_, contextHash_);
   rewriteAsOneBlock(path_, scan.rows, scan.unattributedLookups, contextHash_);
   return NNCacheCountLogContents::of(
@@ -479,6 +500,11 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
       "NNCacheCountLog: a compaction multiple of " + Global::intToString(liveSetMultiple) +
       " has no reading; it must be at least 1."
     );
+  // EXCLUSIVE, taken BEFORE the deciding scan: the decision and the rewrite it authorises must
+  // see the same file, or a block admitted between them is rewritten away unread.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Exclusive);
+  (void)lock;
   const ScanResult scan = scanLog(path_, context_, contextHash_);
   const int64_t liveSet = (int64_t)scan.rows.size();
   // A torn tail is repaired whether or not the size trigger fires: leaving it would make
@@ -492,8 +518,9 @@ bool NNCacheCountLog::compactIfNeeded(int liveSetMultiple) const {
   // act, and a change to either one would silently leave the other saying the old thing.
   // That is not hypothetical: a seen-red leg that mutated compact() left this path green
   // while it still carried its own copy. The cost is one extra scan on the compacting
-  // path -- a read of at most a few megabytes, on an explicitly-invoked dump.
-  const NNCacheCountLogContents written = compact();
+  // path -- a read of at most a few megabytes, on an explicitly-invoked dump. It delegates to
+  // the UNLOCKED form because the exclusive lock is already held above.
+  const NNCacheCountLogContents written = compactUnlocked();
   (void)written;
   return true;
 }
@@ -534,6 +561,15 @@ NNCacheCountLogAppendResult NNCacheCountLog::appendDump(const NNCacheHitCountDel
       "counts to persist. A single-level table keeps none; counting is a property of the "
       "two-level strategy."
     );
+
+  // EXCLUSIVE, taken after the NotCounted refusal so a caller's own malformed dump is refused
+  // without waiting on anybody else's lock, and before the scan-and-repair below so that the
+  // torn-tail repair and the append it precedes are ONE indivisible act. Split, they are the
+  // worst case this lock exists for: a peer appending between the repair and the append lands
+  // its block at the offset the repair just freed.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Exclusive);
+  (void)lock;
 
   NNCacheCountLogAppendResult result;
   result.bytesAppended = 0;

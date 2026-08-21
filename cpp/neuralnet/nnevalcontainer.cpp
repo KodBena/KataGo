@@ -1019,12 +1019,14 @@ int64_t NNEvalContainerIndex::totalPayloadBytes() const {
 
 NNEvalContainer::NNEvalContainer(
   std::string path,
+  std::string directory,
   std::string context,
   std::string modelInternalName,
   int modelVersion,
   uint64_t contextHash
 )
   :path_(std::move(path)),
+   directory_(std::move(directory)),
    context_(std::move(context)),
    modelInternalName_(std::move(modelInternalName)),
    modelVersion_(modelVersion),
@@ -1046,7 +1048,9 @@ NNEvalContainer NNEvalContainer::forContextAndModel(
   if(!FileUtils::isDirectory(directory))
     throw StringError("NNEvalContainer: '" + directory + "' is not an existing directory.");
   const std::string path = directory + "/" + context + "." + modelInternalName + ".nnevals";
-  return NNEvalContainer(path, context, modelInternalName, modelVersion, NNCacheFileName::hashOf(context));
+  return NNEvalContainer(
+    path, directory, context, modelInternalName, modelVersion, NNCacheFileName::hashOf(context)
+  );
 }
 
 uint32_t NNEvalContainer::formatVersion() { return FORMAT_VERSION; }
@@ -1070,6 +1074,12 @@ int64_t NNEvalContainer::bytesForEntry(int nnXLen, int nnYLen, bool hasOwnerMap)
 }
 
 NNEvalContainerContents NNEvalContainer::load() const {
+  // SHARED, because this is a read: it admits every other reader and excludes every writer.
+  // Without it a load concurrent with an append sees the half-written block as a torn tail and
+  // silently discards it AND every block after it -- the writer's loss, suffered by the reader.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Shared);
+  (void)lock;
   ScannedEntries scan = scanEntries(path_, context_, contextHash_, modelInternalName_, modelVersion_);
   return NNEvalContainerContents::of(
     std::move(scan.entries),
@@ -1081,6 +1091,9 @@ NNEvalContainerContents NNEvalContainer::load() const {
 }
 
 NNEvalContainerIndex NNEvalContainer::loadIndex() const {
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Shared);
+  (void)lock;
   ScannedLocations scan = scanLocations(path_, context_, contextHash_, modelInternalName_, modelVersion_);
   return NNEvalContainerIndex::of(
     std::move(scan.locations),
@@ -1097,6 +1110,15 @@ void NNEvalContainer::readEntriesInto(
 ) const {
   if(locations.empty())
     return;
+
+  // SHARED, and it matters more here than anywhere else on the read side: these locations were
+  // read by an EARLIER call, so this is the window in which a writer could move the bytes they
+  // point at. The header re-check below still refuses a file that changed between the two calls
+  // -- the lock does not replace it -- but the lock is what keeps a compaction from landing in
+  // the middle of this pass.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Shared);
+  (void)lock;
 
   NNCacheFileHandle f(path_, "rb");
   if(!f.isOpen())
@@ -1199,6 +1221,17 @@ void NNEvalContainer::readEntriesInto(
 }
 
 NNEvalContainerContents NNEvalContainer::compact() const {
+  // EXCLUSIVE. Compaction is the operation the dedicated lock file exists for: it writes a temp
+  // sibling and renames it over path_, so a lock held on path_'s own inode would survive the
+  // rename attached to an inode that no longer has the name, and the next process to open the
+  // path would lock a different inode entirely. See NNCacheFileLock.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Exclusive);
+  (void)lock;
+  return compactUnlocked();
+}
+
+NNEvalContainerContents NNEvalContainer::compactUnlocked() const {
   ScannedEntries scan = scanEntries(path_, context_, contextHash_, modelInternalName_, modelVersion_);
   rewriteAsOneBlock(path_, scan.entries, contextHash_, modelVersion_, modelInternalName_);
   const int64_t liveSet = (int64_t)scan.entries.size();
@@ -1217,6 +1250,14 @@ bool NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
       "NNEvalContainer: a compaction multiple of " + Global::intToString(liveSetMultiple) +
       " has no reading; it must be at least 1."
     );
+  // EXCLUSIVE, and taken BEFORE the deciding scan rather than around the rewrite alone. The
+  // decision and the rewrite it authorises must see the same file: a writer admitted between
+  // them would have its block rewritten away by a compaction that never read it, or, if it
+  // appended after the scan decided not to compact, would be judged against a file that no
+  // longer exists.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Exclusive);
+  (void)lock;
   // The key-set scan is enough to decide this: the trigger reads the live-set size and the
   // physical entry count, and neither is a payload fact. It reads 32 bytes per entry rather
   // than the whole ~69 MB card the full read would decode and discard.
@@ -1230,8 +1271,10 @@ bool NNEvalContainer::compactIfNeeded(int liveSetMultiple) const {
     return false;
   // DELEGATES rather than rewriting here, so "rewrite this container" has exactly one home
   // and a change to it cannot leave this path saying the old thing. The cost is one extra
-  // scan on the compacting path, on an explicitly-invoked dump.
-  const NNEvalContainerContents written = compact();
+  // scan on the compacting path, on an explicitly-invoked dump. It delegates to the UNLOCKED
+  // form because the exclusive lock is already held above; compact() would ask for it a second
+  // time and wait out its own deadline against itself.
+  const NNEvalContainerContents written = compactUnlocked();
   (void)written;
   return true;
 }
@@ -1246,6 +1289,17 @@ NNEvalContainerAppendResult NNEvalContainer::appendBlock(
         " of this dump is null. A missing evaluation is not a storable fact."
       );
   }
+
+  // EXCLUSIVE, and it is what makes a dump atomic against another process's dump. A block is
+  // written through a reused per-entry buffer -- many small writes, not one -- so two unlocked
+  // appends interleave IN THE MIDDLE of the file, and a reader stops at the first block that
+  // fails its checksum and discards the entire remainder. One interleaved append therefore
+  // costs every block written after it, including blocks that were themselves perfectly good.
+  // Taken after the null check so a caller's own malformed dump is refused without waiting on
+  // anybody else's lock.
+  const NNCacheFileLock lock =
+    NNCacheFileLock::overContext(directory_, context_, NNCacheFileLockMode::Exclusive);
+  (void)lock;
 
   NNEvalContainerAppendResult result;
   result.bytesAppended = 0;
