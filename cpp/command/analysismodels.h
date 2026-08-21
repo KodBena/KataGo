@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "../core/config_parser.h"
 #include "../neuralnet/nneval.h"
 
 // THE NAME SPACE OF THE MODELS ONE ANALYSIS-ENGINE PROCESS HOSTS.
@@ -164,5 +165,38 @@ class AnalysisModelHosts {
   std::vector<NNEvaluator*> evals;  // Parallel to addrs. Not owned.
   size_t numSearchableModels;
 };
+
+//-------------------------------------------------------------------------------------
+// Where an extra model to host comes from, before loading
+//-------------------------------------------------------------------------------------
+
+// One extra model file to host, and how it was asked for -- from the config's numbered
+// extraModelFileN keys, or from the repeatable -extra-model command-line flag. sourceLabel
+// mirrors the vocabulary loadSearchableModel already uses for -model / -extra-model (see
+// analysis.cpp), so a collision or load-failure message names its origin the same way whichever
+// side asked for it.
+struct ExtraModelFile {
+  std::string file;
+  std::string sourceLabel;
+};
+
+// The extra models an analysis engine process should host, from BOTH the config file's numbered
+// extraModelFileN keys and the repeatable -extra-model command-line flag, unioned with the
+// command line and deduplicated by file path (the composition rule; see the teaching comment at
+// this function's call site in analysis.cpp for why union-with-dedupe was chosen over either
+// side overriding the other).
+//
+// The numbered config keys must be contiguous from extraModelFile0 -- extraModelFile0 and
+// extraModelFile2 with no extraModelFile1 is refused, matching this codebase's other numbered-key
+// config idioms (nnModelFile0, botName0, ... in match.cpp), which parse a config-declared count
+// rather than tolerate holes. Throws StringError, naming the offending key, if:
+//  - a numbered key names a file that does not exist on disk.
+//  - the numbered keys are non-contiguous (a higher-numbered key exists past the first gap).
+//
+// Marks every extraModelFileN key it reads as used on `cfg`, the same way every other ConfigParser
+// get* call does, so a config that sets them is not flagged by warnUnusedFields.
+[[nodiscard]] std::vector<ExtraModelFile> collectExtraModelFiles(
+  ConfigParser& cfg, const std::vector<std::string>& extraModelFilesFromCommandLine
+);
 
 #endif  // COMMAND_ANALYSISMODELS_H_

@@ -1,5 +1,9 @@
 #include "../command/analysismodels.h"
 
+#include <algorithm>
+#include <cctype>
+
+#include "../core/fileutils.h"
 #include "../core/global.h"
 #include "../core/test.h"
 
@@ -152,4 +156,62 @@ vector<SearchableModelIdx> AnalysisModelHosts::searchableIdxs() const {
 
 ModelResolution AnalysisModelHosts::resolve(const string& requestedName) const {
   return resolveModelName(addrs, requestedName);
+}
+
+//-------------------------------------------------------------------------------------
+// collectExtraModelFiles
+//-------------------------------------------------------------------------------------
+
+vector<ExtraModelFile> collectExtraModelFiles(ConfigParser& cfg, const vector<string>& extraModelFilesFromCommandLine) {
+  vector<ExtraModelFile> fromConfig;
+  int firstMissingIdx = 0;
+  for(;; firstMissingIdx++) {
+    const string key = "extraModelFile" + Global::intToString(firstMissingIdx);
+    if(!cfg.contains(key))
+      break;
+    const string file = cfg.getString(key);
+    if(!FileUtils::exists(file))
+      throw StringError("Config key " + key + " names a file that does not exist: " + file);
+    fromConfig.push_back(ExtraModelFile{file, key});
+  }
+
+  //A numbered key past the first gap means the numbering is non-contiguous -- e.g. extraModelFile0
+  //and extraModelFile2 with no extraModelFile1. Rather than silently host only the contiguous
+  //prefix (which would host zero of the intended extra models here, and quietly stop reading
+  //keys the operator plainly meant to be read), this is refused, matching the fail-loud style the
+  //rest of the codebase applies to holes in numbered config keys. cfg.unusedKeys() is exactly the
+  //keys not yet read by any get* call in this process, so it still names extraModelFile2 here even
+  //though the loop above already consumed extraModelFile0.
+  for(const string& unusedKey: cfg.unusedKeys()) {
+    if(!Global::isPrefix(unusedKey, "extraModelFile"))
+      continue;
+    const string suffix = unusedKey.substr(string("extraModelFile").size());
+    if(suffix.size() == 0 || !std::all_of(suffix.begin(), suffix.end(), ::isdigit))
+      continue;
+    throw StringError(
+      "Config key " + unusedKey + " is set, but extraModelFile" + Global::intToString(firstMissingIdx) +
+      " is missing. Numbered extraModelFile keys must be contiguous starting from extraModelFile0."
+    );
+  }
+
+  //UNION WITH DEDUPE BY PATH, not either source overriding the other. The config and the
+  //-extra-model flag name the same kind of thing -- another model to host -- and an operator
+  //whose deployment tooling manages the config file while a wrapper script still passes
+  //-extra-model (the shape this feature exists for) expects models named by BOTH to end up
+  //hosted, not one list silently discarding the other. Deduping by exact file-path string (the
+  //same comparison match.cpp's nnModelFile dedup uses) means naming the same file both ways hosts
+  //it once rather than refusing it as a duplicate-name collision or loading it twice.
+  vector<ExtraModelFile> combined = fromConfig;
+  for(const string& file: extraModelFilesFromCommandLine) {
+    bool alreadyPresent = false;
+    for(const ExtraModelFile& existing: combined) {
+      if(existing.file == file) {
+        alreadyPresent = true;
+        break;
+      }
+    }
+    if(!alreadyPresent)
+      combined.push_back(ExtraModelFile{file, "-extra-model"});
+  }
+  return combined;
 }

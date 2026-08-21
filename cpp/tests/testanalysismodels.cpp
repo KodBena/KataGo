@@ -271,6 +271,111 @@ void testHostsRefuseHostingNoSearchableModelAtAll() {
   testAssert(refusal.has_value());
 }
 
+//-------------------------------------------------------------------------------------
+// collectExtraModelFiles: the config-key / -extra-model composition, decode-level
+//-------------------------------------------------------------------------------------
+//
+// This is exercised as PLUMBING -- ConfigParser in, StringError-or-vector out -- rather than
+// against real loaded nets, because what is under test here is the KEY PARSING (contiguity, the
+// missing-file check, the union-with-dedupe rule), not model loading, which the RealModels tests
+// above already cover for the shared loadSearchableModel path. The claim that a config-sourced
+// extraModelFile0 actually hosts a second SEARCHABLE model end to end -- reachable by
+// query_models and answering an analyze naming it -- is witnessed by a running two-model engine
+// instead: audit-reports/impl-multimodel-hosting-witness.py, extended for row 1804 (see that
+// file's own history) exercises exactly that against a real process.
+
+void initConfig(ConfigParser& cfg, const string& contents) {
+  istringstream in(contents);
+  cfg.initialize(in);
+}
+
+void testCollectExtraModelFilesConfigOnly() {
+  ConfigParser cfg;
+  initConfig(cfg, "extraModelFile0 = tests/models/g170-b6c96-s175395328-d26788732.bin.gz\n");
+  const vector<ExtraModelFile> extras = collectExtraModelFiles(cfg, {});
+  testAssert(extras.size() == 1);
+  testAssert(extras[0].file == "tests/models/g170-b6c96-s175395328-d26788732.bin.gz");
+  testAssert(extras[0].sourceLabel == "extraModelFile0");
+}
+
+void testCollectExtraModelFilesCommandLineOnly() {
+  ConfigParser cfg;
+  initConfig(cfg, "");
+  const vector<string> cliFiles = {"tests/models/g170-b6c96-s175395328-d26788732.bin.gz"};
+  const vector<ExtraModelFile> extras = collectExtraModelFiles(cfg, cliFiles);
+  testAssert(extras.size() == 1);
+  testAssert(extras[0].file == cliFiles[0]);
+  testAssert(extras[0].sourceLabel == "-extra-model");
+}
+
+void testCollectExtraModelFilesUnionsAndDedupesByPath() {
+  ConfigParser cfg;
+  initConfig(
+    cfg,
+    "extraModelFile0 = tests/models/g170-b6c96-s175395328-d26788732.bin.gz\n"
+    "extraModelFile1 = tests/models/g170e-b10c128-s1141046784-d204142634.bin.gz\n"
+  );
+  // The second CLI entry names the SAME file as extraModelFile0 -- the union must host it once,
+  // not twice and not refuse it as a duplicate. The first CLI entry is a third, distinct file.
+  const vector<string> cliFiles = {
+    "tests/models/g170-b6c96-s175395328-d26788732-with-comment.bin.gz",
+    "tests/models/g170-b6c96-s175395328-d26788732.bin.gz",
+  };
+  const vector<ExtraModelFile> extras = collectExtraModelFiles(cfg, cliFiles);
+  testAssert(extras.size() == 3);
+  testAssert(extras[0].file == "tests/models/g170-b6c96-s175395328-d26788732.bin.gz");
+  testAssert(extras[0].sourceLabel == "extraModelFile0");
+  testAssert(extras[1].file == "tests/models/g170e-b10c128-s1141046784-d204142634.bin.gz");
+  testAssert(extras[1].sourceLabel == "extraModelFile1");
+  testAssert(extras[2].file == "tests/models/g170-b6c96-s175395328-d26788732-with-comment.bin.gz");
+  testAssert(extras[2].sourceLabel == "-extra-model");
+}
+
+void testCollectExtraModelFilesRefusesAGapInNumbering() {
+  ConfigParser cfg;
+  initConfig(
+    cfg,
+    "extraModelFile0 = tests/models/g170-b6c96-s175395328-d26788732.bin.gz\n"
+    "extraModelFile2 = tests/models/g170e-b10c128-s1141046784-d204142634.bin.gz\n"
+  );
+  bool threw = false;
+  try {
+    (void)collectExtraModelFiles(cfg, {});
+  }
+  catch(const StringError& e) {
+    threw = true;
+    // Names both the offending key and where the numbering broke, so an operator with a typo in
+    // extraModelFile1 (or who meant to renumber but forgot one) is told exactly what to fix.
+    testAssert(string(e.what()).find("extraModelFile2") != string::npos);
+    testAssert(string(e.what()).find("extraModelFile1") != string::npos);
+  }
+  testAssert(threw);
+}
+
+void testCollectExtraModelFilesRefusesAMissingFile() {
+  ConfigParser cfg;
+  initConfig(cfg, "extraModelFile0 = tests/models/this-file-does-not-exist.bin.gz\n");
+  bool threw = false;
+  try {
+    (void)collectExtraModelFiles(cfg, {});
+  }
+  catch(const StringError& e) {
+    threw = true;
+    testAssert(string(e.what()).find("extraModelFile0") != string::npos);
+    testAssert(string(e.what()).find("this-file-does-not-exist.bin.gz") != string::npos);
+  }
+  testAssert(threw);
+}
+
+void testCollectExtraModelFilesMarksConfigKeysUsed() {
+  // So a config that sets extraModelFile0 is not flagged by warnUnusedFields, the same guarantee
+  // every other ConfigParser get* call carries.
+  ConfigParser cfg;
+  initConfig(cfg, "extraModelFile0 = tests/models/g170-b6c96-s175395328-d26788732.bin.gz\n");
+  (void)collectExtraModelFiles(cfg, {});
+  testAssert(cfg.unusedKeys().size() == 0);
+}
+
 }  // namespace
 
 void Tests::runAnalysisModelNameSpaceTests() {
@@ -289,5 +394,11 @@ void Tests::runAnalysisModelNameSpaceTests() {
     testHostsRefuseACompanionSharingASearchableModelsName(models);
     testHostsRefuseHostingNoSearchableModelAtAll();
   }
+  testCollectExtraModelFilesConfigOnly();
+  testCollectExtraModelFilesCommandLineOnly();
+  testCollectExtraModelFilesUnionsAndDedupesByPath();
+  testCollectExtraModelFilesRefusesAGapInNumbering();
+  testCollectExtraModelFilesRefusesAMissingFile();
+  testCollectExtraModelFilesMarksConfigKeysUsed();
   cout << "Done" << endl;
 }

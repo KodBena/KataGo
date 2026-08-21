@@ -351,8 +351,12 @@ int MainCmds::analysis(const vector<string>& args) {
         throw StringError(collision.value());
     };
     loadSearchableModel(modelFile, "-model");
-    for(const string& extraModelFile: extraModelFiles)
-      loadSearchableModel(extraModelFile, "-extra-model");
+    //Union with dedupe by path -- see collectExtraModelFiles's own doc comment for why. In short:
+    //an -extra-model file named on the command line hosts even when a wrapper script that manages
+    //the config already used extraModelFileN for a different one, and naming the SAME file both
+    //ways hosts it once rather than either colliding or double-loading it.
+    for(const ExtraModelFile& extra: collectExtraModelFiles(cfg, extraModelFiles))
+      loadSearchableModel(extra.file, extra.sourceLabel);
     if(humanModelFile != "") {
       humanEval = Setup::initializeNNEvaluator(
         humanModelFile,humanModelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,

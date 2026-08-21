@@ -27,6 +27,27 @@ was built around that model rather than by swapping a net into a shared bot. Hos
 costs roughly N times the NN cache and bot memory; it does not change how many positions are analyzed at
 once, which is still `numAnalysisThreads`.
 
+Extra models can also be named in the CONFIG FILE, for setups where the config (rather than the command
+line) is what a deployment tool manages: `extraModelFile0`, `extraModelFile1`, ... — one key per model,
+numbered contiguously from 0, following the same numbered-key convention `nnModelFile0`/`nnModelFile1`
+(match config) and `botName0`/`botName1` already use elsewhere in KataGo:
+
+```
+extraModelFile0 = /path/to/other/model.bin.gz
+extraModelFile1 = /path/to/yet/another/model.bin.gz
+```
+
+A gap in the numbering (`extraModelFile0` and `extraModelFile2` present, `extraModelFile1` absent) is
+refused at startup rather than silently hosting only the contiguous prefix, and an `extraModelFileN` that
+names a file that does not exist is refused at startup too, naming the key. Both fail before any model is
+loaded, the same way the process fails now on a startup config mistake elsewhere.
+
+**Composition with `-extra-model`:** the two sources are UNIONED, with the same file named by both
+deduplicated to one hosted copy rather than two. Neither source overrides the other, and naming the same
+file both ways is not an error. This is deliberate: a deployment where a wrapper script still passes
+`-extra-model` while a separately-managed config also sets `extraModelFileN` expects models named by
+*either* to end up hosted, not one list silently discarding the other.
+
 A query selects its model with the `model` field, whose value is the model's `internalName` exactly as
 the `query_models` action reports it (`query_models` lists every hosted model). This is the model file's
 own self-declared name; the engine does not invent an alias for it.
