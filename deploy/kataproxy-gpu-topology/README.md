@@ -96,9 +96,27 @@ container with entries the other model's leaves load and never use.
 ## Shared-cache bring-up: probe the directory, then run the suite
 
 Do these two steps **before** 1301 and 1302 are pointed at a shared
-directory, and repeat them whenever that directory moves — in particular
-when it moves onto the sshfs mount at `~/nncache`. Both commands are safe to
-run against a live-but-idle directory and clean up after themselves.
+directory, and repeat them whenever that directory moves. Both commands are
+safe to run against a live-but-idle directory and clean up after themselves.
+
+**Run them on the machine the LEAVES run on, against the path the leaves
+use.** In this deployment the sshfs geometry is: the GPU host (the VM host,
+where the leaves live) mounts, over sshfs, a directory served from the VM
+guest's `~/nncache`. The guest-side directory is just storage; the path
+whose lock semantics matter is the *mount on the GPU host*. A probe run
+guest-side (as was done 2026-08-21: SUPPORTED, and the 16-leg suite green)
+establishes the storage baseline but says nothing about the mount.
+
+**Cross-machine caveat the probe is blind to by construction:** flock on an
+sshfs/FUSE mount is handled by the *client* kernel and never reaches the
+storage server's kernel. Exclusion therefore holds among processes on the
+GPU host sharing the mount — which is the 1301/1302 deployment, so the
+probe's verdict there is the one that counts — but does NOT hold between a
+GPU-host process and anything on the guest touching `~/nncache` directly.
+Rule: while leaves are live, nothing guest-side writes those files; even a
+direct-attach *reader* guest-side is unprotected (it may see a torn tail
+mid-dump — the reader survives by discarding, harmless to the store, but
+the view is truncated). Passive watching (`ls -l`, sizes, mtimes) is fine.
 
 ### Step 1 — does file locking actually EXCLUDE there?
 
