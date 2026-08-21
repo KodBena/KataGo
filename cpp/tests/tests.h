@@ -186,6 +186,17 @@ namespace Tests {
   //testnncountsdump.cpp
   void runNNCountsDumpTests();
 
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  //testnncacheverifyhits.cpp -- VERIFY BUILDS ONLY (cpp/neuralnet/nncacheverifyhits.h).
+  //Neither of these exists in a default build, because the thing they cover does not.
+  void runNNCacheVerifyHitsTests();
+  // NOT a test: the seen-red instrument. Flips one payload scalar of the first evaluation in a
+  // real container file and RE-MINTS both block checksums through the production functions, so
+  // the file still loads and only a forward pass can tell it is wrong. Reached by the
+  // nncachecorruptpayload subcommand. Prints the key it corrupted and the before/after value.
+  void corruptFirstPersistedEvaluation(const std::string& containerPath);
+#endif
+
   //testanalysismodels.cpp
   void runAnalysisModelNameSpaceTests();
   void runAnalysisCacheActionTests();

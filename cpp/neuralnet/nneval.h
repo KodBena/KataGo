@@ -381,6 +381,14 @@ class NNEvaluator {
 
   void clearStats();
 
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // WHAT THE HIT VERIFIER HAS SEEN, for cache_stats to report. Verify builds only, so a client
+  // that finds these fields in a response is looking at a debug build by construction and
+  // cannot mistake one for the other (nncacheverifyhits.h). Absent (a disengaged optional)
+  // when this evaluator has no cache table at all.
+  [[nodiscard]] std::optional<NNCacheHitVerifyStats> getHitVerifyStats() const;
+#endif
+
  private:
   // The one home of "this evaluator was built with a level-0 resolution list", so the three
   // public level-0 surfaces refuse in the same words.
@@ -409,6 +417,12 @@ class NNEvaluator {
   NNCacheTwoLevelTable* nnCacheLevelZeroTable;
   std::optional<std::string> nnCacheDirectory;
   Logger* logger;
+
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // VERIFY BUILDS ONLY. Built beside nnCacheTable and null exactly when that is null, so
+  // "there is a cache" and "there is something verifying its hits" are one decision.
+  std::unique_ptr<NNCacheHitVerifier> nnCacheHitVerifier;
+#endif
 
   std::string internalModelName;
   int modelVersion;
@@ -469,6 +483,23 @@ class NNEvaluator {
   // where warmup matters, and unless warmup is enabled.
   // gpuHandle may be NULL (neural-net-less), in which case this is a no-op.
   void maybeWarmupComputeHandle(ComputeHandle* gpuHandle, int serverThreadIdx);
+
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // VERIFY BUILDS ONLY. Called from the cache-hit branch of evaluate(), with the evaluation
+  // the cache just served. Runs a fresh forward pass for the same position under a PINNED
+  // symmetry and hands both to the verifier; refuses (and counts the refusal) when the
+  // symmetry cannot be pinned. Never touches `served`, never stores, never changes what the
+  // caller receives. See nncacheverifyhits.h for the whole account.
+  void verifyCacheHitAgainstForwardPass(
+    const Board& board,
+    const BoardHistory& history,
+    Player nextPlayer,
+    const SGFMetadata* sgfMeta,
+    const MiscNNInputParams& nnInputParams,
+    NNCacheHitOrigin origin,
+    const std::shared_ptr<NNOutput>& served
+  );
+#endif
 
  public:
   // Helper, for internal use only

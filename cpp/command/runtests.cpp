@@ -79,6 +79,12 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runAnalysisModelNameSpaceTests();
   Tests::runAnalysisCacheActionTests();
   Tests::runAnalysisCacheLifecycleTests();
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // VERIFY BUILDS ONLY. In a default build there is no hit verifier, so there is nothing here
+  // to run and the suite count is unchanged -- which is what makes "the default build's suite
+  // is identical" checkable rather than asserted.
+  Tests::runNNCacheVerifyHitsTests();
+#endif
 
   // Pick an arbitrary file that the test uses
   if(FileUtils::exists("tests/data/configs/folded/test-parent.cfg"))
@@ -160,6 +166,29 @@ int MainCmds::runnnevalcontainerbench(const vector<string>& args) {
   ScoreValue::freeTables();
   return 0;
 }
+
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+// THE SEEN-RED INSTRUMENT for the hit verifier, and the reason it is a subcommand rather than
+// a step inside a test: the corruption has to happen BETWEEN two engine processes -- one that
+// wrote the store, one that will be served from it -- and there is no moment inside a single
+// process at which an external actor could reach in and forge the file. Same argument the
+// container bench's synth/append modes are split for.
+//
+// Deliberately absent from printHelp: an instrument the witness drives, not an operator verb.
+// The precedent is chdvectordriver and runnncachecountlogbench, both absent for the same
+// reason and both saying so at their dispatch site in main.cpp.
+int MainCmds::nncachecorruptpayload(const vector<string>& args) {
+  // args[0] is the subcommand name itself, per handleSubcommand's own slicing in main.cpp.
+  if(args.size() != 2)
+    throw StringError(
+      "nncachecorruptpayload: expected exactly one argument, the path of an eval container "
+      "file (<context>.<model>.nnevals) whose first evaluation is to be corrupted "
+      "checksum-validly. This DESTROYS the meaning of that entry; point it at a scratch store."
+    );
+  Tests::corruptFirstPersistedEvaluation(args[1]);
+  return 0;
+}
+#endif
 
 int MainCmds::runoutputtests(const vector<string>& args) {
   (void)args;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <optional>
 
 using namespace std;
@@ -143,6 +144,15 @@ NNEvaluator::NNEvaluator(
     else {
       nnCacheTable = NNCacheTable::create(nnCacheConfig);
     }
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+    // BUILT BESIDE THE TABLE AND ONLY BESIDE IT, so there is no configuration in which hits
+    // exist and nothing is verifying them. Verify builds only -- see nncacheverifyhits.h.
+    nnCacheHitVerifier = std::make_unique<NNCacheHitVerifier>(
+      NNCacheHitVerifyTolerances::fromConfig(cfg),
+      cfg.contains("nnCacheVerifyHitsIncludeResident") ? cfg.getBool("nnCacheVerifyHitsIncludeResident") : false,
+      logger
+    );
+#endif
   }
 
   if(!debugSkipNeuralNet) {
@@ -1307,10 +1317,27 @@ void NNEvaluator::evaluate(
 
   bool hadResultWithoutOwnerMap = false;
   shared_ptr<NNOutput> resultWithoutOwnerMap;
-  if(nnCacheTable != nullptr && !skipCache && nnCacheTable->get(*presentation, buf.result)) {
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // VERIFY BUILDS ONLY: the same lookup, saying which level answered, because the hit worth a
+  // forward pass is the one whose bytes came off disk. See nncacheverifyhits.h.
+  NNCacheHitOrigin hitOrigin = NNCacheHitOrigin::LevelOneResident;
+  const bool servedFromCache =
+    nnCacheTable != nullptr && !skipCache && nnCacheTable->get(*presentation, buf.result, hitOrigin);
+#else
+  const bool servedFromCache =
+    nnCacheTable != nullptr && !skipCache && nnCacheTable->get(*presentation, buf.result);
+#endif
+  if(servedFromCache) {
     if(!(includeOwnerMap && buf.result->whiteOwnerMap == NULL))
     {
       m_numCacheHits.fetch_add(1, std::memory_order_relaxed);
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+      // AFTER the hit is counted and BEFORE the return, so every served hit is offered to the
+      // verifier and none is offered twice. It cannot change buf.result: see the header.
+      verifyCacheHitAgainstForwardPass(
+        board, history, nextPlayer, sgfMeta, nnInputParams, hitOrigin, buf.result
+      );
+#endif
       buf.hasResult = true;
       return;
     }
@@ -1669,7 +1696,98 @@ void NNEvaluator::evaluate(
   buf.result->nnHash = nnHash;
   // THROUGH THE PRESENTATION, so the store is of the position this call presented and the two
   // cannot come apart: NNCacheTable::set refuses a payload whose hash is not the presented key.
-  if(nnCacheTable != nullptr)
+  if(nnCacheTable != nullptr
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+     // A VERIFICATION RECOMPUTE MUST NOT STORE ITS ANSWER. This call is the nested forward pass
+     // a level-0 hit is being checked against; storing it would shadow the level-0 entry, move
+     // the key to level 1, and silently end verification of that key after its first hit --
+     // the instrument consuming the thing it is there to observe. The default build compiles
+     // no part of this condition (nncacheverifyhits.h).
+     && !NNCacheHitVerifier::inRecompute()
+#endif
+  )
     nnCacheTable->set(*presentation, buf.result, cacheAttribution);
 
 }
+
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+
+std::optional<NNCacheHitVerifyStats> NNEvaluator::getHitVerifyStats() const {
+  if(nnCacheHitVerifier == nullptr)
+    return std::optional<NNCacheHitVerifyStats>();
+  return std::optional<NNCacheHitVerifyStats>(nnCacheHitVerifier->stats());
+}
+
+void NNEvaluator::verifyCacheHitAgainstForwardPass(
+  const Board& board,
+  const BoardHistory& history,
+  Player nextPlayer,
+  const SGFMetadata* sgfMeta,
+  const MiscNNInputParams& nnInputParams,
+  NNCacheHitOrigin origin,
+  const shared_ptr<NNOutput>& served
+) {
+  if(nnCacheHitVerifier == nullptr)
+    return;
+  // A RECOMPUTE'S OWN HITS ARE NOT VERIFIED. It passes skipCache, so it takes no hits today;
+  // this is here so that stays true if that ever changes, rather than being a property a
+  // reader has to go check.
+  if(NNCacheHitVerifier::inRecompute())
+    return;
+  // A NEURAL-NET-LESS EVALUATOR HAS NO FORWARD PASS TO COMPARE AGAINST. Recomputing here would
+  // compare a cached entry against the fixed dummy output and report every hit as a mismatch.
+  if(debugSkipNeuralNet)
+    return;
+  if(!nnCacheHitVerifier->shouldVerify(origin))
+    return;
+
+  // PINNING THE SYMMETRY, OR REFUSING. See nncacheverifyhits.h: a cached evaluation does not
+  // record the symmetry it was computed under, so the only configuration in which a recompute
+  // is comparable to it at all is one where every unspecified evaluation takes the SAME
+  // symmetry. A request that named its own symmetry is already pinned and is reused as-is.
+  int symmetryToUse = nnInputParams.symmetry;
+  if(symmetryToUse == NNInputs::SYMMETRY_NOTSPECIFIED) {
+    if(currentDoRandomize.load(std::memory_order_acquire)) {
+      nnCacheHitVerifier->countSkippedNondeterministicSymmetry();
+      return;
+    }
+    symmetryToUse = currentDefaultSymmetry.load(std::memory_order_acquire);
+  }
+  // SYMMETRY_ALL is not a symmetry a single forward pass can be run under.
+  if(symmetryToUse < 0 || symmetryToUse >= SymmetryHelpers::NUM_SYMMETRIES) {
+    nnCacheHitVerifier->countSkippedNondeterministicSymmetry();
+    return;
+  }
+
+  MiscNNInputParams recomputeParams = nnInputParams;
+  recomputeParams.symmetry = symmetryToUse;
+
+  // ITS OWN BUFFER, not the caller's: the caller's buffer holds the result that is about to be
+  // returned, and evaluate() writes through buf.result.
+  NNResultBuf verifyBuf;
+  // ONE PRESENTATION FOR THE WHOLE REQUEST, NOT TWO. The same channel averageMultipleSymmetries
+  // uses to fan one demand out over several forward passes: the hit that brought us here was
+  // already counted as the presentation, and this evaluation SERVES it.
+  verifyBuf.cachePresentationRole = NNCachePresentationRole::ServesACountedPresentation;
+  // Unattributed on purpose: this evaluation earns no card anything, and it will not be stored.
+  verifyBuf.cacheAttribution = NNCacheAttribution::noAttributableContext();
+
+  {
+    // THE SCOPE IS WHAT KEEPS THE INSTRUMENT OUTSIDE THE INSTRUMENT -- it suppresses the
+    // terminal store at the end of the nested evaluate(). It must cover the whole call.
+    NNCacheHitVerifier::RecomputeScope scope;
+    // includeOwnerMap MIRRORS WHAT WAS SERVED rather than what the caller asked for, so the two
+    // outputs have the same shape and the ownermap-present flag is compared as the persisted
+    // field it is rather than being papered over by asking for one either way.
+    evaluate(
+      board, history, nextPlayer, sgfMeta, recomputeParams, verifyBuf,
+      /*skipCache*/ true, /*includeOwnerMap*/ served->whiteOwnerMap != NULL
+    );
+  }
+
+  if(verifyBuf.result == nullptr)
+    return;
+  nnCacheHitVerifier->compare(served->nnHash, symmetryToUse, *served, *verifyBuf.result, policySize);
+}
+
+#endif  // KATAGO_NNCACHE_VERIFY_HITS

@@ -150,6 +150,14 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::runnncachecountlogbench(subArgs);
   else if(subcommand == "runnnevalcontainerbench")
     return MainCmds::runnnevalcontainerbench(subArgs);
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // The hit verifier's seen-red instrument: forges a checksum-VALID semantic corruption of one
+  // persisted evaluation, between the process that wrote the store and the process that will
+  // be served from it. Verify builds only, and deliberately absent from printHelp for the same
+  // reason as the two above: an instrument, not an operator verb.
+  else if(subcommand == "nncachecorruptpayload")
+    return MainCmds::nncachecorruptpayload(subArgs);
+#endif
   else if(subcommand == "runnnlayertests")
     return MainCmds::runnnlayertests(subArgs);
   else if(subcommand == "runnnontinyboardtest")

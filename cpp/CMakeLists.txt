@@ -612,6 +612,13 @@ option(KATAGO_AUTO_FETCH_DEPS "Automatically fetch missing dependencies into <bu
 # Off by default; not intended to ship. Gates cpp/game/lt9_census.{h,cpp} and a handful of
 # #ifdef KATAGO_LT9_CENSUS call sites in cpp/game/board.cpp and cpp/neuralnet/nninputs.cpp.
 option(KATAGO_LT9_CENSUS "Build with temporary LT-9 ladder/area redundancy census instrumentation (see audit-reports/exp-lt9-ladder-census.md). Not for shipping builds." OFF)
+# DEBUG-ONLY -- the NN cache hit verifier: every hit served from a PERSISTED level-0 source also
+# runs the real forward pass and compares, so a deserialization defect that produces a
+# checksum-VALID but semantically wrong entry is caught at the moment it is served. Costs a full
+# extra forward pass per verified hit, so it is off by default and a build with it on must never
+# enter a timing measurement. Gates cpp/neuralnet/nncacheverifyhits.{h,cpp} whole, plus guarded
+# regions in nncache.h, nncachetwolevel.cpp, nneval.{h,cpp} and command/analysiscacheactions.cpp.
+option(KATAGO_NNCACHE_VERIFY_HITS "Build with the NN cache hit verifier (recomputes the forward pass beside every persisted-cache hit and compares). Not for shipping builds and never for benchmarks." OFF)
 # Inside the build directory (NOT the source tree), so configure never writes into a checkout and
 # separate build directories can't race on a shared vcpkg clone. Override to a common location if
 # you want fetched deps shared across build dirs.
@@ -1048,6 +1055,7 @@ add_executable(katago
   neuralnet/nncachelevelzero.cpp
   neuralnet/nncachedump.cpp
   neuralnet/nncachetrace.cpp
+  neuralnet/nncacheverifyhits.cpp #DEBUG-ONLY -- an empty translation unit unless KATAGO_NNCACHE_VERIFY_HITS is set; see the option() above
   neuralnet/desc.cpp
   neuralnet/debugprint.cpp
   ${NEURALNET_BACKEND_SOURCES}
@@ -1108,6 +1116,7 @@ add_executable(katago
   tests/testnncachecountlogbench.cpp
   tests/testnnevalcontainerbench.cpp
   tests/testnncountsdump.cpp
+  tests/testnncacheverifyhits.cpp #DEBUG-ONLY -- an empty translation unit unless KATAGO_NNCACHE_VERIFY_HITS is set; see the option() above
   tests/testnncachebench.cpp
   tests/testnnevalcanary.cpp
   tests/testbackendreference.cpp
@@ -1168,6 +1177,11 @@ add_executable(katago
 
 if(KATAGO_LT9_CENSUS)
   target_compile_definitions(katago PRIVATE KATAGO_LT9_CENSUS)
+endif()
+
+if(KATAGO_NNCACHE_VERIFY_HITS)
+  target_compile_definitions(katago PRIVATE KATAGO_NNCACHE_VERIFY_HITS)
+  message(STATUS "${ColorBoldRed}KATAGO_NNCACHE_VERIFY_HITS is ON: every persisted-cache hit will run an EXTRA forward pass. This build is for correctness witnesses only -- never for a benchmark.${ColorReset}")
 endif()
 
 if(USE_BACKEND STREQUAL "CUDA")

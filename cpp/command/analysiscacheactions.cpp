@@ -1048,6 +1048,32 @@ json cacheStatsExecute(
     out["levelZeroSourcesAttached"] = (int64_t)eval.numLevelZeroSources();
   }
 
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // VERIFY BUILDS ONLY (cpp/neuralnet/nncacheverifyhits.h). A client that finds these fields
+  // in a response is talking to a build that recomputes the forward pass beside every
+  // persisted-cache hit, and the absence of the fields in a shipping build is not a silence to
+  // interpret -- it is the whole point of the compile-time gate.
+  //
+  // THE TWO SKIP COUNTS ARE REPORTED BESIDE verifiedHits AND NOT FOLDED INTO IT, because a run
+  // that verified nothing (an evaluator with nnRandomize on, whose symmetry cannot be pinned)
+  // and a run that verified everything and found nothing are the same "mismatches: 0" and must
+  // not read the same (ADR-0002).
+  const std::optional<NNCacheHitVerifyStats> verify = eval.getHitVerifyStats();
+  if(verify.has_value()) {
+    json v;
+    v["verifiedHits"] = verify.value().verifiedHits;
+    v["mismatches"] = verify.value().mismatches;
+    v["skippedNondeterministicSymmetry"] = verify.value().skippedNondeterministicSymmetry;
+    v["skippedResidentOrigin"] = verify.value().skippedResidentOrigin;
+    // A RATIO AGAINST THE ALLOWANCE, not a raw deviation: the channels are in five different
+    // units and a maximum over them in raw units means nothing. <= 1.0 is a held comparison.
+    v["worstDeviationRatio"] = verify.value().worstDeviationRatio;
+    v["worstChannel"] = verify.value().worstChannel;
+    v["worstKey"] = verify.value().worstKey;
+    out["hitVerification"] = v;
+  }
+#endif
+
   // ONE-SHOT REPORTING, so this is the surface that reports RUNNING TOTALS -- the absolute
   // harvest -- and not the delta a dump appends. Nothing here is written anywhere, which is
   // what makes the absolute the right answer to ask for.

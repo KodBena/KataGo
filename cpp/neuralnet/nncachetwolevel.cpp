@@ -25,6 +25,21 @@
 //   lower-priority source left resolving a superseded key would answer before level 1 ever
 //   got the chance to.
 
+// WHICH LEVEL ANSWERED THE LAST get ON THIS THREAD -- verify builds only, and nothing else in
+// this file or any other reads it except getRecordingOrigin, three lines below its writer.
+//
+// WHY A THREAD-LOCAL AND NOT AN OUT-PARAMETER: the alternative is a second copy of the
+// resolution walk, compiled only in a debug build, which is a second home for the one fact
+// this class exists to own (see the header: "the list order IS the fact"). A write nobody
+// outside one function reads is the cheaper defect than a walk that can drift from its twin.
+// The default build compiles neither the variable nor the write: the macro is empty.
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+namespace { thread_local NNCacheHitOrigin t_lastGetOrigin = NNCacheHitOrigin::LevelOneResident; }
+#define VERIFY_HITS_RECORD_ORIGIN(o) (t_lastGetOrigin = (o))
+#else
+#define VERIFY_HITS_RECORD_ORIGIN(o) ((void)0)
+#endif
+
 //-------------------------------------------------------------------------------------
 // The ordered resolution list
 //-------------------------------------------------------------------------------------
@@ -549,8 +564,10 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
     // The attached sources first, in attach order, first match winning. A hit counts
     // itself in the same 32-bit word the lookup's own entry read already brought into
     // cache, so counting costs the level-0 path nothing beyond the increment.
-    if(levelZero_.get(nnHash, ret))
+    if(levelZero_.get(nnHash, ret)) {
+      VERIFY_HITS_RECORD_ORIGIN(NNCacheHitOrigin::LevelZeroPersisted);
       return true;
+    }
     // Fall through. A level-1 hit is counted in the ledger; that is one extra random
     // access on the level-1 hit path, and it is the only place in this design where
     // counting costs a memory access it would not otherwise make.
@@ -559,10 +576,25 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
     // forwarder rather than plain protected access.
     if(NNCacheTable::getRaw(*levelOne_, nnHash, ret)) {
       ledger_.add(nnHash, 1);
+      VERIFY_HITS_RECORD_ORIGIN(NNCacheHitOrigin::LevelOneResident);
       return true;
     }
     return false;
   }
+
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // VERIFY BUILDS ONLY (nncacheverifyhits.h). The resolution order is NOT restated here: this
+  // runs the ordinary get and then reads what that get recorded, so there is exactly one
+  // place in this file that decides which level answers a key. A second copy of that walk,
+  // even one only a debug build compiles, would be a second home for the one fact this class
+  // exists to own (this file's own header, "the list order IS the fact").
+  bool getRecordingOrigin(Hash128 nnHash, std::shared_ptr<NNOutput>& ret, NNCacheHitOrigin& origin) override {
+    if(!get(nnHash, ret))
+      return false;
+    origin = t_lastGetOrigin;
+    return true;
+  }
+#endif
 
   void set(const std::shared_ptr<NNOutput>& p) override {
     // Level 0 is frozen, so every set is level 1's. If level 0 holds this key, retire its

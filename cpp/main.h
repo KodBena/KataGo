@@ -27,6 +27,10 @@ namespace MainCmds {
   int runnncachetwolevelbench(const std::vector<std::string>& args);
   int runnncachecountlogbench(const std::vector<std::string>& args);
   int runnnevalcontainerbench(const std::vector<std::string>& args);
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // VERIFY BUILDS ONLY -- the hit verifier's seen-red instrument. See runtests.cpp.
+  int nncachecorruptpayload(const std::vector<std::string>& args);
+#endif
   int runnnlayertests(const std::vector<std::string>& args);
   int runnnontinyboardtest(const std::vector<std::string>& args);
   int runnnsymmetriestest(const std::vector<std::string>& args);

@@ -12,6 +12,7 @@
 #include "../core/hash.h"
 #include "../neuralnet/nncachecontext.h"
 #include "../neuralnet/nncacheobservations.h"
+#include "../neuralnet/nncacheverifyhits.h"
 #include "../neuralnet/nninputs.h"
 
 class ConfigParser;
@@ -562,6 +563,15 @@ class NNCacheTable {
   bool get(const NNCachePresentation& presentation, std::shared_ptr<NNOutput>& ret) {
     return get(presentation.key(), ret);
   }
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // THE SAME LOOKUP, SAYING WHICH LEVEL ANSWERED. Verify builds only -- see
+  // nncacheverifyhits.h. It exists because the ONE hit worth a forward pass is the one whose
+  // bytes came off disk, and the ordinary get() collapses that distinction to a bool by
+  // design (the counting surfaces deliberately merge the levels; see harvestHitCounts).
+  bool get(const NNCachePresentation& presentation, std::shared_ptr<NNOutput>& ret, NNCacheHitOrigin& origin) {
+    return getRecordingOrigin(presentation.key(), ret, origin);
+  }
+#endif
   void set(
     const NNCachePresentation& presentation,
     const std::shared_ptr<NNOutput>& p,
@@ -680,6 +690,17 @@ class NNCacheTable {
   // These are thread-safe. For get, ret will be set to nullptr upon a failure to find.
   virtual bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) = 0;
   virtual void set(const std::shared_ptr<NNOutput>& p) = 0;
+
+#ifdef KATAGO_NNCACHE_VERIFY_HITS
+  // VERIFY BUILDS ONLY. Defaulted rather than pure: every single-level table shape answers out
+  // of resident memory and has nothing to say beyond that, so only the two-level table
+  // overrides. A default that reported LevelZeroPersisted would make a chained table's RAM hit
+  // look like a deserialization, which is the one thing this must never get wrong.
+  virtual bool getRecordingOrigin(Hash128 nnHash, std::shared_ptr<NNOutput>& ret, NNCacheHitOrigin& origin) {
+    origin = NNCacheHitOrigin::LevelOneResident;
+    return get(nnHash, ret);
+  }
+#endif
 
   // A DECORATOR OVER NNCacheTable (tracing, second-sighting admission, the two-level table's
   // level 1) holds its wrapped table as a plain `unique_ptr<NNCacheTable>` and must call that
