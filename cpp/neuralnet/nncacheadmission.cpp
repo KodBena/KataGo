@@ -70,8 +70,11 @@ class NNCacheTableSecondSighting final : public NNCacheTable {
   }
 
   // A read is unaffected: admission decides what gets stored, never what gets found.
+  // getRaw, not inner->get: inner's static type is NNCacheTable, the base, and the raw
+  // get/set are protected -- see nncache.h's own comment on why a decorator needs the static
+  // forwarder rather than plain protected access.
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
-    return inner->get(nnHash,ret);
+    return NNCacheTable::getRaw(*inner, nnHash, ret);
   }
 
   // And a membership question is unaffected twice over: this decorator's own ghost is written by
@@ -86,7 +89,7 @@ class NNCacheTableSecondSighting final : public NNCacheTable {
     const uint64_t idx = nnHash.hash1 & ghostMask;
     const uint32_t tag = (uint32_t)(nnHash.hash0 >> 32) | 1u;
     if(ghost[idx].load(std::memory_order_relaxed) == tag) {
-      inner->set(p);
+      NNCacheTable::setRaw(*inner, p);
       return;
     }
     ghost[idx].store(tag, std::memory_order_relaxed);

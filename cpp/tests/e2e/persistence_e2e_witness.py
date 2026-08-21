@@ -2,7 +2,7 @@
 """End-to-end witness for the COMPOSED property: persistence, and the model keying on it.
 
   usage: cpp/tests/e2e/persistence_e2e_witness.py <katago> <config-template> <workdir>
-                                                  [<netA> <netB>] [--only S,P,K,K5,K6] [--keep]
+                                                  [<netA> <netB>] [--only S,P,A,K,K5,K6] [--keep]
   e.g.   cpp/tests/e2e/persistence_e2e_witness.py ./cpp/build/katago \\
              cpp/tests/e2e/persistence_e2e.cfg /tmp/pe2e
 
@@ -73,6 +73,11 @@ THE GROUPS
                        count log's content unmoved, no key's recorded observations moved. P3e
                        records the one place the file is NOT byte-identical, and why that is
                        FILED rather than fixed in this increment.
+  A  accounting     THE OPERATOR'S OWN PRINCIPLE, pinned: the same query, with and without a
+                    "cacheContext" field, does IDENTICAL neural net work and returns an
+                    IDENTICAL search -- cacheContext is bookkeeping alongside the work, never
+                    an input to it. The one place a difference is expected: the context's own
+                    attribution counter in cache_stats.
   K  the keying     K0 seed, K1 the own container re-attached (zero rows), K2 the other model
                     gets nothing and pays real work, K3 THE DISTINGUISHER, K4 the capability
                     control that forecloses "the machinery simply cannot serve across models".
@@ -119,7 +124,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from e2e_harness import DEFAULT_NET_A, DEFAULT_NET_B, Harness, Witness  # noqa: E402
 from keying_legs import run_eval_cache_salt, run_keying, run_salt_independence  # noqa: E402
-from persistence_legs import run_fingerprints, run_persistence  # noqa: E402
+from persistence_legs import run_accounting, run_fingerprints, run_persistence  # noqa: E402
 
 
 def parse_argv(argv):
@@ -166,7 +171,7 @@ def main():
   name_a, name_b = h.model_names()
   print("MODELS   %s = %s" % (net_a, name_a))
   print("MODELS   %s = %s" % (net_b, name_b))
-  print("GROUPS   %s" % (",".join(sorted(only)) if only else "S,P,K,K5,K6 (all)"))
+  print("GROUPS   %s" % (",".join(sorted(only)) if only else "S,P,A,K,K5,K6 (all)"))
   print()
 
   def running(group):
@@ -177,6 +182,8 @@ def main():
 
   if running("P"):
     run_persistence(w, h, name_a)
+  if running("A"):
+    run_accounting(w, h, name_a)
   if running("K"):
     run_keying(w, h, name_a, name_b, fp_a, fp_b)
   if running("K5"):

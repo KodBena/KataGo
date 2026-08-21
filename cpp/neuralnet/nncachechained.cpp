@@ -145,8 +145,6 @@ class NNCacheTableChained final : public NNCacheTable {
   );
   ~NNCacheTableChained() override;
 
-  bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override;
-  void set(const std::shared_ptr<NNOutput>& p) override;
   void clear() override;
   bool contains(Hash128 nnHash) const override;
   NNCacheStats stats() const override;
@@ -155,6 +153,15 @@ class NNCacheTableChained final : public NNCacheTable {
   // re-exports it so a test asserts against this and never against its own arithmetic
   // (ADR-0012 P1).
   static size_t entryBytesFor(const NNOutput& out) { return sizeof(Node) + nnOutputFootprintBytes(out); }
+
+  // PROTECTED, matching the base: this class has no header today, so nothing outside this
+  // translation unit can name the concrete type and reach these publicly regardless -- but a
+  // header could be added later without anyone thinking to re-check access, exactly the defect
+  // an out-of-frame audit found in NNCacheTableProbed (which DOES have a header). Fixed here in
+  // the same pass, defense in depth.
+ protected:
+  bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override;
+  void set(const std::shared_ptr<NNOutput>& p) override;
 
  private:
   uint64_t bucketOf(Hash128 hash) const { return hash.hash0 & bucketMask; }

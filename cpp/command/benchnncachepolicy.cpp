@@ -17,6 +17,25 @@
 
 using namespace std;
 
+// A SINGLE, DELIBERATELY NARROW REACH around NNCacheTable::get(Hash128,...) and
+// set(shared_ptr<NNOutput>,...) being protected (nncache.h). replayOne below drives a table
+// directly off a captured byte-level trace of (hash, bytes) tuples, with no NNEvaluator and no
+// board position anywhere in this tool, so there is no NNCachePresentation to mint one from --
+// the raw form is exactly what this bench MEASURES, not a legitimate boundary it is reaching
+// around instead of going through. Deliberately at GLOBAL scope, not inside the anonymous
+// namespace below: nncache.h's friend declaration names this class, and a class defined inside
+// an anonymous namespace is a different entity from the one a friend declaration in another
+// translation unit names.
+class NNCacheTableBenchAccess {
+ public:
+  static bool get(NNCacheTable& table, Hash128 nnHash, std::shared_ptr<NNOutput>& ret) {
+    return table.get(nnHash, ret);
+  }
+  static void set(NNCacheTable& table, const std::shared_ptr<NNOutput>& p) {
+    table.set(p);
+  }
+};
+
 // The nn-cache policy sweep.
 //
 // WHAT THIS ANSWERS. For each point of the policy matrix -- collision scheme x ways x
@@ -339,12 +358,12 @@ static ReplayResult replayOne(
       if(forceOwnerMap) bytes = (uint32_t)(sizeof(NNOutput) + 19*19*sizeof(float));
       if(forceNoOwnerMap) bytes = (uint32_t)sizeof(NNOutput);
       bool attached = false;
-      table->set(payloadFor(hash,bytes,attached));
+      NNCacheTableBenchAccess::set(*table, payloadFor(hash,bytes,attached));
       r.sets += 1;
       everHeld.insert(rec.hash0 ^ rec.hash1);
     }
     else {
-      const bool found = table->get(hash,got);
+      const bool found = NNCacheTableBenchAccess::get(*table, hash, got);
       r.gets += 1;
       if(found)
         r.hits += 1;
@@ -361,7 +380,7 @@ static ReplayResult replayOne(
           if(forceOwnerMap) bytes = (uint32_t)(sizeof(NNOutput) + 19*19*sizeof(float));
           if(forceNoOwnerMap) bytes = (uint32_t)sizeof(NNOutput);
           bool attached = false;
-          table->set(payloadFor(hash,bytes,attached));
+          NNCacheTableBenchAccess::set(*table, payloadFor(hash,bytes,attached));
           r.synthesizedSets += 1;
           everHeld.insert(rec.hash0 ^ rec.hash1);
         }

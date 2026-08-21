@@ -11,6 +11,7 @@
 #include "../neuralnet/nncachefrozen.h"
 #include "../neuralnet/nncachelevelzero.h"
 #include "../neuralnet/nncachetwolevel.h"
+#include "../tests/nncachetabletestaccess.h"
 #include "../tests/testcacheswapseam.h"
 
 using namespace std;
@@ -117,7 +118,7 @@ bool refused(const std::function<void()>& f, const string& mustMention) {
 // The tag the table served for `key`, or nullopt if nothing did.
 optional<float> served(NNCacheTable& table, Hash128 key) {
   shared_ptr<NNOutput> got;
-  const bool found = table.get(key, got);
+  const bool found = NNCacheTableTestAccess::get(table, key, got);
   testAssert(found == (got != nullptr));
   if(!found)
     return nullopt;
@@ -184,7 +185,7 @@ void testFirstMatchInAttachOrderWins() {
   testAssert(served(*table, k3) == SOURCE_A);
   // A key no source holds falls through, and level 1 has it once it is set.
   testAssert(served(*table, nowhere) == nullopt);
-  table->set(sharedOutputFor(nowhere, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(nowhere, LEVEL_ONE));
   testAssert(served(*table, nowhere) == LEVEL_ONE);
 
   // ONLY THE WINNING SOURCE COUNTED. The losers' entries for the shared keys were never
@@ -270,7 +271,7 @@ void testDetachPreservesRelativeOrderAndReAttachGoesToTheBack() {
   (void)table->detachLevelZero(SWAP_PERMIT, idA2);
   testAssert(table->numLevelZeroSources() == 0);
   testAssert(served(*table, shared) == nullopt);
-  table->set(sharedOutputFor(shared, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(shared, LEVEL_ONE));
   testAssert(served(*table, shared) == LEVEL_ONE);
 
   cout << "  churn: A,B,C,D -> detach B -> detach A -> re-attach A; the C-and-D key served "
@@ -311,7 +312,7 @@ void testASetShadowsTheKeyInEverySourceThatHoldsIt() {
   // on the get path can do this while A wins, which is exactly why it is planted.
   testAssert(b->addHits(shared, 5));
 
-  table->set(sharedOutputFor(shared, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(shared, LEVEL_ONE));
 
   // THE OBSERVATION: what the table serves. Under a first-holder-only shadow this is
   // SOURCE_B -- a superseded evaluation, served ahead of the fresh one.
@@ -617,8 +618,8 @@ void testAFullyShadowedEarlierSourceStillHoldsItsPlace() {
 
   testAssert(served(*table, k0) == SOURCE_A);
   // Shadow both of A's keys -- which also shadows B's, so level 1 owns them now.
-  table->set(sharedOutputFor(k0, LEVEL_ONE));
-  table->set(sharedOutputFor(k1, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(k0, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(k1, LEVEL_ONE));
   testAssert(a->numEntries() == 2);
   testAssert(!a->contains(k0) && !a->contains(k1));
   testAssert(served(*table, k0) == LEVEL_ONE);
@@ -779,7 +780,7 @@ void testAReAttachedSourceCannotServeWhatLevelOneOwns() {
 
   // THE SET A IS ABSENT FOR. It shadows the key in B, which is attached, and cannot reach A,
   // which is not. Level 1 owns the key from here on.
-  table->set(sharedOutputFor(shared, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(shared, LEVEL_ONE));
   testAssert(served(*table, shared) == LEVEL_ONE);
 
   // THE RE-ATTACH. Under the old contract A returned holding the key unshadowed.
@@ -840,9 +841,9 @@ void testAKeyLevelOneEvictedAndThenCarriedBackInAppearsOnce() {
   unique_ptr<NNCacheTwoLevelTable> table =
     makeTwoLevelNNCacheTable(sourceOver({nthKey(149)}, SOURCE_C), defaultLevelOne(0), 8);
 
-  table->set(sharedOutputFor(hot, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(hot, LEVEL_ONE));
   testAssert(served(*table, hot) == LEVEL_ONE);   // a level-1 hit, so the ledger has a row
-  table->set(sharedOutputFor(other, LEVEL_ONE));  // and the one slot is now other's
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(other, LEVEL_ONE));  // and the one slot is now other's
   shared_ptr<NNOutput> gone;
   testAssert(!table->peek(hot, gone));            // level 1 really has evicted it
 
@@ -895,8 +896,10 @@ class FaultInjectingLevelOne final : public NNCacheTable {
     return inner_->contains(nnHash);
   }
 
-  bool get(Hash128 nnHash, shared_ptr<NNOutput>& ret) override { return inner_->get(nnHash, ret); }
-  void set(const shared_ptr<NNOutput>& p) override { inner_->set(p); }
+  bool get(Hash128 nnHash, shared_ptr<NNOutput>& ret) override {
+    return NNCacheTableTestAccess::get(*inner_, nnHash, ret);
+  }
+  void set(const shared_ptr<NNOutput>& p) override { NNCacheTableTestAccess::set(*inner_, p); }
   void clear() override { inner_->clear(); }
   NNCacheStats stats() const override { return inner_->stats(); }
 
@@ -959,9 +962,9 @@ void testAThrowMidReconcileLeavesTheAttachAsIfItNeverHappened() {
   // Level 1 takes ownership of all three keys, and earns retrievals of its own on one of them so
   // the ledger is not empty before the failed attach -- an unchanged empty ledger would be a
   // weaker observation than an unchanged populated one.
-  table->set(sharedOutputFor(owned0, LEVEL_ONE));
-  table->set(sharedOutputFor(owned1, LEVEL_ONE));
-  table->set(sharedOutputFor(owned2, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(owned0, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(owned1, LEVEL_ONE));
+  NNCacheTableTestAccess::set(*table, sharedOutputFor(owned2, LEVEL_ONE));
   testAssert(served(*table, owned0) == LEVEL_ONE);
   testAssert(served(*table, owned0) == LEVEL_ONE);
 

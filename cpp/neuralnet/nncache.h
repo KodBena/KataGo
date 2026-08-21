@@ -373,10 +373,6 @@ class NNCacheTable {
 
   NNCacheTable(const NNCacheTable& other) = delete;
   NNCacheTable& operator=(const NNCacheTable& other) = delete;
-
-  // These are thread-safe. For get, ret will be set to nullptr upon a failure to find.
-  virtual bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) = 0;
-  virtual void set(const std::shared_ptr<NNOutput>& p) = 0;
   virtual void clear() = 0;
 
   // DOES THIS TABLE HOLD AN ENTRY FOR `nnHash` RIGHT NOW, TOUCHING NOTHING AT ALL?
@@ -668,7 +664,54 @@ class NNCacheTable {
  protected:
   NNCacheTable();
 
+  // THE RAW, HASH-KEYED SURFACE. PROTECTED, NOT PUBLIC: the presentation-minted
+  // get(NNCachePresentation,...)/set(NNCachePresentation,...,attribution) pair above, and the
+  // named accessors elsewhere in this class (peek, the attributed-set overloads, the
+  // observation and attribution surfaces), are what production code outside this class
+  // hierarchy is entitled to call. A caller holding a bare Hash128 and an NNOutput has no
+  // presentation, no attribution, and no ledger entry -- exactly the state the counting and
+  // attribution machinery above exists to make unreachable from the request path -- so the
+  // raw form is not exposed for a caller to reach for instead. Every table shape still
+  // implements it: it is what the presentation-minted overloads forward to, and it is the
+  // only door left to concrete table implementations, decorators, the one bench tool that
+  // replays a byte-level trace with no presentation to mint, and one test-tree shim (see the
+  // two friends below).
+  //
+  // These are thread-safe. For get, ret will be set to nullptr upon a failure to find.
+  virtual bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) = 0;
+  virtual void set(const std::shared_ptr<NNOutput>& p) = 0;
+
+  // A DECORATOR OVER NNCacheTable (tracing, second-sighting admission, the two-level table's
+  // level 1) holds its wrapped table as a plain `unique_ptr<NNCacheTable>` and must call that
+  // wrapped table's own raw get/set. Ordinary protected inheritance does not reach it: the
+  // wrapped object's static type is NNCacheTable itself, not the decorator's own derived type,
+  // and the additional access check on a protected NON-STATIC member ([class.protected])
+  // refuses access through an object typed as the base class even from a member of a derived
+  // class. A protected STATIC member carries no such restriction, so these two forwarders are
+  // the bounded fix: any NNCacheTable subclass may call them on any other table, and nothing
+  // outside this class hierarchy can, because they are themselves protected.
+  static bool getRaw(NNCacheTable& table, Hash128 nnHash, std::shared_ptr<NNOutput>& ret) {
+    return table.get(nnHash, ret);
+  }
+  static void setRaw(NNCacheTable& table, const std::shared_ptr<NNOutput>& p) {
+    table.set(p);
+  }
+
  private:
+  // TWO NARROW, NAMED EXCEPTIONS to "production code outside the presentation-minted path
+  // cannot call raw get/set" -- neither is a general-purpose backdoor.
+  //
+  //   * NNCacheTableBenchAccess (cpp/command/benchnncachepolicy.cpp) replays a captured
+  //     byte-level trace of (hash, bytes) tuples straight against a freshly-built table, to
+  //     measure the table's own hash-tag and eviction-policy cost. There is no board position
+  //     and no NNEvaluator in that tool, so there is nothing to mint a presentation from --
+  //     the raw form is what the measurement is OF.
+  //   * NNCacheTableTestAccess (cpp/tests/nncachetabletestaccess.h) is the one door the
+  //     existing get/set-driven unit tests reach the raw surface through, so a correctness
+  //     test can still exercise get/set directly without every test file becoming a friend of
+  //     its own.
+  friend class NNCacheTableBenchAccess;
+  friend class NNCacheTableTestAccess;
   // What observe() does once the null test above it has passed. Out of line so the hot path
   // holds one branch and a call that is never taken, rather than the ownership check and the
   // attribution switch inlined into every evaluation.

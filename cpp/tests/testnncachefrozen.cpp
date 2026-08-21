@@ -10,6 +10,7 @@
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncachefrozen.h"
 #include "../neuralnet/nncachetwolevel.h"
+#include "../tests/nncachetabletestaccess.h"
 
 using namespace std;
 using namespace TestCommon;
@@ -84,7 +85,7 @@ unique_ptr<NNCacheTable> defaultLevelOne(int sizePowerOfTwo) {
 
 bool present(NNCacheTable& table, Hash128 hash) {
   shared_ptr<NNOutput> got;
-  const bool found = table.get(hash, got);
+  const bool found = NNCacheTableTestAccess::get(table, hash, got);
   testAssert(found == (got != nullptr));
   if(found)
     testAssert(got->nnHash == hash);
@@ -143,7 +144,7 @@ shared_ptr<NNOutput> evaluateLikeNNEvaluator(
   NNCacheTable& table, Hash128 key, bool includeOwnerMap, EvaluationTripwire& tripwire
 ) {
   shared_ptr<NNOutput> result;
-  if(table.get(key, result)) {
+  if(NNCacheTableTestAccess::get(table, key, result)) {
     // nneval.cpp:925 -- a hit that satisfies the request RETURNS, and nothing below runs.
     if(!(includeOwnerMap && result->whiteOwnerMap == NULL))
       return result;
@@ -152,7 +153,7 @@ shared_ptr<NNOutput> evaluateLikeNNEvaluator(
     result = nullptr;
   }
   const shared_ptr<NNOutput> fresh = tripwire.evaluate(key);
-  table.set(fresh);
+  NNCacheTableTestAccess::set(table, fresh);
   return fresh;
 }
 
@@ -307,7 +308,7 @@ void testLevelZeroAnswersFirstAndLevelOneCatchesTheRest() {
   // A key in neither level is absent.
   testAssert(!present(*table, nthKey(50)));
   // A set goes to level 1 and is then found by fall-through.
-  table->set(outputFor(nthKey(50), false));
+  NNCacheTableTestAccess::set(*table, outputFor(nthKey(50), false));
   testAssert(present(*table, nthKey(50)));
 
   // clear() empties level 1 and leaves level 0 intact: level 0 is the content this
@@ -330,7 +331,7 @@ void testSkipCachePathUpholdsTheOneOwnerInvariant() {
 
   testAssert(frozen->contains(key));
   // No get precedes this set: that is exactly what skipCache does.
-  table->set(outputFor(key, false));
+  NNCacheTableTestAccess::set(*table, outputFor(key, false));
 
   // AT MOST ONE LEVEL OWNS THE KEY, observed rather than argued: level 0 no longer
   // resolves it, and the table still does -- from level 1.
@@ -359,18 +360,18 @@ void testOwnerMapFallThroughUpholdsTheOneOwnerInvariant() {
   // The get that hits level 0 and finds no ownership map. nneval stashes this and falls
   // through rather than returning.
   shared_ptr<NNOutput> hit;
-  testAssert(table->get(key, hit));
+  testAssert(NNCacheTableTestAccess::get(*table, key, hit));
   testAssert(hit->whiteOwnerMap == NULL);
 
   // The set of the fuller result that follows.
-  table->set(outputFor(key, true));
+  NNCacheTableTestAccess::set(*table, outputFor(key, true));
 
   // One owner: level 0 has given the key up.
   testAssert(!frozen->contains(key));
   // And the caller now gets the fuller entry, rather than being handed the ownermap-less
   // one forever. This is the whole reason the set is not a no-op.
   shared_ptr<NNOutput> after;
-  testAssert(table->get(key, after));
+  testAssert(NNCacheTableTestAccess::get(*table, key, after));
   testAssert(after->whiteOwnerMap != NULL);
 }
 
@@ -474,7 +475,7 @@ void testHitCountsSurviveTheTransferBetweenLevels() {
     testAssert(present(*table, stays));
 
   // Ownership of `moved` transfers to level 1, carrying its three hits.
-  table->set(outputFor(moved, true));
+  NNCacheTableTestAccess::set(*table, outputFor(moved, true));
   // Two more hits, now served by level 1.
   for(int i = 0; i < 2; i++)
     testAssert(present(*table, moved));
@@ -488,7 +489,7 @@ void testHitCountsSurviveTheTransferBetweenLevels() {
   // A key only ever served by level 1 is counted too -- "no matter which level it occurs
   // on" includes the level that has no counter of its own.
   const Hash128 levelOneOnly = nthKey(77);
-  table->set(outputFor(levelOneOnly, false));
+  NNCacheTableTestAccess::set(*table, outputFor(levelOneOnly, false));
   for(int i = 0; i < 4; i++)
     testAssert(present(*table, levelOneOnly));
   const NNCacheHitLedger again = table->harvestHitCounts();
@@ -501,7 +502,7 @@ void testHitCountsSurviveTheTransferBetweenLevels() {
 // than handing back an empty row list a caller could read as "nothing was hit".
 void testASingleLevelTableReportsNotCountedRatherThanEmpty() {
   unique_ptr<NNCacheTable> table = defaultLevelOne(8);
-  table->set(outputFor(nthKey(0), false));
+  NNCacheTableTestAccess::set(*table, outputFor(nthKey(0), false));
   testAssert(present(*table, nthKey(0)));
   const NNCacheHitLedger ledger = table->harvestHitCounts();
   testAssert(!ledger.isCounted());
@@ -562,7 +563,7 @@ void testTwoLevelStatsSumBothLevels() {
 
   // Shadow one entry. It leaves the resident count and the resident payload, and its
   // evaluation's bytes reappear as fixed structure the table can no longer hand out.
-  table->set(outputFor(a, false));
+  NNCacheTableTestAccess::set(*table, outputFor(a, false));
   const NNCacheStats after = table->stats();
   testAssert(after.residentEntries == both.residentEntries);  // one left level 0, one entered level 1
   testAssert(frozen->shadowedPayloadBytes() > 0);

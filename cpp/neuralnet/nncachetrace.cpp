@@ -63,7 +63,10 @@ class NNCacheTableTracing final : public NNCacheTable {
   }
 
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
-    const bool found = inner->get(nnHash,ret);
+    // getRaw, not inner->get: inner's static type is NNCacheTable, the base, and the raw
+    // get/set are protected -- see nncache.h's own comment on why a decorator needs the
+    // static forwarder rather than plain protected access.
+    const bool found = NNCacheTable::getRaw(*inner, nnHash, ret);
     append(nnHash, found ? NNCacheTrace::FLAG_HIT : 0u, 0u);
     return found;
   }
@@ -73,7 +76,7 @@ class NNCacheTableTracing final : public NNCacheTable {
     // constant: whether this entry carries an ownership map is precisely the thing a
     // replay must not have to guess.
     append(p->nnHash, NNCacheTrace::FLAG_IS_SET, (uint32_t)nnOutputFootprintBytes(*p));
-    inner->set(p);
+    NNCacheTable::setRaw(*inner, p);
   }
 
   // DELEGATED AND DELIBERATELY NOT RECORDED. The trace exists so a replay can re-run this run's

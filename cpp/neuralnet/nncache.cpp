@@ -512,11 +512,18 @@ class NNCacheTableDirect final : public NNCacheTable {
   NNCacheTableDirect(int sizePowerOfTwo, int mutexPoolSizePowerOfTwo);
   ~NNCacheTableDirect() override;
 
-  bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override;
-  void set(const std::shared_ptr<NNOutput>& p) override;
   void clear() override;
   bool contains(Hash128 nnHash) const override;
   NNCacheStats stats() const override;
+
+  // PROTECTED, matching the base: this class has no header today, so nothing outside this
+  // translation unit can name the concrete type and reach these publicly regardless -- but a
+  // header could be added later without anyone thinking to re-check access, exactly the defect
+  // an out-of-frame audit found in NNCacheTableProbed (which DOES have a header). Fixed here in
+  // the same pass, defense in depth.
+ protected:
+  bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override;
+  void set(const std::shared_ptr<NNOutput>& p) override;
 };
 
 NNCacheTableDirect::Entry::Entry()

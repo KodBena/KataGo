@@ -2,6 +2,7 @@
 
 #include "../core/config_parser.h"
 #include "../neuralnet/nncache.h"
+#include "../tests/nncachetabletestaccess.h"
 
 using namespace std;
 using namespace TestCommon;
@@ -391,26 +392,26 @@ void Tests::runNNCacheConfigTests() {
 
     Hash128 hash(0x1234567812345678ULL, 0x8765432187654321ULL);
     shared_ptr<NNOutput> got;
-    testAssert(!table->get(hash,got));
+    testAssert(!NNCacheTableTestAccess::get(*table, hash,got));
     testAssert(got == nullptr);
 
     shared_ptr<NNOutput> entry = std::make_shared<NNOutput>();
     entry->nnHash = hash;
     entry->nnXLen = 19;
     entry->nnYLen = 19;
-    table->set(entry);
+    NNCacheTableTestAccess::set(*table, entry);
 
-    testAssert(table->get(hash,got));
+    testAssert(NNCacheTableTestAccess::get(*table, hash,got));
     testAssert(got != nullptr);
     testAssert(got->nnHash == hash);
 
     Hash128 otherHash(0xdeadbeefdeadbeefULL, 0xfeedfacefeedfaceULL);
-    testAssert(!table->get(otherHash,got));
+    testAssert(!NNCacheTableTestAccess::get(*table, otherHash,got));
     testAssert(got == nullptr);
 
-    testAssert(table->get(hash,got));
+    testAssert(NNCacheTableTestAccess::get(*table, hash,got));
     table->clear();
-    testAssert(!table->get(hash,got));
+    testAssert(!NNCacheTableTestAccess::get(*table, hash,got));
   }
 
   cout << "nn cache config tests passed" << endl;

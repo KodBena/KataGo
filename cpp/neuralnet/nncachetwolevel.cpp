@@ -554,7 +554,10 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
     // Fall through. A level-1 hit is counted in the ledger; that is one extra random
     // access on the level-1 hit path, and it is the only place in this design where
     // counting costs a memory access it would not otherwise make.
-    if(levelOne_->get(nnHash, ret)) {
+    // getRaw, not levelOne_->get: levelOne_'s static type is NNCacheTable, the base, and the
+    // raw get/set are protected -- see nncache.h's own comment on why this needs the static
+    // forwarder rather than plain protected access.
+    if(NNCacheTable::getRaw(*levelOne_, nnHash, ret)) {
       ledger_.add(nnHash, 1);
       return true;
     }
@@ -579,7 +582,7 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
     const uint64_t transferred = levelZero_.shadowAllHolders(p->nnHash);
     if(transferred > 0)
       ledger_.add(p->nnHash, transferred > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)transferred);
-    levelOne_->set(p);
+    NNCacheTable::setRaw(*levelOne_, p);
   }
 
   // LEVEL 1 ONLY, AND WITHOUT COUNTING. Both halves are the point. Not counting is what
@@ -587,7 +590,7 @@ class NNCacheTableTwoLevel final : public NNCacheTwoLevelTable, private NNCacheL
   // what keeps a dump from being handed an entry whose bytes are already in the file it is
   // appending to, which is the duplicate NNCacheEntryProvenance exists to foreclose.
   bool peek(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
-    return levelOne_->get(nnHash, ret);
+    return NNCacheTable::getRaw(*levelOne_, nnHash, ret);
   }
 
   // Either level holds it, and nothing is touched in finding out -- NNCacheFrozen::contains

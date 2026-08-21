@@ -11,6 +11,7 @@
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncachefrozen.h"
 #include "../neuralnet/nncachetwolevel.h"
+#include "../tests/nncachetabletestaccess.h"
 #include "../tests/testcacheswapseam.h"
 
 using namespace std;
@@ -173,7 +174,7 @@ void Tests::runNNCacheTwoLevelBench() {
       int64_t found = 0;
       for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
         if(firstSource->get(missQueries[(size_t)i], got)) found++;
-        else if(referenceLevelOne->get(missQueries[(size_t)i], got)) found++;
+        else if(NNCacheTableTestAccess::get(*referenceLevelOne, missQueries[(size_t)i], got)) found++;
       }
       missNs.push_back(timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP);
       if(found != 0) throw StringError("bench: the miss stream hit something");
@@ -181,7 +182,7 @@ void Tests::runNNCacheTwoLevelBench() {
       ClockTimer hitTimer;
       for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
         if(firstSource->get(hitQueries[(size_t)i], got)) found++;
-        else if(referenceLevelOne->get(hitQueries[(size_t)i], got)) found++;
+        else if(NNCacheTableTestAccess::get(*referenceLevelOne, hitQueries[(size_t)i], got)) found++;
       }
       hitNs.push_back(hitTimer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP);
       if(found != LOOKUPS_PER_REP) throw StringError("bench: the hit stream missed something");
@@ -206,13 +207,13 @@ void Tests::runNNCacheTwoLevelBench() {
       int64_t found = 0;
       ClockTimer timer;
       for(int64_t i = 0; i < LOOKUPS_PER_REP; i++)
-        if(table->get(missQueries[(size_t)i], got)) found++;
+        if(NNCacheTableTestAccess::get(*table, missQueries[(size_t)i], got)) found++;
       missNs.push_back(timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP);
       if(found != 0) throw StringError("bench: the miss stream hit something");
 
       ClockTimer hitTimer;
       for(int64_t i = 0; i < LOOKUPS_PER_REP; i++)
-        if(table->get(hitQueries[(size_t)i], got)) found++;
+        if(NNCacheTableTestAccess::get(*table, hitQueries[(size_t)i], got)) found++;
       hitNs.push_back(hitTimer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP);
       if(found != LOOKUPS_PER_REP) throw StringError("bench: the hit stream missed something");
     }
@@ -265,7 +266,7 @@ void Tests::runNNCacheTwoLevelBench() {
               p->nnHash = keyOf(base + i);
               p->nnXLen = 19;
               p->nnYLen = 19;
-              attachTable->set(p);
+              NNCacheTableTestAccess::set(*attachTable, p);
             }
           }
           ClockTimer timer;
@@ -349,13 +350,13 @@ void Tests::runNNCacheTwoLevelBench() {
         ClockTimer timer;
         if(doBase) {
           for(int64_t i = 0; i < LOOKUPS_PER_REP; i++)
-            if(plain->get(missQueries[(size_t)i], got)) found++;
+            if(NNCacheTableTestAccess::get(*plain, missQueries[(size_t)i], got)) found++;
           base = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
         }
         else {
           for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
             (void)plain->present(missQueries[(size_t)i], unattributed);
-            if(plain->get(missQueries[(size_t)i], got)) found++;
+            if(NNCacheTableTestAccess::get(*plain, missQueries[(size_t)i], got)) found++;
           }
           obs = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
         }
@@ -389,13 +390,13 @@ void Tests::runNNCacheTwoLevelBench() {
           ClockTimer timer;
           if(doBase) {
             for(int64_t i = 0; i < LOOKUPS_PER_REP; i++)
-              if(plain->get(missQueries[(size_t)i], got)) found++;
+              if(NNCacheTableTestAccess::get(*plain, missQueries[(size_t)i], got)) found++;
             base = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
           }
           else {
             for(int64_t i = 0; i < LOOKUPS_PER_REP; i++) {
               (void)plain->present(missQueries[(size_t)i], *arms[arm]);
-              if(plain->get(missQueries[(size_t)i], got)) found++;
+              if(NNCacheTableTestAccess::get(*plain, missQueries[(size_t)i], got)) found++;
             }
             obs = timer.getSeconds() * 1.0e9 / (double)LOOKUPS_PER_REP;
           }

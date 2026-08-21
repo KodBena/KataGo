@@ -11,6 +11,7 @@
 #include "../command/analysiscachelifecycle.h"
 #include "../core/config_parser.h"
 #include "../neuralnet/nncachecountlog.h"
+#include "../tests/nncachetabletestaccess.h"
 #include "../tests/tinymodel.h"
 
 // THE CONFIG-DRIVEN LIFECYCLE OF THE PERSISTED CACHE: an engine that attaches its context from
@@ -347,7 +348,7 @@ void testWorkSurvivesAShutdownDumpAndIsReadBackByALaterStartupAttach() {
     // without this process ever having set it.
     for(int serial = 1; serial <= (int)written; serial++) {
       shared_ptr<NNOutput> fromDisk;
-      testAssert(eval.cacheTable().get(nthKey(serial), fromDisk));
+      testAssert(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(serial), fromDisk));
       testAssert(fromDisk != nullptr && fromDisk->nnHash == nthKey(serial));
     }
     // And the count log the first engine's counts half wrote is there and whole.
@@ -508,7 +509,7 @@ void testThePeriodicDumperWritesWithNobodyAskingAndNoCleanExit() {
     NNEvaluator& eval = *second.hosts->searchableEval(model);
     for(int serial = 1; serial <= (int)writtenByInterval; serial++) {
       shared_ptr<NNOutput> fromDisk;
-      testAssert(eval.cacheTable().get(nthKey(serial), fromDisk));
+      testAssert(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(serial), fromDisk));
     }
     cout << "  the PERIODIC dump alone put " << writtenByInterval
          << " entries on disk -- no wire verb, no clean exit, and a later engine reads them back"
@@ -548,7 +549,7 @@ void testTheConfiguredAdmissionGovernsWhatTheDumpWrites() {
   // Key 1 asked for a second time: now observed twice, and the only one that clears the default.
   shared_ptr<NNOutput> got;
   (void)eval.cacheTable().present(nthKey(1), attribution);
-  testAssert(eval.cacheTable().get(nthKey(1), got));
+  testAssert(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(1), got));
 
   const AnalysisCacheDumpReport report = analysisCacheDumpAttachedContexts(
     *engine.hosts, engine.attachments, engine.lifecycle, AnalysisCacheDumpOccasion::Shutdown, 0
@@ -564,10 +565,10 @@ void testTheConfiguredAdmissionGovernsWhatTheDumpWrites() {
     (void)analysisCacheStartupAttach(*second.hosts, second.attachments, second.lifecycle);
     NNEvaluator& secondEval = *second.hosts->searchableEval(model);
     shared_ptr<NNOutput> admitted;
-    testAssert(secondEval.cacheTable().get(nthKey(1), admitted));
+    testAssert(NNCacheTableTestAccess::get(secondEval.cacheTable(), nthKey(1), admitted));
     shared_ptr<NNOutput> refused;
-    testAssert(!secondEval.cacheTable().get(nthKey(2), refused));
-    testAssert(!secondEval.cacheTable().get(nthKey(3), refused));
+    testAssert(!NNCacheTableTestAccess::get(secondEval.cacheTable(), nthKey(2), refused));
+    testAssert(!NNCacheTableTestAccess::get(secondEval.cacheTable(), nthKey(3), refused));
   }
   cout << "  the DEFAULT admission really governs: of 3 earned keys the dump wrote the 1 seen "
           "twice, and a later engine finds only that one on disk" << endl;

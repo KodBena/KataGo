@@ -255,6 +255,15 @@ class NNCacheTableProbed final : public NNCacheTable {
     return false;
   }
 
+  // PROTECTED, matching the base: NNCacheTable::get(Hash128,...)/set(shared_ptr,...) are
+  // protected precisely so that production code outside the presentation-minted path cannot
+  // call them, and an override's access specifier is independent of its base's -- re-declaring
+  // these under public: here (as this class did before this fix) would have reopened exactly
+  // that door for any caller holding the CONCRETE NNCacheTableProbed type instead of the
+  // NNCacheTable& the factory hands back. Re-tightening an override's access is legal C++ even
+  // though the signature is unchanged (found by the out-of-frame audit dispatched over this
+  // change; see the ledger).
+ protected:
   bool get(Hash128 nnHash, std::shared_ptr<NNOutput>& ret) override {
     // Free ret BEFORE locking, to avoid any expensive operations while locked.
     if(ret != nullptr)
@@ -357,6 +366,7 @@ class NNCacheTableProbed final : public NNCacheTable {
     // No longer locked; buf falls out of scope and frees whatever it swapped out.
   }
 
+ public:
   // A snapshot taken one region at a time; see NNCacheTableDirect::stats for why there
   // is no global lock and what that costs under live traffic.
   //

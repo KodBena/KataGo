@@ -266,3 +266,66 @@ def run_persistence(w, h, name_a):
     "mark looks like -- or nonzero on a true no-op, which is what this fix closed.",
   )
   print()
+
+
+def run_accounting(w, h, name_a):
+  """Group A: THE OPERATOR'S OWN PRINCIPLE -- cacheContext is accounting-only.
+
+  A request's "cacheContext" field says which attached context's ledger a query's new cache
+  entries are credited to (analysis.cpp resolves it into an NNCacheAttribution before a
+  single position is evaluated). It is not consulted by the search, the neural net, or the
+  cache's get/set path itself -- attribution is bookkeeping alongside the work, never an
+  input to it. This is the pin for that: the SAME query, asked twice on two engines that have
+  never seen each other's cache directory (so neither run can be served from the other's
+  disk), does the SAME neural net work and returns the SAME search whether or not a
+  cacheContext is named -- and the one place a difference is expected to show up at all is
+  the attribution counter cache_stats reads back.
+  """
+  net_a = h.net_a
+  print("== A: cacheContext is accounting-only ==")
+
+  # Baseline: no context anywhere in the story -- not attached, not named on the query.
+  _, base_cfg = h.config("a_base")
+  out_base, rows_base = h.session(base_cfg, [net_a], [dict(POSITION, id="q")])
+  ans_base = out_base["q"]
+
+  # The identical query, on a FRESH cache directory this process is the first to touch, with a
+  # context attached and named on the request's own "cacheContext" field.
+  _, ctx_cfg = h.config("a_ctx")
+  out_ctx, rows_ctx = h.session(ctx_cfg, [net_a], [
+    {"id": "a", "action": "cache_attach", "context": "acct-card"},
+    dict(POSITION, id="q", cacheContext="acct-card"),
+    {"id": "s", "action": "cache_stats"},
+    # discardUndumped: this leg is about accounting, not persistence -- P already pins the
+    # dump path, and going through it here would be a second, weaker statement of it.
+    {"id": "x", "action": "cache_detach", "context": "acct-card", "discardUndumped": True},
+  ])
+  ans_ctx = out_ctx["q"]
+  ok_seq = all("error" not in out_ctx[k] for k in ("a", "q", "s", "x"))
+
+  w.check(
+    "A1 IDENTICAL NEURAL NET WORK: the same row count with and without cacheContext",
+    ok_seq and rows_base[net_a] > 0 and rows_base[net_a] == rows_ctx[net_a],
+    "rows without a context=%d, rows with one=%d" % (rows_base[net_a], rows_ctx[net_a]),
+    "the same positive row count -- cacheContext must not change how much neural net work a "
+    "query does",
+  )
+  w.check(
+    "A2 IDENTICAL SEARCH: the same fingerprint, winrate, scoreLead and move visits with and "
+    "without cacheContext",
+    ok_seq and search_shape(ans_base) == search_shape(ans_ctx),
+    "without=%s\n            with=%s" % (search_shape(ans_base), search_shape(ans_ctx)),
+    "the same whole search shape -- attribution rides alongside the search and is never an "
+    "input to it",
+  )
+  ctx = context_of(out_ctx["s"], "acct-card")
+  w.check(
+    "A3 and the attribution DID land: cache_stats credits the context with every key this "
+    "query's work earned",
+    ok_seq and ctx.get("unpersistedEntries") == rows_ctx[net_a],
+    "context unpersistedEntries=%s, rows this query paid for=%d"
+    % (ctx.get("unpersistedEntries"), rows_ctx[net_a]),
+    "unpersistedEntries == the row count -- so A1/A2's equality is not because the context "
+    "went unused; the SAME work happened and was ALSO credited",
+  )
+  print()

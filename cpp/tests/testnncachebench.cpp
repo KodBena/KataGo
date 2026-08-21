@@ -7,6 +7,7 @@
 
 #include "../core/timer.h"
 #include "../neuralnet/nncacheprobed.h"
+#include "../tests/nncachetabletestaccess.h"
 
 using namespace std;
 using namespace NNCacheProbed;
@@ -65,7 +66,7 @@ static shared_ptr<NNOutput> streamEntry(Hash128 hash) {
 template<class Table>
 static void populate(Table& table, int64_t inserts) {
   for(int64_t i = 0; i<inserts; i++)
-    table.set(streamEntry(streamKey((uint64_t)i)));
+    NNCacheTableTestAccess::set(table, streamEntry(streamKey((uint64_t)i)));
 }
 
 // Times `lookups` gets over keys drawn from [keyBase, keyBase+keyRange). The miss arm
@@ -80,7 +81,7 @@ static double timeLookups(
   int64_t found = 0;
   ClockTimer timer;
   for(int64_t i = 0; i<lookups; i++) {
-    if(table.get(streamKey((uint64_t)(keyBase + (i % keyRange))),got))
+    if(NNCacheTableTestAccess::get(table, streamKey((uint64_t)(keyBase + (i % keyRange))),got))
       found += 1;
   }
   const double seconds = timer.getSeconds();
@@ -188,7 +189,7 @@ void Tests::runNNCacheBench() {
     shared_ptr<NNOutput> got;
     int64_t resident = 0;
     for(int64_t i = 0; i<LOOKUPS; i++)
-      resident += tagged.get(streamKey((uint64_t)(hitBase + (i % LOOKUPS))),got) ? 1 : 0;
+      resident += NNCacheTableTestAccess::get(tagged, streamKey((uint64_t)(hitBase + (i % LOOKUPS))),got) ? 1 : 0;
     const ArmResult hitArm = runArms(tagged,untagged,hitBase,LOOKUPS,resident);
     cout << "  ways=" << ways << " hit stream resident fraction: "
          << (double)resident / (double)LOOKUPS << endl;

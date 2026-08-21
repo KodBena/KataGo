@@ -6,6 +6,7 @@
 #include "../command/analysiscacheactions.h"
 #include "../core/config_parser.h"
 #include "../neuralnet/nncachecountlog.h"
+#include "../tests/nncachetabletestaccess.h"
 #include "../tests/tinymodel.h"
 
 // THE ANALYSIS ENGINE'S PERSISTED-CACHE ACTIONS: cache_attach, cache_detach, cache_dump and
@@ -526,7 +527,7 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
   shared_ptr<NNOutput> got;
   for(int again = 0; again < 2; again++) {
     (void)eval.cacheTable().present(nthKey(1), attribution);
-    testAssert(eval.cacheTable().get(nthKey(1), got));
+    testAssert(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(1), got));
   }
 
   // The dump. Counts first, then evaluations, which is the order the admission predicate needs.
@@ -576,7 +577,7 @@ void testASessionsWorkSurvivesADumpDetachReattachCycle(RealEngineCache& engine) 
   // And the re-attached content really resolves: a get for a key this process never set in the
   // new attachment answers, out of level 0.
   shared_ptr<NNOutput> fromDisk;
-  testAssert(eval.cacheTable().get(nthKey(3), fromDisk));
+  testAssert(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(3), fromDisk));
   testAssert(fromDisk->nnHash == nthKey(3));
 
   cout << "  attach -> earn -> dump -> detach -> re-attach: " << reattached["entriesInLevelZero"].get<int64_t>()
@@ -622,7 +623,7 @@ void testALevelOneFillAdmitsTheRemainderAndMarksItPersisted(RealEngineCache& eng
   int resolved = 0;
   for(int serial = 301; serial <= 303; serial++) {
     shared_ptr<NNOutput> got;
-    if(eval.cacheTable().get(nthKey(serial), got))
+    if(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(serial), got))
       resolved += 1;
   }
   testAssert(resolved == 3);
@@ -762,7 +763,7 @@ void testCountsAreDumpedPerContextWithTwoContextsAttached(RealEngineCache& engin
   shared_ptr<NNOutput> got;
   for(int again = 0; again < 2; again++) {
     (void)eval.cacheTable().present(nthKey(401), NNCacheAttribution::toContext(idA));
-    testAssert(eval.cacheTable().get(nthKey(401), got));
+    testAssert(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(401), got));
   }
   (void)eval.cacheTable().present(nthKey(451), NNCacheAttribution::toContext(idB));
   eval.cacheTable().set(makeOutput(451, false), NNCacheAttribution::toContext(idB));
@@ -861,7 +862,7 @@ void testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(RealEngineCache& engine
   shared_ptr<NNOutput> unused;
   for(int i = 0; i < 3; i++) {
     (void)eval.cacheTable().present(nthKey(prewarmedSerials[i]), NNCacheAttribution::toContext(prewarmedId));
-    testAssert(eval.cacheTable().get(nthKey(prewarmedSerials[i]), got));
+    testAssert(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(prewarmedSerials[i]), got));
   }
   (void)unused;
 
@@ -900,7 +901,7 @@ void testDetachSeesUndumpedCountsThatTheOldProxyCouldNot(RealEngineCache& engine
   const NNCacheContextId secondId = attachments.attachmentFor(model, card).contextId;
   for(int i = 0; i < 3; i++) {
     (void)eval.cacheTable().present(nthKey(prewarmedSerials[i]), NNCacheAttribution::toContext(secondId));
-    testAssert(eval.cacheTable().get(nthKey(prewarmedSerials[i]), got));
+    testAssert(NNCacheTableTestAccess::get(eval.cacheTable(), nthKey(prewarmedSerials[i]), got));
   }
   testAssert(eval.cacheTable().unpersistedKeysFor(secondId).empty());          // still silent
   testAssert(eval.cacheTable().hasUnpersistedObservationCountsFor(secondId));  // and this is not
@@ -1046,11 +1047,11 @@ void testCacheStatsReportsObservationsAndTheyDifferFromRetrievals() {
   // The requests that hit.
   for(int i = 0; i < 3; i++) {
     (void)table.present(nthKey(401), attribution);
-    testAssert(table.get(nthKey(401), got));
+    testAssert(NNCacheTableTestAccess::get(table, nthKey(401), got));
   }
   for(int i = 0; i < 2; i++) {
     (void)table.present(nthKey(402), attribution);
-    testAssert(table.get(nthKey(402), got));
+    testAssert(NNCacheTableTestAccess::get(table, nthKey(402), got));
   }
 
   const NNCacheObservationLedger observations = table.harvestObservationCountsFor(contextId);

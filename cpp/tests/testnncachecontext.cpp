@@ -13,6 +13,7 @@
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncachecontext.h"
 #include "../neuralnet/nncachecountlog.h"
+#include "../tests/nncachetabletestaccess.h"
 #include "../neuralnet/nncachefrozen.h"
 #include "../neuralnet/nncachetwolevel.h"
 #include "../neuralnet/nneval.h"
@@ -274,7 +275,7 @@ void testEachContextsEarningsReachThatContextsCountLogAndNoOthers() {
   shared_ptr<NNOutput> got;
   for(int again = 0; again < 2; again++) {
     (void)table->present(earnedByA, NNCacheAttribution::toContext(cardA));
-    testAssert(table->get(earnedByA, got));
+    testAssert(NNCacheTableTestAccess::get(*table, earnedByA, got));
   }
 
   const NNCacheCountLog logA = NNCacheCountLog::forContext(dir.path(), "card-5455");
@@ -390,7 +391,7 @@ void testACacheWithNoAttachedContextIsExactlyWhatItWasBefore() {
   const Hash128 key = nthKey(21);
   table->set(outputFor(key), NNCacheAttribution::noAttributableContext());
   shared_ptr<NNOutput> got;
-  testAssert(table->get(key, got));
+  testAssert(NNCacheTableTestAccess::get(*table, key, got));
   testAssert(got->nnHash == key);
   testAssert(table->harvestAttribution().disposition() == NNCacheAttributionDisposition::NotAttributed);
 }

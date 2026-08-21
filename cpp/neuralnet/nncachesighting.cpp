@@ -331,6 +331,12 @@ class NNCacheTableDirectSighting final : public NNCacheTable {
     return entry.ptr != nullptr && entry.ptr->nnHash == nnHash;
   }
 
+  // PROTECTED, matching the base: this class has no header today, so nothing outside this
+  // translation unit can name the concrete type and reach these publicly regardless -- but a
+  // header could be added later without anyone thinking to re-check access, exactly the defect
+  // an out-of-frame audit found in NNCacheTableProbed (which DOES have a header). Fixed here in
+  // the same pass, defense in depth.
+ protected:
   // A get IS a sighting -- that is the whole point of the axis, and it is what makes the
   // count something other than a constant. The ghost update is deliberately OUTSIDE the
   // region lock: it is a lock-free hint, and putting it under the lock would lengthen the
@@ -396,6 +402,7 @@ class NNCacheTableDirectSighting final : public NNCacheTable {
     }
   }
 
+ public:
   void clear() override {
     std::shared_ptr<NNOutput> buf;
     for(uint64_t idx = 0; idx < tableSize; idx++) {

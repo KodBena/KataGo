@@ -7,6 +7,7 @@
 #include "../neuralnet/nncache.h"
 #include "../neuralnet/nncacheimpl.h"
 #include "../neuralnet/nncacheprobed.h"
+#include "../tests/nncachetabletestaccess.h"
 
 using namespace std;
 using namespace TestCommon;
@@ -49,7 +50,7 @@ static shared_ptr<NNOutput> entryFor(Hash128 hash, bool withOwnerMap) {
 // needs to continue a sequence.
 static bool present(NNCacheTable& table, Hash128 hash) {
   shared_ptr<NNOutput> got;
-  bool found = table.get(hash,got);
+  bool found = NNCacheTableTestAccess::get(table, hash,got);
   testAssert(found == (got != nullptr));
   if(found)
     testAssert(got->nnHash == hash);
@@ -122,12 +123,12 @@ static void testLruEvictsTheLeastRecentlyUsed(NNCacheCollisionScheme scheme) {
   );
   const Hash128 a = keyAt(0,0), b = keyAt(0,1), c = keyAt(0,2), d = keyAt(0,3), e = keyAt(0,4);
 
-  table->set(entryFor(a,false));
-  table->set(entryFor(b,false));
-  table->set(entryFor(c,false));
-  table->set(entryFor(d,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(c,false));
+  NNCacheTableTestAccess::set(*table, entryFor(d,false));
   testAssert(present(*table,a));  // re-sighting A is the point of the scenario
-  table->set(entryFor(e,false));
+  NNCacheTableTestAccess::set(*table, entryFor(e,false));
 
   testAssert(present(*table,a));
   testAssert(!present(*table,b));   // B, and nothing else, is the victim
@@ -146,14 +147,14 @@ static void testLruSecondEvictionFollowsTheNewOrder(NNCacheCollisionScheme schem
   const Hash128 a = keyAt(0,0), b = keyAt(0,1), c = keyAt(0,2), d = keyAt(0,3);
   const Hash128 e = keyAt(0,4), f = keyAt(0,5);
 
-  table->set(entryFor(a,false));
-  table->set(entryFor(b,false));
-  table->set(entryFor(c,false));
-  table->set(entryFor(d,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(c,false));
+  NNCacheTableTestAccess::set(*table, entryFor(d,false));
   testAssert(present(*table,a));
-  table->set(entryFor(e,false));
+  NNCacheTableTestAccess::set(*table, entryFor(e,false));
   testAssert(present(*table,c));
-  table->set(entryFor(f,false));
+  NNCacheTableTestAccess::set(*table, entryFor(f,false));
 
   testAssert(present(*table,a));
   testAssert(!present(*table,b));
@@ -174,14 +175,14 @@ static void testLfuEvictsTheLeastFrequentlyUsed() {
   );
   const Hash128 a = keyAt(0,0), b = keyAt(0,1), c = keyAt(0,2), d = keyAt(0,3), e = keyAt(0,4);
 
-  table->set(entryFor(a,false));
-  table->set(entryFor(b,false));
-  table->set(entryFor(c,false));
-  table->set(entryFor(d,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(c,false));
+  NNCacheTableTestAccess::set(*table, entryFor(d,false));
   for(int i = 0; i<3; i++) testAssert(present(*table,a));
   for(int i = 0; i<2; i++) testAssert(present(*table,b));
   testAssert(present(*table,c));
-  table->set(entryFor(e,false));
+  NNCacheTableTestAccess::set(*table, entryFor(e,false));
 
   testAssert(present(*table,a));
   testAssert(present(*table,b));
@@ -217,16 +218,16 @@ static unique_ptr<NNCacheTable> buildLfuAgedTable(int newcomers) {
     probedConfig(NNCacheCollisionScheme::LinearProbe,WAYS,NNCacheEvictionPolicy::Lfu,SIZE_POW,POOL_POW)
   );
   const Hash128 a = keyAt(0,0), b = keyAt(0,1), c = keyAt(0,2), d = keyAt(0,3);
-  table->set(entryFor(a,false));
-  table->set(entryFor(b,false));
-  table->set(entryFor(c,false));
-  table->set(entryFor(d,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(c,false));
+  NNCacheTableTestAccess::set(*table, entryFor(d,false));
   for(int i = 0; i<3; i++) testAssert(present(*table,a));   // A: 4 sightings
   for(int i = 0; i<2; i++) testAssert(present(*table,b));   // B: 3
   testAssert(present(*table,c));                            // C: 2
                                                             // D: 1
   for(int i = 0; i<newcomers; i++)
-    table->set(entryFor(keyAt(0,4+i),false));
+    NNCacheTableTestAccess::set(*table, entryFor(keyAt(0,4+i),false));
   return table;
 }
 
@@ -261,13 +262,13 @@ static void testRandomEvictsExactlyOneResidentAndOnlyWhenFull() {
   vector<Hash128> keys;
   for(int i = 0; i<WAYS; i++) {
     keys.push_back(keyAt(0,i));
-    table->set(entryFor(keys.back(),false));
+    NNCacheTableTestAccess::set(*table, entryFor(keys.back(),false));
   }
   for(int i = 0; i<WAYS; i++)
     testAssert(present(*table,keys[i]));
 
   const Hash128 extra = keyAt(0,WAYS);
-  table->set(entryFor(extra,false));
+  NNCacheTableTestAccess::set(*table, entryFor(extra,false));
   testAssert(present(*table,extra));
   int survivors = 0;
   for(int i = 0; i<WAYS; i++)
@@ -289,14 +290,14 @@ static void testRandomChoosesUniformlyAmongWays() {
   vector<Hash128> occupant;
   for(int j = 0; j<WAYS; j++) {
     occupant.push_back(keyAt(0,j));
-    table->set(entryFor(occupant.back(),false));
+    NNCacheTableTestAccess::set(*table, entryFor(occupant.back(),false));
   }
 
   const int trials = 4000;
   vector<int> victimCount((size_t)WAYS,0);
   for(int t = 0; t<trials; t++) {
     const Hash128 fresh = keyAt(0,WAYS+t);
-    table->set(entryFor(fresh,false));
+    NNCacheTableTestAccess::set(*table, entryFor(fresh,false));
     int victimWay = -1;
     for(int j = 0; j<WAYS; j++) {
       if(!present(*table,occupant[(size_t)j])) {
@@ -371,7 +372,7 @@ static void testChainedByteBudgetCountsTheRealFootprint() {
     vector<Hash128> keys;
     for(int64_t i = 0; i < bareFit+1; i++) {
       keys.push_back(keyAt((uint64_t)(i % 4), (int)i));   // buckets 0..3, all in region 0
-      table->set(entryFor(keys.back(),false));
+      NNCacheTableTestAccess::set(*table, entryFor(keys.back(),false));
     }
     testAssert(!present(*table,keys[0]));
     for(size_t i = 1; i<keys.size(); i++)
@@ -384,7 +385,7 @@ static void testChainedByteBudgetCountsTheRealFootprint() {
     vector<Hash128> keys;
     for(int64_t i = 0; i < bareFit+1; i++) {
       keys.push_back(keyAt((uint64_t)(i % 4), (int)i));
-      table->set(entryFor(keys.back(),true));
+      NNCacheTableTestAccess::set(*table, entryFor(keys.back(),true));
     }
     int survivors = 0;
     for(size_t i = 0; i<keys.size(); i++)
@@ -405,11 +406,11 @@ static void testChainedSweepEvictsByRecency() {
 
   unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lru));
   const Hash128 a = keyAt(0,0), b = keyAt(1,1), c = keyAt(2,2), d = keyAt(3,3);
-  table->set(entryFor(a,false));
-  table->set(entryFor(b,false));
-  table->set(entryFor(c,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(c,false));
   testAssert(present(*table,a));    // A is now the most recently used, B the least
-  table->set(entryFor(d,false));
+  NNCacheTableTestAccess::set(*table, entryFor(d,false));
 
   testAssert(present(*table,a));
   testAssert(!present(*table,b));
@@ -428,8 +429,8 @@ static void testChainedRechargesAnUpgradedEntry() {
 
   unique_ptr<NNCacheTable> table = NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lru));
   const Hash128 a = keyAt(0,0), b = keyAt(1,1);
-  table->set(entryFor(a,false));
-  table->set(entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
   testAssert(present(*table,a));
   testAssert(present(*table,b));
 
@@ -439,7 +440,7 @@ static void testChainedRechargesAnUpgradedEntry() {
     chainedEntryBytes(*ownerProto) + chainedEntryBytes(*bareProto) >
     (size_t)chainedRegionBudgetBytes(maxBytes,sizePow,poolPow)
   );
-  table->set(entryFor(a,true));
+  NNCacheTableTestAccess::set(*table, entryFor(a,true));
   testAssert(present(*table,a));
   testAssert(!present(*table,b));
 }
@@ -458,8 +459,8 @@ static void testChainedRandomEvictsExactlyOneResident() {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Random));
     for(int i = 0; i<3; i++)
-      table->set(entryFor(keys[i],false));
-    table->set(entryFor(keys[3],false));
+      NNCacheTableTestAccess::set(*table, entryFor(keys[i],false));
+    NNCacheTableTestAccess::set(*table, entryFor(keys[3],false));
     int survivors = 0;
     for(int i = 0; i<4; i++)
       survivors += present(*table,keys[i]) ? 1 : 0;
@@ -481,7 +482,7 @@ static void testChainedRandomEvictsExactlyOneResident() {
     vector<Hash128> many;
     for(int i = 0; i<numKeys; i++) {
       many.push_back(keyAt((uint64_t)(i % 4), 200+i));   // buckets 0..3, all region 0
-      table->set(entryFor(many.back(),false));
+      NNCacheTableTestAccess::set(*table, entryFor(many.back(),false));
     }
     int survivors = 0;
     bool matchesRecencyOutcome = true;
@@ -509,9 +510,9 @@ static void testChainedLfuEvictsTheLeastFrequentlyUsed() {
   unique_ptr<NNCacheTable> table =
     NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lfu));
   const Hash128 a = keyAt(0,0), b = keyAt(1,1), c = keyAt(2,2), d = keyAt(3,3);
-  table->set(entryFor(a,false));
-  table->set(entryFor(b,false));
-  table->set(entryFor(c,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(c,false));
   // All three were admitted at floor+1 = 1. Sight A three times and B once, leaving C
   // the least frequent by construction; every get here is a sighting, which is the trap
   // named at the top of this file, and it is being used deliberately.
@@ -520,7 +521,7 @@ static void testChainedLfuEvictsTheLeastFrequentlyUsed() {
   testAssert(present(*table,a));
   testAssert(present(*table,b));
 
-  table->set(entryFor(d,false));
+  NNCacheTableTestAccess::set(*table, entryFor(d,false));
   testAssert(present(*table,a));
   testAssert(present(*table,b));
   testAssert(!present(*table,c));   // C, and only C: fewest sightings
@@ -547,11 +548,11 @@ static void testChainedLfuAgesAStaleEntry() {
   for(int n = 0; n <= maxNewcomers && diedAfter < 0; n++) {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lfu));
-    table->set(entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
     for(int i = 0; i<4; i++)          // A reaches count 5, then is never referenced again
       testAssert(present(*table,a));
     for(int i = 0; i<n; i++)          // newcomers, none of them ever re-referenced
-      table->set(entryFor(keyAt((uint64_t)(1 + (i % 3)), 100+i),false));
+      NNCacheTableTestAccess::set(*table, entryFor(keyAt((uint64_t)(1 + (i % 3)), 100+i),false));
     if(!present(*table,a))
       diedAfter = n;
   }
@@ -579,8 +580,8 @@ static void testChainedStatsReportWhatIsResident() {
 
   unique_ptr<NNCacheTable> table =
     NNCacheTable::create(chainedConfig(maxBytes,sizePow,poolPow,NNCacheEvictionPolicy::Lru));
-  table->set(entryFor(keyAt(0,0),false));
-  table->set(entryFor(keyAt(1,1),true));
+  NNCacheTableTestAccess::set(*table, entryFor(keyAt(0,0),false));
+  NNCacheTableTestAccess::set(*table, entryFor(keyAt(1,1),true));
 
   const NNCacheStats s = table->stats();
   testAssert(s.residentEntries == 2);
@@ -603,7 +604,7 @@ static void testProbedStatsReportOccupancy() {
     probedConfig(NNCacheCollisionScheme::LinearProbe,WAYS,NNCacheEvictionPolicy::Lru,SIZE_POW,POOL_POW)
   );
   for(int i = 0; i<3; i++)
-    table->set(entryFor(keyAt(0,i),false));
+    NNCacheTableTestAccess::set(*table, entryFor(keyAt(0,i),false));
 
   const NNCacheStats s = table->stats();
   testAssert(s.residentEntries == 3);
@@ -635,24 +636,24 @@ static void testSecondSightingAdmission() {
   unique_ptr<NNCacheTable> table = NNCacheTable::create(config);
   const Hash128 a = keyAt(3,0), b = keyAt(5,1);
 
-  table->set(entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
   testAssert(!present(*table,a));   // first sighting is remembered, not stored
-  table->set(entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
   testAssert(present(*table,a));    // second sighting is stored
 
-  table->set(entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
   testAssert(!present(*table,b));
   testAssert(present(*table,a));    // and B's first sighting did not disturb A
-  table->set(entryFor(b,false));
+  NNCacheTableTestAccess::set(*table, entryFor(b,false));
   testAssert(present(*table,b));
 
   // clear() must clear the ghost set too, or the table would keep admitting on the
   // strength of sightings that belong to a position it no longer holds.
   table->clear();
   testAssert(!present(*table,a));
-  table->set(entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
   testAssert(!present(*table,a));
-  table->set(entryFor(a,false));
+  NNCacheTableTestAccess::set(*table, entryFor(a,false));
   testAssert(present(*table,a));
 }
 
@@ -670,9 +671,9 @@ static void testSecondSightingComposesWithEveryShape() {
       withAdmission(configs[i],NNCacheAdmissionPolicy::SecondSighting)
     );
     const Hash128 key = keyAt(7,(int)i);
-    table->set(entryFor(key,false));
+    NNCacheTableTestAccess::set(*table, entryFor(key,false));
     testAssert(!present(*table,key));
-    table->set(entryFor(key,false));
+    NNCacheTableTestAccess::set(*table, entryFor(key,false));
     testAssert(present(*table,key));
   }
 }
@@ -736,22 +737,22 @@ static void testSightingPolaritiesDisagreeOnAHotIncumbent() {
   {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepMoreSeen));
-    table->set(entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
     testAssert(present(*table,a));
     testAssert(present(*table,a));
     testAssert(present(*table,a));       // A: 4 sightings
-    table->set(entryFor(b,false));       // B: 1
+    NNCacheTableTestAccess::set(*table, entryFor(b,false));       // B: 1
     testAssert(present(*table,a));       // the more-seen incumbent survived
     testAssert(!present(*table,b));      // and the newcomer was refused outright
   }
   {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepLessSeen));
-    table->set(entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
     testAssert(present(*table,a));
     testAssert(present(*table,a));
     testAssert(present(*table,a));       // A: 4 sightings
-    table->set(entryFor(b,false));       // B: 1
+    NNCacheTableTestAccess::set(*table, entryFor(b,false));       // B: 1
     testAssert(!present(*table,a));      // the more-seen incumbent was replaced
     testAssert(present(*table,b));       // by the less-seen newcomer
   }
@@ -777,20 +778,20 @@ static void testSightingCountsForNonResidentKeysDecideTheContest() {
   {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepMoreSeen));
-    table->set(entryFor(b,false));
+    NNCacheTableTestAccess::set(*table, entryFor(b,false));
     for(int i = 0; i<4; i++)
       testAssert(!present(*table,a));    // misses, and sightings all the same
-    table->set(entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
     testAssert(present(*table,a));
     testAssert(!present(*table,b));
   }
   {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepLessSeen));
-    table->set(entryFor(b,false));
+    NNCacheTableTestAccess::set(*table, entryFor(b,false));
     for(int i = 0; i<4; i++)
       testAssert(!present(*table,a));
-    table->set(entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
     testAssert(!present(*table,a));      // the newcomer LOST -- new behaviour entirely
     testAssert(present(*table,b));
   }
@@ -814,7 +815,7 @@ static void testSightingRulesMatchAlwaysWhenNoKeyIsEverReseen() {
     for(int i = 0; i<numKeys; i++) {
       const Hash128 k = sightingKeyAt(0,i);
       testAssert(!present(*table,k));    // the engine's miss...
-      table->set(entryFor(k,false));     // ...followed by its store
+      NNCacheTableTestAccess::set(*table, entryFor(k,false));     // ...followed by its store
     }
     for(int i = 0; i<numKeys; i++)
       testAssert(present(*table,sightingKeyAt(0,i)) == (i == numKeys-1));
@@ -832,9 +833,9 @@ static void testKeepSightedGivesExactlyOneReprieve() {
   {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepSighted));
-    table->set(entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
     testAssert(present(*table,a));       // the sighting that earns the reprieve
-    table->set(entryFor(b,false));
+    NNCacheTableTestAccess::set(*table, entryFor(b,false));
     testAssert(present(*table,a));
     testAssert(!present(*table,b));
   }
@@ -842,10 +843,10 @@ static void testKeepSightedGivesExactlyOneReprieve() {
   {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepSighted));
-    table->set(entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
     testAssert(present(*table,a));
-    table->set(entryFor(b,false));       // refused; A's reprieve is now spent
-    table->set(entryFor(c,false));       // C finds an unsighted incumbent and takes it
+    NNCacheTableTestAccess::set(*table, entryFor(b,false));       // refused; A's reprieve is now spent
+    NNCacheTableTestAccess::set(*table, entryFor(c,false));       // C finds an unsighted incumbent and takes it
     testAssert(!present(*table,a));
     testAssert(!present(*table,b));
     testAssert(present(*table,c));
@@ -855,8 +856,8 @@ static void testKeepSightedGivesExactlyOneReprieve() {
   {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(replacementConfig(NNCacheReplacementPolicy::KeepSighted));
-    table->set(entryFor(a,false));
-    table->set(entryFor(b,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(b,false));
     testAssert(!present(*table,a));
     testAssert(present(*table,b));
   }
@@ -877,10 +878,10 @@ static void testAReofferedKeyIsNeverRefused() {
   for(int r = 0; r<3; r++) {
     unique_ptr<NNCacheTable> table = NNCacheTable::create(replacementConfig(rules[r]));
     const Hash128 a = sightingKeyAt(0,0);
-    table->set(entryFor(a,false));
+    NNCacheTableTestAccess::set(*table, entryFor(a,false));
     testAssert(present(*table,a));                 // a hit, which under keepsighted also
                                                    // sets the very flag that would refuse
-    table->set(entryFor(a,true));                  // the ownermap upgrade
+    NNCacheTableTestAccess::set(*table, entryFor(a,true));                  // the ownermap upgrade
     testAssert(present(*table,a));
     const NNCacheStats s = table->stats();
     testAssert(s.residentEntries == 1);
@@ -950,9 +951,9 @@ static void testReplacementComposesWithSecondSighting() {
     unique_ptr<NNCacheTable> table =
       NNCacheTable::create(withAdmission(replacementConfig(rules[r]), NNCacheAdmissionPolicy::SecondSighting));
     const Hash128 key = sightingKeyAt(9,r);
-    table->set(entryFor(key,false));
+    NNCacheTableTestAccess::set(*table, entryFor(key,false));
     testAssert(!present(*table,key));   // admission still needs two stores
-    table->set(entryFor(key,false));
+    NNCacheTableTestAccess::set(*table, entryFor(key,false));
     testAssert(present(*table,key));
   }
 }
@@ -1087,12 +1088,12 @@ static void testEveryShapeConstructsAndCaches() {
     const Hash128 key = keyAt(11,(int)i);
     const Hash128 absent = keyAt(11,1000+(int)i);
     testAssert(!present(*table,key));
-    table->set(entryFor(key,false));
+    NNCacheTableTestAccess::set(*table, entryFor(key,false));
     testAssert(present(*table,key));
     testAssert(!present(*table,absent));
     table->clear();
     testAssert(!present(*table,key));
-    table->set(entryFor(key,false));
+    NNCacheTableTestAccess::set(*table, entryFor(key,false));
     testAssert(present(*table,key));
   }
 }
