@@ -99,24 +99,22 @@ Do these two steps **before** 1301 and 1302 are pointed at a shared
 directory, and repeat them whenever that directory moves. Both commands are
 safe to run against a live-but-idle directory and clean up after themselves.
 
-**Run them on the machine the LEAVES run on, against the path the leaves
-use.** In this deployment the sshfs geometry is: the GPU host (the VM host,
-where the leaves live) mounts, over sshfs, a directory served from the VM
-guest's `~/nncache`. The guest-side directory is just storage; the path
-whose lock semantics matter is the *mount on the GPU host*. A probe run
-guest-side (as was done 2026-08-21: SUPPORTED, and the 16-leg suite green)
-establishes the storage baseline but says nothing about the mount.
+**Run them on the machine the ENGINES run on, against the path the engines
+use.** How that path is provided — local disk, sshfs, SMB, NFS — is the
+storage operator's business and changes nothing here. Two transport-agnostic
+facts are all this section relies on: (1) a lock verdict is only meaningful
+from the engines' own machine and path, which is why the probe exists as a
+command rather than a mount-options checklist; (2) on any network
+filesystem, locks taken by the engines do not necessarily bind processes
+running directly on the storage server — so while engines are live, nothing
+on the storage side should write those files, and a direct-attach reader
+there may see a torn tail mid-dump (the reader survives by discarding;
+harmless to the store, but the view is truncated). Passive watching
+(`ls -l`, sizes, mtimes) on the storage side is always fine.
 
-**Cross-machine caveat the probe is blind to by construction:** flock on an
-sshfs/FUSE mount is handled by the *client* kernel and never reaches the
-storage server's kernel. Exclusion therefore holds among processes on the
-GPU host sharing the mount — which is the 1301/1302 deployment, so the
-probe's verdict there is the one that counts — but does NOT hold between a
-GPU-host process and anything on the guest touching `~/nncache` directly.
-Rule: while leaves are live, nothing guest-side writes those files; even a
-direct-attach *reader* guest-side is unprotected (it may see a torn tail
-mid-dump — the reader survives by discarding, harmless to the store, but
-the view is truncated). Passive watching (`ls -l`, sizes, mtimes) is fine.
+A probe + suite run directly on the storage directory (done 2026-08-21:
+SUPPORTED, 16 legs green) is the healthy-storage baseline; the verdict that
+gates sharing is the one from the engines' side.
 
 ### Step 1 — does file locking actually EXCLUDE there?
 
