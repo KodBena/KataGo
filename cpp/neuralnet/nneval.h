@@ -131,9 +131,17 @@ class NNEvaluator {
   std::string getAbbrevInternalModelName() const;
   Logger* getLogger();
   bool isNeuralNetLess() const;
+  // The build-time max batch size: backend buffers are allocated for this many rows, and
+  // fixed-shape backends (NeuralNet::BatchPolicy::FixedShape) pad every inference up to exactly
+  // this many rows, so it is also the one input shape their sessions get compiled for.
   int getMaxBatchSize() const;
-  int getCurrentBatchSize() const;
-  void setCurrentBatchSize(int batchSize);
+  // An additional cap, at most maxBatchSize, on how many queued queries the server threads will
+  // actually send in each batch. On fixed-shape backends lowering this below maxBatchSize only
+  // wastes padding rows, since the batch still runs maxBatchSize rows of compute. To genuinely
+  // run smaller batches there, recreate the NNEvaluator with a smaller maxBatchSize, as the
+  // benchmark does.
+  int getMaxRowsToSendPerBatch() const;
+  void setMaxRowsToSendPerBatch(int maxRows);
   bool requiresSGFMetadata() const;
 
   int getNumGpus() const;
@@ -283,6 +291,8 @@ class NNEvaluator {
   std::vector<std::thread*> serverThreads;
 
   const int maxBatchSize;
+  // NeuralNet::getNumEffectiveDevices at construction, see getNumGpus()
+  const int numEffectiveDevices;
 
   // Counters for statistics
   std::atomic<uint64_t> m_numRowsProcessed;
@@ -309,8 +319,8 @@ class NNEvaluator {
   // Randomization settings for symmetries
   std::atomic<bool> currentDoRandomize;
   std::atomic<int> currentDefaultSymmetry;
-  // Modifiable batch size smaller than maxBatchSize
-  std::atomic<int> currentBatchSize;
+  // See setMaxRowsToSendPerBatch
+  std::atomic<int> maxRowsToSendPerBatch;
 
   // Queued up requests
   ThreadSafeQueue<NNResultBuf*> queryQueue;

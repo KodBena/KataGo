@@ -400,6 +400,8 @@ int MainCmds::runtinynntests(const vector<string>& args) {
     );
     istringstream in(cfgStr);
     cfg.initialize(in);
+    //The ONNX backend requires an explicit provider choice in real configs, so tests set cpu.
+    cfg.overrideKey("onnxProvider", "cpu");
   }
 
   const bool logToStdoutDefault = true;
@@ -463,13 +465,12 @@ int MainCmds::runnnevalcanarytests(const vector<string>& args) {
   {
     Setup::initializeSession(cfg);
     const int expectedConcurrentEvals = 1;
-    const int defaultMaxBatchSize = 8;
     const bool defaultRequireExactNNLen = false;
     const bool disableFP16 = false;
     const string expectedSha256 = "";
     nnEval = Setup::initializeNNEvaluator(
       modelFile,modelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
-      NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+      NNPos::MAX_BOARD_LEN,NNPos::MAX_BOARD_LEN,Setup::MaxBatchSizeRequest::fromConcurrency(),defaultRequireExactNNLen,disableFP16,
       Setup::SETUP_FOR_GTP
     );
   }
@@ -522,13 +523,12 @@ int MainCmds::runbeginsearchspeedtest(const vector<string>& args) {
   {
     Setup::initializeSession(cfg);
     const int expectedConcurrentEvals = params.numThreads;
-    const int defaultMaxBatchSize = std::max(8,((params.numThreads+3)/4)*4);
     const bool defaultRequireExactNNLen = false;
     const bool disableFP16 = false;
     const string expectedSha256 = "";
     nnEval = Setup::initializeNNEvaluator(
       modelFile,modelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
-      Board::MAX_LEN,Board::MAX_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+      Board::MAX_LEN,Board::MAX_LEN,Setup::MaxBatchSizeRequest::fromConcurrency(),defaultRequireExactNNLen,disableFP16,
       Setup::SETUP_FOR_GTP
     );
   }
@@ -646,13 +646,12 @@ int MainCmds::runownershipspeedtest(const vector<string>& args) {
   {
     Setup::initializeSession(cfg);
     const int expectedConcurrentEvals = params.numThreads;
-    const int defaultMaxBatchSize = std::max(8,((params.numThreads+3)/4)*4);
     const bool defaultRequireExactNNLen = false;
     const bool disableFP16 = false;
     const string expectedSha256 = "";
     nnEval = Setup::initializeNNEvaluator(
       modelFile,modelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
-      Board::MAX_LEN,Board::MAX_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+      Board::MAX_LEN,Board::MAX_LEN,Setup::MaxBatchSizeRequest::fromConcurrency(),defaultRequireExactNNLen,disableFP16,
       Setup::SETUP_FOR_GTP
     );
   }
