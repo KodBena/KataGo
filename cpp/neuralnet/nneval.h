@@ -147,6 +147,8 @@ class NNEvaluator {
   int getNumGpus() const;
   int getNumServerThreads() const;
   std::set<int> getGpuIdxs() const;
+  // One entry per server thread, in thread order, -1 meaning the backend's default device.
+  const std::vector<int>& getGpuIdxByServerThread() const;
   int getNNXLen() const;
   int getNNYLen() const;
   bool getRequireExactNNLen() const;
@@ -344,7 +346,7 @@ class NNEvaluator {
 
  public:
   // Helper, for internal use only
-  void serve(NNServerBuf& buf, Rand& rand, int gpuIdxForThisThread, int serverThreadIdx);
+  void serve(Rand& rand, int gpuIdxForThisThread, int serverThreadIdx);
 };
 
 #endif  // NEURALNET_NNEVAL_H_
