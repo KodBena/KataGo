@@ -84,6 +84,10 @@ if __name__ == "__main__":
     optional_args.add_argument('-lr-scale-auto', help='LR auto scaling', required=False, action='store_true')
     optional_args.add_argument('-lr-scale-auto2', help='LR auto scaling 2', required=False, type=float)
     optional_args.add_argument('-lr-schedule', help="Explicit piecewise-constant LR scale schedule as (global_step_samples,lr_scale) points, e.g. '(0,12.0),(20M,9.0),(40M,6.0)'. Must start at (0,...); each point sets the LR scale from that sample count onward. Counts accept K/M/B suffixes. Mutually exclusive with -lr-scale/-lr-scale-auto/-lr-scale-auto2.", required=False, type=str)
+    optional_args.add_argument('-lr-cycle-low', help="Cyclic LR scale keyed to the export cycle: LR scale at the bottom of the cycle. Requires all four -lr-cycle-* flags and -epochs-per-export. Within each export cycle of E=epochs-per-export epochs, epoch i (0-based, the export cycle counter mod E) uses f(x)=((1-x)*sqrt(low)+x*sqrt(high))^2, where x=(i+1)/up for the first `up` epochs, x=1.0 in the middle, and x=1-(k+1)/down for the last `down` epochs (k=0..down-1), so the first epoch of the cycle runs at f(1/up) and the final epoch before export runs at `low`. Interpolating in sqrt space rather than linearly makes the ramp start lower and the ramp-down spend more epochs near `low`. Changes in steps once per epoch. Mutually exclusive with -lr-scale/-lr-scale-auto/-lr-scale-auto2/-lr-schedule.", type=float, required=False)
+    optional_args.add_argument('-lr-cycle-high', help='Cyclic LR scale: LR scale at the top of the cycle. See -lr-cycle-low', type=float, required=False)
+    optional_args.add_argument('-lr-cycle-up-epochs', help='Cyclic LR scale: number of epochs at the start of each export cycle to ramp up. See -lr-cycle-low', type=int, required=False)
+    optional_args.add_argument('-lr-cycle-down-epochs', help='Cyclic LR scale: number of epochs at the end of each export cycle to ramp down. See -lr-cycle-low', type=int, required=False)
     optional_args.add_argument('-head-lr-factor', help='LR factor for output head weights', type=float, required=False, default=0.5)
     optional_args.add_argument('-noreg-lr-factor', help='LR factor for noreg params (biases, norms)', type=float, required=False, default=1.0)
     optional_args.add_argument('-muon-adam-lr-factor', help='LR factor for muon-ineligible (adam) params when using muon', type=float, required=False, default=1.0)
@@ -120,12 +124,14 @@ if __name__ == "__main__":
     optional_args.add_argument('-sleep-seconds-per-epoch', help='Sleep this long between epochs', type=int, required=False)
     optional_args.add_argument('-max-train-bucket-per-new-data', help='When data added, add this many train rows per data row to bucket', type=float, required=False)
     optional_args.add_argument('-max-train-bucket-size', help='Approx total number of train rows allowed if data stops', type=float, required=False)
+    optional_args.add_argument('-initial-train-bucket-level', help='Train rows initially in the bucket when the checkpoint has no bucket state yet, default samples-per-epoch. No effect once the checkpoint has a bucket.', type=float, required=False)
     optional_args.add_argument('-max-train-steps-since-last-reload', help='Approx total of training allowed if shuffling stops', type=float, required=False)
     optional_args.add_argument('-stop-when-train-bucket-limited', help='Terminate due to train bucket rather than waiting for more', required=False, action='store_true')
     optional_args.add_argument('-max-val-samples', help='Approx max of validation samples per epoch', type=int, required=False)
     optional_args.add_argument('-data-prefetch-depth', help='Number of training data files to prefetch ahead of the one being consumed, to hide disk+decompress latency at file boundaries. Memory scales linearly with this (each in-flight file holds its full expanded arrays in RAM, per rank).', type=int, default=1, required=False)
     optional_args.add_argument('-randomize-val', help='Randomize order of validation files', required=False, action='store_true')
     optional_args.add_argument('-no-export', help='Do not export models', required=False, action='store_true')
+    optional_args.add_argument('-no-longterm-checkpoints', help='Do not save the periodic archival checkpoints in longterm_checkpoints/', required=False, action='store_true')
     optional_args.add_argument('-no-repeat-files', help='Track what shuffled data was used and do not repeat, even when killed and resumed', required=False, action='store_true')
     optional_args.add_argument('-quit-if-no-data', help='If no data, quit instead of waiting for data', required=False, action='store_true')
 
@@ -254,7 +260,11 @@ def multiprocessing_setup(rank: int, world_size: int):
     if 'MASTER_PORT' not in os.environ or not os.environ['MASTER_PORT']:
         os.environ['MASTER_PORT'] = '23456'
     logging.info("Running torch.distributed.init_process_group")
-    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Ranks can reach their first collective many minutes apart, for example when one rank hits a
+    # warm torch.compile cache and another does not, or when data loading is slowed by other work
+    # on the machine. The default NCCL watchdog of about ten minutes then kills the run, so allow
+    # a much longer wait. A truly hung collective is still detected, just later.
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size, timeout=datetime.timedelta(hours=1))
     logging.info(f"Returned from torch.distributed.init_process_group, my rank = {rank}, world_size={world_size}")
 
 def multiprocessing_cleanup():
@@ -345,6 +355,12 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     lr_scale_auto = args["lr_scale_auto"]
     lr_scale_auto2 = args["lr_scale_auto2"]
     lr_schedule = parse_lr_schedule(args["lr_schedule"]) if args["lr_schedule"] is not None else None
+    lr_cycle_low = args["lr_cycle_low"]
+    lr_cycle_high = args["lr_cycle_high"]
+    lr_cycle_up_epochs = args["lr_cycle_up_epochs"]
+    lr_cycle_down_epochs = args["lr_cycle_down_epochs"]
+    lr_cycle_args = (lr_cycle_low, lr_cycle_high, lr_cycle_up_epochs, lr_cycle_down_epochs)
+    use_lr_cycle = any(a is not None for a in lr_cycle_args)
     head_lr_factor = args["head_lr_factor"]
     noreg_lr_factor = args["noreg_lr_factor"]
     muon_adam_lr_factor = args["muon_adam_lr_factor"]
@@ -388,12 +404,14 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     sleep_seconds_per_epoch = args["sleep_seconds_per_epoch"]
     max_train_bucket_per_new_data = args["max_train_bucket_per_new_data"]
     max_train_bucket_size = args["max_train_bucket_size"]
+    initial_train_bucket_level = args["initial_train_bucket_level"]
     max_train_steps_since_last_reload = args["max_train_steps_since_last_reload"]
     stop_when_train_bucket_limited = args["stop_when_train_bucket_limited"]
     max_val_samples = args["max_val_samples"]
     randomize_val = args["randomize_val"]
     data_prefetch_depth = args["data_prefetch_depth"]
     no_export = args["no_export"]
+    no_longterm_checkpoints = args["no_longterm_checkpoints"]
     no_repeat_files = args["no_repeat_files"]
     quit_if_no_data = args["quit_if_no_data"]
 
@@ -427,6 +445,14 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         assert lr_scale == 1.0, "Cannot specify both -lr-scale and -lr-schedule"
         assert not lr_scale_auto and lr_scale_auto2 is None, "Cannot specify -lr-schedule together with -lr-scale-auto/-lr-scale-auto2"
         logging.info("Using explicit -lr-schedule: " + ", ".join(f"(samples>={s}: scale {v})" for s, v in lr_schedule))
+    if use_lr_cycle:
+        assert all(a is not None for a in lr_cycle_args), "Must specify all of -lr-cycle-low, -lr-cycle-high, -lr-cycle-up-epochs, -lr-cycle-down-epochs together"
+        assert lr_scale == 1.0, "Cannot specify both -lr-scale and -lr-cycle-*"
+        assert not lr_scale_auto and lr_scale_auto2 is None and lr_schedule is None, "Cannot specify -lr-cycle-* together with -lr-scale-auto/-lr-scale-auto2/-lr-schedule"
+        assert epochs_per_export is not None, "-lr-cycle-* requires -epochs-per-export"
+        assert lr_cycle_low >= 0.0 and lr_cycle_high >= 0.0
+        assert lr_cycle_up_epochs >= 0 and lr_cycle_down_epochs >= 0
+        assert lr_cycle_up_epochs + lr_cycle_down_epochs <= epochs_per_export, "-lr-cycle-up-epochs + -lr-cycle-down-epochs must be <= -epochs-per-export"
 
     assert not (not datadir and not latestdatadir), "Must specify one of -datadir and -latestdatadir"
     assert not (datadir and latestdatadir), "Must specify only one of -datadir and -latestdatadir"
@@ -437,6 +463,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         max_train_bucket_size = 1.0e30
     if epochs_per_export is None:
         epochs_per_export = 1
+    assert epochs_per_export >= 1, "epochs_per_export must be at least 1"
     if swa_period_samples is None:
         swa_period_samples = max(1, samples_per_epoch // 2)
     if swa_scale is None:
@@ -552,6 +579,9 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
             if train_state["global_step_samples"] < 600000000:
                 return 0.08 * lr_scale_auto2
             return 0.05 * lr_scale_auto2
+        elif use_lr_cycle:
+            # Use .get because this can be called during fresh-model init, before train_state is fully populated.
+            return lr_cycle_factor(train_state.get("export_cycle_counter", 0) % epochs_per_export)
         elif lr_schedule is not None:
             # Piecewise-constant: use the value of the last point whose threshold <= current samples.
             samples = train_state["global_step_samples"]
@@ -564,6 +594,30 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
             return scale
         else:
             return 1.0
+
+    def lr_cycle_factor(epoch_in_cycle):
+        # See the help text of -lr-cycle-low for the schedule definition. Callers pass the export
+        # cycle counter mod epochs_per_export, so the clamp is only a safety net.
+        i = max(0, min(epoch_in_cycle, epochs_per_export - 1))
+        if i < lr_cycle_up_epochs:
+            x = (i + 1) / lr_cycle_up_epochs
+        elif i >= epochs_per_export - lr_cycle_down_epochs:
+            k = i - (epochs_per_export - lr_cycle_down_epochs)
+            x = 1.0 - (k + 1) / lr_cycle_down_epochs
+        else:
+            x = 1.0
+        return ((1.0 - x) * math.sqrt(lr_cycle_low) + x * math.sqrt(lr_cycle_high)) ** 2.0
+
+    if use_lr_cycle:
+        # A run meant to hold at lr_cycle_high indefinitely can use a huge -epochs-per-export so
+        # that the cycle never wraps. Cap how many epochs of the table get logged in that case.
+        num_cycle_epochs_to_log = min(epochs_per_export, 100)
+        logging.info(
+            f"Using cyclic LR scale keyed to export cycle: low {lr_cycle_low} high {lr_cycle_high} "
+            f"up {lr_cycle_up_epochs} epochs, down {lr_cycle_down_epochs} epochs, cycle {epochs_per_export} epochs: "
+            + ", ".join(f"epoch{i}: {lr_cycle_factor(i):.4f}" for i in range(num_cycle_epochs_to_log))
+            + (", ..." if epochs_per_export > num_cycle_epochs_to_log else "")
+        )
 
     def get_effective_lr_scale(train_state):
         return lr_scale * lr_scale_auto_factor(train_state)
@@ -617,7 +671,10 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     if os.path.exists(get_checkpoint_prev_path(i)):
                         os.replace(get_checkpoint_prev_path(i), get_checkpoint_prev_path(i+1))
                 if os.path.exists(get_checkpoint_path()):
-                    shutil.copy(get_checkpoint_path(), get_checkpoint_prev_path(0))
+                    # Copy under a temporary name and rename so that a reader such as a backup
+                    # rsync never sees a partially written checkpoint_prev0.ckpt.
+                    shutil.copy(get_checkpoint_path(), get_checkpoint_prev_path(0) + ".tmp")
+                    os.replace(get_checkpoint_prev_path(0) + ".tmp", get_checkpoint_prev_path(0))
                 torch.save(state_dict, get_checkpoint_path() + ".tmp")
                 os.replace(get_checkpoint_path() + ".tmp", get_checkpoint_path())
 
@@ -777,6 +834,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         return param_groups
 
     def load():
+        loading_initial_checkpoint = False
         if not os.path.exists(get_checkpoint_path()) or always_initial_checkpoint:
             if not always_initial_checkpoint:
                 logging.info("No preexisting checkpoint found at: " + get_checkpoint_path())
@@ -788,6 +846,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 if os.path.exists(initial_checkpoint):
                     logging.info(f"Using initial checkpoint: {initial_checkpoint}")
                     path_to_load_from = initial_checkpoint
+                    loading_initial_checkpoint = True
                 else:
                     raise Exception(f"No preexisting checkpoint found, initial checkpoint provided is invalid: {initial_checkpoint}")
             else:
@@ -858,16 +917,20 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
             else:
                 logging.info("WARNING: Train state not found in state dict, using fresh train state")
 
-            if required_initial_checkpoint_train_steps:
-                if (
+            if loading_initial_checkpoint:
+                if required_initial_checkpoint_train_steps is not None and (
                     "global_step_samples" not in train_state or
                     train_state["global_step_samples"] < required_initial_checkpoint_train_steps
                 ):
                     # Sleep 15 minutes and try again
-                    logging.info(f"Requiring {required_initial_checkpoint_train_steps} but {global_step_samples=}")
+                    logging.info(
+                        f"Requiring {required_initial_checkpoint_train_steps} but initial checkpoint "
+                        f"has {train_state.get('global_step_samples')}"
+                    )
                     time.sleep(900)
                     return None
-                # In the mode where we require a specifc number of train steps, go ahead and reset the export cycle.
+                # Adopting an initial checkpoint starts a new run, so its export cycle starts
+                # fresh regardless of the counter stored in that checkpoint.
                 train_state["export_cycle_counter"] = 0
 
             # Do this before loading the state dict, while the model is initialized to fresh values, to get a good baseline
@@ -969,11 +1032,33 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     if "global_step_samples" not in train_state:
         train_state["global_step_samples"] = 0
     if max_train_bucket_per_new_data is not None and "train_bucket_level" not in train_state:
-        train_state["train_bucket_level"] = samples_per_epoch
+        if initial_train_bucket_level is not None:
+            train_state["train_bucket_level"] = initial_train_bucket_level
+        else:
+            train_state["train_bucket_level"] = samples_per_epoch
+        logging.info("Checkpoint has no train bucket state, initial bucket level %.0f" % train_state["train_bucket_level"])
     if "train_steps_since_last_reload" not in train_state:
         train_state["train_steps_since_last_reload"] = 0
     if "export_cycle_counter" not in train_state:
         train_state["export_cycle_counter"] = 0
+    # The checkpoint records the epochs_per_export it was trained with. Since the export cycle
+    # counter is not reset at export time and the cycle position is counter mod epochs_per_export,
+    # resuming with a different -epochs-per-export would otherwise land at an arbitrary point in
+    # the new cycle. Instead, rebase the counter to the position within the latest cycle under the
+    # old length, capped to just before the end of the new cycle. A run that was already past that
+    # point in its old cycle then exports after one more epoch rather than starting a whole new
+    # cycle. Checkpoints without the field adopt the current setting.
+    if "epochs_per_export" not in train_state:
+        train_state["epochs_per_export"] = epochs_per_export
+    elif train_state["epochs_per_export"] != epochs_per_export:
+        old_epochs_per_export = train_state["epochs_per_export"]
+        rebased = min(train_state["export_cycle_counter"] % old_epochs_per_export, epochs_per_export - 1)
+        logging.info(
+            f"epochs_per_export changed {old_epochs_per_export} -> {epochs_per_export}, rebasing "
+            f"export cycle counter {train_state['export_cycle_counter']} -> {rebased}"
+        )
+        train_state["export_cycle_counter"] = rebased
+        train_state["epochs_per_export"] = epochs_per_export
     if "window_start_data_row_idx" not in train_state:
         train_state["window_start_data_row_idx"] = 0
     if "total_num_data_rows" not in train_state:
@@ -1000,6 +1085,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         elif intermediate_loss_scale is None:
             assert False, "Please specify both of main_loss_scale and intermediate_loss_scale or neither when using an architecture with an intermediate head."
 
+    logging.info(f"epochs_per_export {epochs_per_export}")
     logging.info(f"swa_period_samples {swa_period_samples}")
     logging.info(f"swa_scale {swa_scale}")
     logging.info(f"lookahead_alpha {lookahead_alpha}")
@@ -1387,6 +1473,15 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     else:
         running_metrics["weights"] = defaultdict(float,running_metrics["weights"])
 
+    # If nsamp isn't in the running metrics (e.g. loading from an initial checkpoint that
+    # doesn't include running metrics), seed it from the train state so it continues from
+    # the right sample count rather than restarting at 0.
+    if "nsamp" not in running_metrics["sums"] and "global_step_samples" in train_state:
+        global_step_samples_initial = train_state["global_step_samples"]
+        running_metrics["sums"]["nsamp"] = global_step_samples_initial
+        running_metrics["weights"]["nsamp"] = global_step_samples_initial
+        logging.info(f"Seeded running_metrics nsamp from train_state global_step_samples: {global_step_samples_initial}")
+
     torch.backends.cudnn.benchmark = True
     trainloop_helpers.maybe_enable_compiled_autograd()
 
@@ -1651,11 +1746,11 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 if lookahead_k is not None and lookahead_print:
                     # Only accumulate metrics when lookahead is synced if lookahead_print is True
                     if lookahead_counter == 0:
-                        accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=math.exp(-0.001 * lookahead_k), new_weight=1.0)
+                        accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=math.exp(-0.005 * lookahead_k), new_weight=1.0)
                     else:
                         accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=1.0, new_weight=0.0)
                 else:
-                    accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=0.999, new_weight=1.0)
+                    accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=0.995, new_weight=1.0)
 
 
                 if batch_count_this_epoch % print_train_loss_every_batches == 0:
@@ -1739,8 +1834,10 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     slow_param_data = lookahead_cache[param]
                     param.data.copy_(slow_param_data)
 
-        if rank == 0:
-            train_state["export_cycle_counter"] += 1
+        # Incremented on every rank, not just rank 0, so that the counter stays in sync across DDP
+        # processes. Under -lr-cycle-* the counter determines the LR, and all ranks must apply the
+        # same LR. See the export check below for why the counter is not reset at export time.
+        train_state["export_cycle_counter"] += 1
 
         num_epochs_this_instance += 1
 
@@ -1824,16 +1921,16 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     logging.info(f"Validation took {t1-t0} seconds")
                     validation_model.train()
 
+        # The export cycle counter is not reset at export time. It keeps counting epochs so that
+        # outside tooling can track a run's epoch count from its checkpoints, and anything that
+        # cares about the position within an export cycle, such as this check and the -lr-cycle-*
+        # schedule, takes it mod epochs_per_export. One consequence is that a run switched from
+        # -no-export to exporting waits for its next cycle boundary rather than exporting
+        # immediately.
+        is_time_to_export = (train_state["export_cycle_counter"] % epochs_per_export == 0)
+
         if rank == 0:
             logging.info("Export cycle counter = " + str(train_state["export_cycle_counter"]))
-
-            is_time_to_export = False
-            if train_state["export_cycle_counter"] >= epochs_per_export:
-                if no_export:
-                    train_state["export_cycle_counter"] = epochs_per_export
-                else:
-                    train_state["export_cycle_counter"] = 0
-                    is_time_to_export = True
 
             skip_export_this_time = False
             if export_prob is not None:
@@ -1879,7 +1976,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         else:
             time.sleep(sleep_seconds_per_epoch)
 
-        if rank == 0:
+        if rank == 0 and not no_longterm_checkpoints:
             now = datetime.datetime.now()
             if now - last_longterm_checkpoint_save_time >= datetime.timedelta(hours=12):
                 last_longterm_checkpoint_save_time = now
